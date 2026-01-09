@@ -195,83 +195,70 @@ func NewFieldData(dataType schemapb.DataType, fieldSchema *schemapb.FieldSchema,
 	typeParams := fieldSchema.GetTypeParams()
 	switch dataType {
 	case schemapb.DataType_Float16Vector:
+		if fieldSchema.GetNullable() {
+			return nil, merr.WrapErrParameterInvalidMsg("vector not support null")
+		}
 		dim, err := GetDimFromParams(typeParams)
 		if err != nil {
 			return nil, err
 		}
-		data := &Float16VectorFieldData{
-			Data:     make([]byte, 0, cap),
-			Dim:      dim,
-			Nullable: fieldSchema.GetNullable(),
-		}
-		if fieldSchema.GetNullable() {
-			data.ValidData = make([]bool, 0, cap)
-		}
-		return data, nil
+		return &Float16VectorFieldData{
+			Data: make([]byte, 0, cap),
+			Dim:  dim,
+		}, nil
 	case schemapb.DataType_BFloat16Vector:
+		if fieldSchema.GetNullable() {
+			return nil, merr.WrapErrParameterInvalidMsg("vector not support null")
+		}
 		dim, err := GetDimFromParams(typeParams)
 		if err != nil {
 			return nil, err
 		}
-		data := &BFloat16VectorFieldData{
-			Data:     make([]byte, 0, cap),
-			Dim:      dim,
-			Nullable: fieldSchema.GetNullable(),
-		}
-		if fieldSchema.GetNullable() {
-			data.ValidData = make([]bool, 0, cap)
-		}
-		return data, nil
+		return &BFloat16VectorFieldData{
+			Data: make([]byte, 0, cap),
+			Dim:  dim,
+		}, nil
 	case schemapb.DataType_FloatVector:
+		if fieldSchema.GetNullable() {
+			return nil, merr.WrapErrParameterInvalidMsg("vector not support null")
+		}
 		dim, err := GetDimFromParams(typeParams)
 		if err != nil {
 			return nil, err
 		}
-		data := &FloatVectorFieldData{
-			Data:     make([]float32, 0, cap),
-			Dim:      dim,
-			Nullable: fieldSchema.GetNullable(),
-		}
-		if fieldSchema.GetNullable() {
-			data.ValidData = make([]bool, 0, cap)
-		}
-		return data, nil
+		return &FloatVectorFieldData{
+			Data: make([]float32, 0, cap),
+			Dim:  dim,
+		}, nil
 	case schemapb.DataType_BinaryVector:
+		if fieldSchema.GetNullable() {
+			return nil, merr.WrapErrParameterInvalidMsg("vector not support null")
+		}
 		dim, err := GetDimFromParams(typeParams)
 		if err != nil {
 			return nil, err
 		}
-		data := &BinaryVectorFieldData{
-			Data:     make([]byte, 0, cap),
-			Dim:      dim,
-			Nullable: fieldSchema.GetNullable(),
-		}
-		if fieldSchema.GetNullable() {
-			data.ValidData = make([]bool, 0, cap)
-		}
-		return data, nil
+		return &BinaryVectorFieldData{
+			Data: make([]byte, 0, cap),
+			Dim:  dim,
+		}, nil
 	case schemapb.DataType_SparseFloatVector:
-		data := &SparseFloatVectorFieldData{
-			Nullable: fieldSchema.GetNullable(),
-		}
 		if fieldSchema.GetNullable() {
-			data.ValidData = make([]bool, 0, cap)
+			return nil, merr.WrapErrParameterInvalidMsg("vector not support null")
 		}
-		return data, nil
+		return &SparseFloatVectorFieldData{}, nil
 	case schemapb.DataType_Int8Vector:
+		if fieldSchema.GetNullable() {
+			return nil, merr.WrapErrParameterInvalidMsg("vector not support null")
+		}
 		dim, err := GetDimFromParams(typeParams)
 		if err != nil {
 			return nil, err
 		}
-		data := &Int8VectorFieldData{
-			Data:     make([]int8, 0, cap),
-			Dim:      dim,
-			Nullable: fieldSchema.GetNullable(),
-		}
-		if fieldSchema.GetNullable() {
-			data.ValidData = make([]bool, 0, cap)
-		}
-		return data, nil
+		return &Int8VectorFieldData{
+			Data: make([]int8, 0, cap),
+			Dim:  dim,
+		}, nil
 	case schemapb.DataType_Bool:
 		data := &BoolFieldData{
 			Data:     make([]bool, 0, cap),
@@ -361,6 +348,15 @@ func NewFieldData(dataType schemapb.DataType, fieldSchema *schemapb.FieldSchema,
 
 	case schemapb.DataType_Geometry:
 		data := &GeometryFieldData{
+			Data:     make([][]byte, 0, cap),
+			Nullable: fieldSchema.GetNullable(),
+		}
+		if fieldSchema.GetNullable() {
+			data.ValidData = make([]bool, 0, cap)
+		}
+		return data, nil
+	case schemapb.DataType_Mol:
+		data := &MolFieldData{
 			Data:     make([][]byte, 0, cap),
 			Nullable: fieldSchema.GetNullable(),
 		}
@@ -466,97 +462,35 @@ type GeometryFieldData struct {
 	ValidData []bool
 	Nullable  bool
 }
-
-// LogicalToPhysicalMapping maps logical offset to physical offset for nullable vector
-type LogicalToPhysicalMapping struct {
-	validCount int
-	l2pMap     map[int]int
+type MolFieldData struct {
+	Data      [][]byte
+	ValidData []bool
+	Nullable  bool
 }
-
-func (m *LogicalToPhysicalMapping) GetPhysicalOffset(logicalOffset int) int {
-	if m.l2pMap == nil {
-		return logicalOffset
-	}
-	if physicalOffset, ok := m.l2pMap[logicalOffset]; ok {
-		return physicalOffset
-	}
-	return -1
-}
-
-func (m *LogicalToPhysicalMapping) GetMemorySize() int {
-	size := 8                  // validCount int
-	size += len(m.l2pMap) * 16 // map[int]int, roughly 16 bytes per entry
-	return size
-}
-
-func (m *LogicalToPhysicalMapping) GetValidCount() int {
-	return m.validCount
-}
-
-func (m *LogicalToPhysicalMapping) Build(validData []bool, startLogical, totalCount int) {
-	if totalCount == 0 {
-		return
-	}
-	if len(validData) < totalCount {
-		return
-	}
-
-	if m.l2pMap == nil {
-		m.l2pMap = make(map[int]int)
-	}
-
-	physicalIdx := m.validCount
-	for i := 0; i < totalCount; i++ {
-		if validData[i] {
-			m.l2pMap[startLogical+i] = physicalIdx
-			physicalIdx++
-		}
-	}
-	m.validCount = physicalIdx
-}
-
 type BinaryVectorFieldData struct {
-	Data       []byte
-	ValidData  []bool
-	Dim        int
-	Nullable   bool
-	L2PMapping LogicalToPhysicalMapping
+	Data []byte
+	Dim  int
 }
 type FloatVectorFieldData struct {
-	Data       []float32
-	ValidData  []bool
-	Dim        int
-	Nullable   bool
-	L2PMapping LogicalToPhysicalMapping
+	Data []float32
+	Dim  int
 }
 type Float16VectorFieldData struct {
-	Data       []byte
-	ValidData  []bool
-	Dim        int
-	Nullable   bool
-	L2PMapping LogicalToPhysicalMapping
+	Data []byte
+	Dim  int
 }
 type BFloat16VectorFieldData struct {
-	Data       []byte
-	ValidData  []bool
-	Dim        int
-	Nullable   bool
-	L2PMapping LogicalToPhysicalMapping
+	Data []byte
+	Dim  int
 }
 
 type SparseFloatVectorFieldData struct {
 	schemapb.SparseFloatArray
-	ValidData  []bool
-	Nullable   bool
-	L2PMapping LogicalToPhysicalMapping
 }
 
 type Int8VectorFieldData struct {
-	Data       []int8
-	ValidData  []bool
-	Dim        int
-	Nullable   bool
-	L2PMapping LogicalToPhysicalMapping
+	Data []int8
+	Dim  int
 }
 
 type VectorArrayFieldData struct {
@@ -573,71 +507,30 @@ func (dst *SparseFloatVectorFieldData) AppendAllRows(src *SparseFloatVectorField
 		dst.Dim = src.Dim
 	}
 	dst.Contents = append(dst.Contents, src.Contents...)
-	if src.Nullable {
-		if dst.ValidData == nil {
-			dst.ValidData = make([]bool, 0, len(src.ValidData))
-		}
-		dst.L2PMapping.Build(src.ValidData, len(dst.ValidData), len(src.ValidData))
-		dst.ValidData = append(dst.ValidData, src.ValidData...)
-		dst.Nullable = true
-	}
 }
 
 // RowNum implements FieldData.RowNum
-func (data *BoolFieldData) RowNum() int        { return len(data.Data) }
-func (data *Int8FieldData) RowNum() int        { return len(data.Data) }
-func (data *Int16FieldData) RowNum() int       { return len(data.Data) }
-func (data *Int32FieldData) RowNum() int       { return len(data.Data) }
-func (data *Int64FieldData) RowNum() int       { return len(data.Data) }
-func (data *FloatFieldData) RowNum() int       { return len(data.Data) }
-func (data *DoubleFieldData) RowNum() int      { return len(data.Data) }
-func (data *TimestamptzFieldData) RowNum() int { return len(data.Data) }
-func (data *StringFieldData) RowNum() int      { return len(data.Data) }
-func (data *ArrayFieldData) RowNum() int       { return len(data.Data) }
-func (data *JSONFieldData) RowNum() int        { return len(data.Data) }
-func (data *GeometryFieldData) RowNum() int    { return len(data.Data) }
-func (data *BinaryVectorFieldData) RowNum() int {
-	if data.Nullable {
-		return len(data.ValidData)
-	}
-	return len(data.Data) * 8 / data.Dim
-}
-
-func (data *FloatVectorFieldData) RowNum() int {
-	if data.Nullable {
-		return len(data.ValidData)
-	}
-	return len(data.Data) / data.Dim
-}
-
-func (data *Float16VectorFieldData) RowNum() int {
-	if data.Nullable {
-		return len(data.ValidData)
-	}
-	return len(data.Data) / 2 / data.Dim
-}
-
+func (data *BoolFieldData) RowNum() int          { return len(data.Data) }
+func (data *Int8FieldData) RowNum() int          { return len(data.Data) }
+func (data *Int16FieldData) RowNum() int         { return len(data.Data) }
+func (data *Int32FieldData) RowNum() int         { return len(data.Data) }
+func (data *Int64FieldData) RowNum() int         { return len(data.Data) }
+func (data *FloatFieldData) RowNum() int         { return len(data.Data) }
+func (data *DoubleFieldData) RowNum() int        { return len(data.Data) }
+func (data *TimestamptzFieldData) RowNum() int   { return len(data.Data) }
+func (data *StringFieldData) RowNum() int        { return len(data.Data) }
+func (data *ArrayFieldData) RowNum() int         { return len(data.Data) }
+func (data *JSONFieldData) RowNum() int          { return len(data.Data) }
+func (data *GeometryFieldData) RowNum() int      { return len(data.Data) }
+func (data *MolFieldData) RowNum() int           { return len(data.Data) }
+func (data *BinaryVectorFieldData) RowNum() int  { return len(data.Data) * 8 / data.Dim }
+func (data *FloatVectorFieldData) RowNum() int   { return len(data.Data) / data.Dim }
+func (data *Float16VectorFieldData) RowNum() int { return len(data.Data) / 2 / data.Dim }
 func (data *BFloat16VectorFieldData) RowNum() int {
-	if data.Nullable {
-		return len(data.ValidData)
-	}
 	return len(data.Data) / 2 / data.Dim
 }
-
-func (data *SparseFloatVectorFieldData) RowNum() int {
-	if data.Nullable {
-		return len(data.ValidData)
-	}
-	return len(data.Contents)
-}
-
-func (data *Int8VectorFieldData) RowNum() int {
-	if data.Nullable {
-		return len(data.ValidData)
-	}
-	return len(data.Data) / data.Dim
-}
-
+func (data *SparseFloatVectorFieldData) RowNum() int { return len(data.Contents) }
+func (data *Int8VectorFieldData) RowNum() int        { return len(data.Data) / data.Dim }
 func (data *VectorArrayFieldData) RowNum() int {
 	return len(data.Data)
 }
@@ -727,52 +620,35 @@ func (data *GeometryFieldData) GetRow(i int) any {
 	return data.Data[i]
 }
 
-func (data *BinaryVectorFieldData) GetRow(i int) any {
+func (data *MolFieldData) GetRow(i int) any {
 	if data.GetNullable() && !data.ValidData[i] {
 		return nil
 	}
-	physicalIdx := data.L2PMapping.GetPhysicalOffset(i)
-	return data.Data[physicalIdx*data.Dim/8 : (physicalIdx+1)*data.Dim/8]
+	return data.Data[i]
+}
+
+func (data *BinaryVectorFieldData) GetRow(i int) any {
+	return data.Data[i*data.Dim/8 : (i+1)*data.Dim/8]
 }
 
 func (data *SparseFloatVectorFieldData) GetRow(i int) interface{} {
-	if data.GetNullable() && !data.ValidData[i] {
-		return nil
-	}
-	physicalIdx := data.L2PMapping.GetPhysicalOffset(i)
-	return data.Contents[physicalIdx]
+	return data.Contents[i]
 }
 
 func (data *FloatVectorFieldData) GetRow(i int) interface{} {
-	if data.GetNullable() && !data.ValidData[i] {
-		return nil
-	}
-	physicalIdx := data.L2PMapping.GetPhysicalOffset(i)
-	return data.Data[physicalIdx*data.Dim : (physicalIdx+1)*data.Dim]
+	return data.Data[i*data.Dim : (i+1)*data.Dim]
 }
 
 func (data *Float16VectorFieldData) GetRow(i int) interface{} {
-	if data.GetNullable() && !data.ValidData[i] {
-		return nil
-	}
-	physicalIdx := data.L2PMapping.GetPhysicalOffset(i)
-	return data.Data[physicalIdx*data.Dim*2 : (physicalIdx+1)*data.Dim*2]
+	return data.Data[i*data.Dim*2 : (i+1)*data.Dim*2]
 }
 
 func (data *BFloat16VectorFieldData) GetRow(i int) interface{} {
-	if data.GetNullable() && !data.ValidData[i] {
-		return nil
-	}
-	physicalIdx := data.L2PMapping.GetPhysicalOffset(i)
-	return data.Data[physicalIdx*data.Dim*2 : (physicalIdx+1)*data.Dim*2]
+	return data.Data[i*data.Dim*2 : (i+1)*data.Dim*2]
 }
 
 func (data *Int8VectorFieldData) GetRow(i int) interface{} {
-	if data.GetNullable() && !data.ValidData[i] {
-		return nil
-	}
-	physicalIdx := data.L2PMapping.GetPhysicalOffset(i)
-	return data.Data[physicalIdx*data.Dim : (physicalIdx+1)*data.Dim]
+	return data.Data[i*data.Dim : (i+1)*data.Dim]
 }
 
 func (data *VectorArrayFieldData) GetRow(i int) interface{} {
@@ -791,6 +667,7 @@ func (data *StringFieldData) GetDataRows() any            { return data.Data }
 func (data *ArrayFieldData) GetDataRows() any             { return data.Data }
 func (data *JSONFieldData) GetDataRows() any              { return data.Data }
 func (data *GeometryFieldData) GetDataRows() any          { return data.Data }
+func (data *MolFieldData) GetDataRows() any               { return data.Data }
 func (data *BinaryVectorFieldData) GetDataRows() any      { return data.Data }
 func (data *FloatVectorFieldData) GetDataRows() any       { return data.Data }
 func (data *Float16VectorFieldData) GetDataRows() any     { return data.Data }
@@ -1007,84 +884,64 @@ func (data *GeometryFieldData) AppendRow(row interface{}) error {
 	return nil
 }
 
-func (data *BinaryVectorFieldData) AppendRow(row interface{}) error {
+func (data *MolFieldData) AppendRow(row interface{}) error {
 	if data.GetNullable() && row == nil {
-		data.L2PMapping.Build([]bool{false}, len(data.ValidData), 1)
+		data.Data = append(data.Data, make([][]byte, 1)...)
 		data.ValidData = append(data.ValidData, false)
 		return nil
 	}
+	switch v := row.(type) {
+	case []byte:
+		data.Data = append(data.Data, v)
+	case string:
+		// MOL type stores SMILES strings, convert to []byte
+		data.Data = append(data.Data, []byte(v))
+	default:
+		return merr.WrapErrParameterInvalid("[]byte or string", row, "Wrong row type")
+	}
+	if data.GetNullable() {
+		data.ValidData = append(data.ValidData, true)
+	}
+	return nil
+}
+
+func (data *BinaryVectorFieldData) AppendRow(row interface{}) error {
 	v, ok := row.([]byte)
 	if !ok || len(v) != data.Dim/8 {
 		return merr.WrapErrParameterInvalid("[]byte", row, "Wrong row type")
 	}
 	data.Data = append(data.Data, v...)
-	if data.GetNullable() {
-		data.L2PMapping.Build([]bool{true}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, true)
-	}
 	return nil
 }
 
 func (data *FloatVectorFieldData) AppendRow(row interface{}) error {
-	if data.GetNullable() && row == nil {
-		data.L2PMapping.Build([]bool{false}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, false)
-		return nil
-	}
 	v, ok := row.([]float32)
 	if !ok || len(v) != data.Dim {
 		return merr.WrapErrParameterInvalid("[]float32", row, "Wrong row type")
 	}
 	data.Data = append(data.Data, v...)
-	if data.GetNullable() {
-		data.L2PMapping.Build([]bool{true}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, true)
-	}
 	return nil
 }
 
 func (data *Float16VectorFieldData) AppendRow(row interface{}) error {
-	if data.GetNullable() && row == nil {
-		data.L2PMapping.Build([]bool{false}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, false)
-		return nil
-	}
 	v, ok := row.([]byte)
 	if !ok || len(v) != data.Dim*2 {
 		return merr.WrapErrParameterInvalid("[]byte", row, "Wrong row type")
 	}
 	data.Data = append(data.Data, v...)
-	if data.GetNullable() {
-		data.L2PMapping.Build([]bool{true}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, true)
-	}
 	return nil
 }
 
 func (data *BFloat16VectorFieldData) AppendRow(row interface{}) error {
-	if data.GetNullable() && row == nil {
-		data.L2PMapping.Build([]bool{false}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, false)
-		return nil
-	}
 	v, ok := row.([]byte)
 	if !ok || len(v) != data.Dim*2 {
 		return merr.WrapErrParameterInvalid("[]byte", row, "Wrong row type")
 	}
 	data.Data = append(data.Data, v...)
-	if data.GetNullable() {
-		data.L2PMapping.Build([]bool{true}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, true)
-	}
 	return nil
 }
 
 func (data *SparseFloatVectorFieldData) AppendRow(row interface{}) error {
-	if data.GetNullable() && row == nil {
-		data.L2PMapping.Build([]bool{false}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, false)
-		return nil
-	}
 	v, ok := row.([]byte)
 	if !ok {
 		return merr.WrapErrParameterInvalid("SparseFloatVectorRowData", row, "Wrong row type")
@@ -1097,28 +954,15 @@ func (data *SparseFloatVectorFieldData) AppendRow(row interface{}) error {
 		data.Dim = rowDim
 	}
 	data.Contents = append(data.Contents, v)
-	if data.GetNullable() {
-		data.L2PMapping.Build([]bool{true}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, true)
-	}
 	return nil
 }
 
 func (data *Int8VectorFieldData) AppendRow(row interface{}) error {
-	if data.GetNullable() && row == nil {
-		data.L2PMapping.Build([]bool{false}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, false)
-		return nil
-	}
 	v, ok := row.([]int8)
 	if !ok || len(v) != data.Dim {
 		return merr.WrapErrParameterInvalid("[]int8", row, "Wrong row type")
 	}
 	data.Data = append(data.Data, v...)
-	if data.GetNullable() {
-		data.L2PMapping.Build([]bool{true}, len(data.ValidData), 1)
-		data.ValidData = append(data.ValidData, true)
-	}
 	return nil
 }
 
@@ -1220,6 +1064,14 @@ func (data *JSONFieldData) AppendRows(dataRows interface{}, validDataRows interf
 }
 
 func (data *GeometryFieldData) AppendRows(dataRows interface{}, validDataRows interface{}) error {
+	err := data.AppendDataRows(dataRows)
+	if err != nil {
+		return err
+	}
+	return data.AppendValidDataRows(validDataRows)
+}
+
+func (data *MolFieldData) AppendRows(dataRows interface{}, validDataRows interface{}) error {
 	err := data.AppendDataRows(dataRows)
 	if err != nil {
 		return err
@@ -1396,6 +1248,21 @@ func (data *GeometryFieldData) AppendDataRows(rows interface{}) error {
 		}
 	default:
 		return merr.WrapErrParameterInvalid("[][]byte", rows, "Wrong rows type")
+	}
+	return nil
+}
+
+func (data *MolFieldData) AppendDataRows(rows interface{}) error {
+	switch v := rows.(type) {
+	case [][]byte:
+		data.Data = append(data.Data, v...)
+	case []string:
+		// MOL type stores SMILES strings, convert to [][]byte
+		for _, row := range v {
+			data.Data = append(data.Data, []byte(row))
+		}
+	default:
+		return merr.WrapErrParameterInvalid("[][]byte or []string", rows, "Wrong rows type")
 	}
 	return nil
 }
@@ -1629,8 +1496,7 @@ func (data *GeometryFieldData) AppendValidDataRows(rows interface{}) error {
 	return nil
 }
 
-// AppendValidDataRows appends FLATTEN vectors to field data.
-func (data *BinaryVectorFieldData) AppendValidDataRows(rows interface{}) error {
+func (data *MolFieldData) AppendValidDataRows(rows interface{}) error {
 	if rows == nil {
 		return nil
 	}
@@ -1638,8 +1504,21 @@ func (data *BinaryVectorFieldData) AppendValidDataRows(rows interface{}) error {
 	if !ok {
 		return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
 	}
-	data.L2PMapping.Build(v, len(data.ValidData), len(v))
 	data.ValidData = append(data.ValidData, v...)
+	return nil
+}
+
+// AppendValidDataRows appends FLATTEN vectors to field data.
+func (data *BinaryVectorFieldData) AppendValidDataRows(rows interface{}) error {
+	if rows != nil {
+		v, ok := rows.([]bool)
+		if !ok {
+			return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
+		}
+		if len(v) != 0 {
+			return merr.WrapErrParameterInvalidMsg("not support Nullable in vector")
+		}
+	}
 	return nil
 }
 
@@ -1658,69 +1537,69 @@ func (data *VectorArrayFieldData) AppendValidDataRows(rows interface{}) error {
 
 // AppendValidDataRows appends FLATTEN vectors to field data.
 func (data *FloatVectorFieldData) AppendValidDataRows(rows interface{}) error {
-	if rows == nil {
-		return nil
+	if rows != nil {
+		v, ok := rows.([]bool)
+		if !ok {
+			return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
+		}
+		if len(v) != 0 {
+			return merr.WrapErrParameterInvalidMsg("not support Nullable in vector")
+		}
 	}
-	v, ok := rows.([]bool)
-	if !ok {
-		return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
-	}
-	data.L2PMapping.Build(v, len(data.ValidData), len(v))
-	data.ValidData = append(data.ValidData, v...)
 	return nil
 }
 
 // AppendValidDataRows appends FLATTEN vectors to field data.
 func (data *Float16VectorFieldData) AppendValidDataRows(rows interface{}) error {
-	if rows == nil {
-		return nil
+	if rows != nil {
+		v, ok := rows.([]bool)
+		if !ok {
+			return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
+		}
+		if len(v) != 0 {
+			return merr.WrapErrParameterInvalidMsg("not support Nullable in vector")
+		}
 	}
-	v, ok := rows.([]bool)
-	if !ok {
-		return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
-	}
-	data.L2PMapping.Build(v, len(data.ValidData), len(v))
-	data.ValidData = append(data.ValidData, v...)
 	return nil
 }
 
 // AppendValidDataRows appends FLATTEN vectors to field data.
 func (data *BFloat16VectorFieldData) AppendValidDataRows(rows interface{}) error {
-	if rows == nil {
-		return nil
+	if rows != nil {
+		v, ok := rows.([]bool)
+		if !ok {
+			return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
+		}
+		if len(v) != 0 {
+			return merr.WrapErrParameterInvalidMsg("not support Nullable in vector")
+		}
 	}
-	v, ok := rows.([]bool)
-	if !ok {
-		return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
-	}
-	data.L2PMapping.Build(v, len(data.ValidData), len(v))
-	data.ValidData = append(data.ValidData, v...)
 	return nil
 }
 
 func (data *SparseFloatVectorFieldData) AppendValidDataRows(rows interface{}) error {
-	if rows == nil {
-		return nil
+	if rows != nil {
+		v, ok := rows.([]bool)
+		if !ok {
+			return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
+		}
+		if len(v) != 0 {
+			return merr.WrapErrParameterInvalidMsg("not support Nullable in vector")
+		}
 	}
-	v, ok := rows.([]bool)
-	if !ok {
-		return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
-	}
-	data.L2PMapping.Build(v, len(data.ValidData), len(v))
-	data.ValidData = append(data.ValidData, v...)
 	return nil
 }
 
 func (data *Int8VectorFieldData) AppendValidDataRows(rows interface{}) error {
-	if rows == nil {
-		return nil
+	if rows != nil {
+		v, ok := rows.([]bool)
+		if !ok {
+			return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
+		}
+		if len(v) != 0 {
+			return merr.WrapErrParameterInvalidMsg("not support Nullable in vector")
+		}
 	}
-	v, ok := rows.([]bool)
-	if !ok {
-		return merr.WrapErrParameterInvalid("[]bool", rows, "Wrong rows type")
-	}
-	data.L2PMapping.Build(v, len(data.ValidData), len(v))
-	data.ValidData = append(data.ValidData, v...)
 	return nil
 }
 
@@ -1757,32 +1636,17 @@ func (data *TimestamptzFieldData) GetMemorySize() int {
 	return binary.Size(data.Data) + binary.Size(data.ValidData) + binary.Size(data.Nullable)
 }
 
-func (data *BinaryVectorFieldData) GetMemorySize() int {
-	// Data + ValidData + Dim(4) + Nullable(1) + L2PMapping
-	return binary.Size(data.Data) + binary.Size(data.ValidData) + 4 + 1 + data.L2PMapping.GetMemorySize()
-}
-
-func (data *FloatVectorFieldData) GetMemorySize() int {
-	return binary.Size(data.Data) + binary.Size(data.ValidData) + 4 + 1 + data.L2PMapping.GetMemorySize()
-}
-
-func (data *Float16VectorFieldData) GetMemorySize() int {
-	return binary.Size(data.Data) + binary.Size(data.ValidData) + 4 + 1 + data.L2PMapping.GetMemorySize()
-}
-
-func (data *BFloat16VectorFieldData) GetMemorySize() int {
-	return binary.Size(data.Data) + binary.Size(data.ValidData) + 4 + 1 + data.L2PMapping.GetMemorySize()
-}
+func (data *BinaryVectorFieldData) GetMemorySize() int   { return binary.Size(data.Data) + 4 }
+func (data *FloatVectorFieldData) GetMemorySize() int    { return binary.Size(data.Data) + 4 }
+func (data *Float16VectorFieldData) GetMemorySize() int  { return binary.Size(data.Data) + 4 }
+func (data *BFloat16VectorFieldData) GetMemorySize() int { return binary.Size(data.Data) + 4 }
 
 func (data *SparseFloatVectorFieldData) GetMemorySize() int {
 	// TODO(SPARSE): should this be the memory size of serialzied size?
-	// SparseFloatArray + ValidData + Nullable(1) + L2PMapping
-	return proto.Size(&data.SparseFloatArray) + binary.Size(data.ValidData) + 1 + data.L2PMapping.GetMemorySize()
+	return proto.Size(&data.SparseFloatArray)
 }
 
-func (data *Int8VectorFieldData) GetMemorySize() int {
-	return binary.Size(data.Data) + binary.Size(data.ValidData) + 4 + 1 + data.L2PMapping.GetMemorySize()
-}
+func (data *Int8VectorFieldData) GetMemorySize() int { return binary.Size(data.Data) + 4 }
 
 func GetVectorSize(vector *schemapb.VectorField, vectorType schemapb.DataType) int {
 	size := 0
@@ -1829,6 +1693,10 @@ func (data *ArrayFieldData) GetDataType() schemapb.DataType  { return schemapb.D
 func (data *JSONFieldData) GetDataType() schemapb.DataType   { return schemapb.DataType_JSON }
 func (data *GeometryFieldData) GetDataType() schemapb.DataType {
 	return schemapb.DataType_Geometry
+}
+
+func (data *MolFieldData) GetDataType() schemapb.DataType {
+	return schemapb.DataType_Mol
 }
 
 func (data *BinaryVectorFieldData) GetDataType() schemapb.DataType {
@@ -1913,51 +1781,32 @@ func (data *GeometryFieldData) GetMemorySize() int {
 	return size + binary.Size(data.ValidData) + binary.Size(data.Nullable)
 }
 
-func (data *BoolFieldData) GetRowSize(i int) int        { return 1 }
-func (data *Int8FieldData) GetRowSize(i int) int        { return 1 }
-func (data *Int16FieldData) GetRowSize(i int) int       { return 2 }
-func (data *Int32FieldData) GetRowSize(i int) int       { return 4 }
-func (data *Int64FieldData) GetRowSize(i int) int       { return 8 }
-func (data *FloatFieldData) GetRowSize(i int) int       { return 4 }
-func (data *DoubleFieldData) GetRowSize(i int) int      { return 8 }
-func (data *TimestamptzFieldData) GetRowSize(i int) int { return 8 }
-func (data *BinaryVectorFieldData) GetRowSize(i int) int {
-	if data.GetNullable() && !data.ValidData[i] {
-		return 0
+func (data *MolFieldData) GetMemorySize() int {
+	var size int
+	// MOL type stores pickle binary data, each molecule has different size
+	for _, val := range data.Data {
+		size += len(val) + 16
 	}
-	return data.Dim / 8
+	return size + binary.Size(data.ValidData) + binary.Size(data.Nullable)
 }
 
-func (data *FloatVectorFieldData) GetRowSize(i int) int {
-	if data.GetNullable() && !data.ValidData[i] {
-		return 0
-	}
-	return data.Dim * 4
-}
-
-func (data *Float16VectorFieldData) GetRowSize(i int) int {
-	if data.GetNullable() && !data.ValidData[i] {
-		return 0
-	}
-	return data.Dim * 2
-}
-
-func (data *BFloat16VectorFieldData) GetRowSize(i int) int {
-	if data.GetNullable() && !data.ValidData[i] {
-		return 0
-	}
-	return data.Dim * 2
-}
-
-func (data *Int8VectorFieldData) GetRowSize(i int) int {
-	if data.GetNullable() && !data.ValidData[i] {
-		return 0
-	}
-	return data.Dim
-}
-func (data *StringFieldData) GetRowSize(i int) int   { return len(data.Data[i]) + 16 }
-func (data *JSONFieldData) GetRowSize(i int) int     { return len(data.Data[i]) + 16 }
-func (data *GeometryFieldData) GetRowSize(i int) int { return len(data.Data[i]) + 16 }
+func (data *BoolFieldData) GetRowSize(i int) int           { return 1 }
+func (data *Int8FieldData) GetRowSize(i int) int           { return 1 }
+func (data *Int16FieldData) GetRowSize(i int) int          { return 2 }
+func (data *Int32FieldData) GetRowSize(i int) int          { return 4 }
+func (data *Int64FieldData) GetRowSize(i int) int          { return 8 }
+func (data *FloatFieldData) GetRowSize(i int) int          { return 4 }
+func (data *DoubleFieldData) GetRowSize(i int) int         { return 8 }
+func (data *TimestamptzFieldData) GetRowSize(i int) int    { return 8 }
+func (data *BinaryVectorFieldData) GetRowSize(i int) int   { return data.Dim / 8 }
+func (data *FloatVectorFieldData) GetRowSize(i int) int    { return data.Dim * 4 }
+func (data *Float16VectorFieldData) GetRowSize(i int) int  { return data.Dim * 2 }
+func (data *BFloat16VectorFieldData) GetRowSize(i int) int { return data.Dim * 2 }
+func (data *Int8VectorFieldData) GetRowSize(i int) int     { return data.Dim }
+func (data *StringFieldData) GetRowSize(i int) int         { return len(data.Data[i]) + 16 }
+func (data *JSONFieldData) GetRowSize(i int) int           { return len(data.Data[i]) + 16 }
+func (data *GeometryFieldData) GetRowSize(i int) int       { return len(data.Data[i]) + 16 }
+func (data *MolFieldData) GetRowSize(i int) int            { return len(data.Data[i]) + 16 }
 func (data *ArrayFieldData) GetRowSize(i int) int {
 	switch data.ElementType {
 	case schemapb.DataType_Bool:
@@ -1981,11 +1830,7 @@ func (data *ArrayFieldData) GetRowSize(i int) int {
 }
 
 func (data *SparseFloatVectorFieldData) GetRowSize(i int) int {
-	if data.GetNullable() && !data.ValidData[i] {
-		return 0
-	}
-	physicalIdx := data.L2PMapping.GetPhysicalOffset(i)
-	return len(data.Contents[physicalIdx])
+	return len(data.Contents[i])
 }
 
 func (data *VectorArrayFieldData) GetRowSize(i int) int {
@@ -2025,27 +1870,27 @@ func (data *TimestamptzFieldData) GetNullable() bool {
 }
 
 func (data *BFloat16VectorFieldData) GetNullable() bool {
-	return data.Nullable
+	return false
 }
 
 func (data *BinaryVectorFieldData) GetNullable() bool {
-	return data.Nullable
+	return false
 }
 
 func (data *FloatVectorFieldData) GetNullable() bool {
-	return data.Nullable
+	return false
 }
 
 func (data *SparseFloatVectorFieldData) GetNullable() bool {
-	return data.Nullable
+	return false
 }
 
 func (data *Float16VectorFieldData) GetNullable() bool {
-	return data.Nullable
+	return false
 }
 
 func (data *Int8VectorFieldData) GetNullable() bool {
-	return data.Nullable
+	return false
 }
 
 func (data *StringFieldData) GetNullable() bool {
@@ -2068,22 +1913,6 @@ func (data *GeometryFieldData) GetNullable() bool {
 	return data.Nullable
 }
 
-func (data *BoolFieldData) GetValidData() []bool              { return data.ValidData }
-func (data *Int8FieldData) GetValidData() []bool              { return data.ValidData }
-func (data *Int16FieldData) GetValidData() []bool             { return data.ValidData }
-func (data *Int32FieldData) GetValidData() []bool             { return data.ValidData }
-func (data *Int64FieldData) GetValidData() []bool             { return data.ValidData }
-func (data *FloatFieldData) GetValidData() []bool             { return data.ValidData }
-func (data *DoubleFieldData) GetValidData() []bool            { return data.ValidData }
-func (data *TimestamptzFieldData) GetValidData() []bool       { return data.ValidData }
-func (data *StringFieldData) GetValidData() []bool            { return data.ValidData }
-func (data *ArrayFieldData) GetValidData() []bool             { return data.ValidData }
-func (data *JSONFieldData) GetValidData() []bool              { return data.ValidData }
-func (data *GeometryFieldData) GetValidData() []bool          { return data.ValidData }
-func (data *BinaryVectorFieldData) GetValidData() []bool      { return data.ValidData }
-func (data *FloatVectorFieldData) GetValidData() []bool       { return data.ValidData }
-func (data *Float16VectorFieldData) GetValidData() []bool     { return data.ValidData }
-func (data *BFloat16VectorFieldData) GetValidData() []bool    { return data.ValidData }
-func (data *SparseFloatVectorFieldData) GetValidData() []bool { return data.ValidData }
-func (data *Int8VectorFieldData) GetValidData() []bool        { return data.ValidData }
-func (data *VectorArrayFieldData) GetValidData() []bool       { return nil }
+func (data *MolFieldData) GetNullable() bool {
+	return data.Nullable
+}
