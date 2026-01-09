@@ -22,7 +22,6 @@ import (
 	"math/bits"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -135,8 +134,7 @@ const (
 )
 
 const (
-	// Version 3: metadata moved to separate meta.json file (instead of parquet metadata)
-	JSONStatsDataFormatVersion = 3
+	JSONStatsDataFormatVersion = 2
 )
 
 // Search, Index parameter keys
@@ -189,7 +187,6 @@ const (
 	CollectionTTLConfigKey      = "collection.ttl.seconds"
 	CollectionAutoCompactionKey = "collection.autocompaction.enabled"
 	CollectionDescription       = "collection.description"
-	CollectionTTLFieldKey       = "ttl_field"
 
 	// Deprecated: will be removed in the 3.0 after implementing ack sync up semantic.
 	CollectionOnTruncatingKey = "collection.on.truncating" // when collection is on truncating, forbid the compaction of current collection.
@@ -203,6 +200,8 @@ const (
 	// rate limit
 	CollectionInsertRateMaxKey   = "collection.insertRate.max.mb"
 	CollectionInsertRateMinKey   = "collection.insertRate.min.mb"
+	CollectionUpsertRateMaxKey   = "collection.upsertRate.max.mb"
+	CollectionUpsertRateMinKey   = "collection.upsertRate.min.mb"
 	CollectionDeleteRateMaxKey   = "collection.deleteRate.max.mb"
 	CollectionDeleteRateMinKey   = "collection.deleteRate.min.mb"
 	CollectionBulkLoadRateMaxKey = "collection.bulkLoadRate.max.mb"
@@ -243,6 +242,8 @@ const (
 	PartitionKeyIsolationKey   = "partitionkey.isolation"
 	FieldSkipLoadKey           = "field.skipLoad"
 	IndexOffsetCacheEnabledKey = "indexoffsetcache.enabled"
+	ReplicateIDKey             = "replicate.id"
+	ReplicateEndTSKey          = "replicate.endTS"
 	IndexNonEncoding           = "index.nonEncoding"
 	EnableDynamicSchemaKey     = `dynamicfield.enabled`
 	NamespaceEnabledKey        = "namespace.enabled"
@@ -514,6 +515,33 @@ func ShouldFieldBeLoaded(kvs []*commonpb.KeyValuePair) (bool, error) {
 	return true, nil
 }
 
+func IsReplicateEnabled(kvs []*commonpb.KeyValuePair) (bool, bool) {
+	replicateID, ok := GetReplicateID(kvs)
+	return replicateID != "", ok
+}
+
+func GetReplicateID(kvs []*commonpb.KeyValuePair) (string, bool) {
+	for _, kv := range kvs {
+		if kv.GetKey() == ReplicateIDKey {
+			return kv.GetValue(), true
+		}
+	}
+	return "", false
+}
+
+func GetReplicateEndTS(kvs []*commonpb.KeyValuePair) (uint64, bool) {
+	for _, kv := range kvs {
+		if kv.GetKey() == ReplicateEndTSKey {
+			ts, err := strconv.ParseUint(kv.GetValue(), 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			return ts, true
+		}
+	}
+	return 0, false
+}
+
 func IsEnableDynamicSchema(kvs []*commonpb.KeyValuePair) (found bool, value bool, err error) {
 	for _, kv := range kvs {
 		if kv.GetKey() == EnableDynamicSchemaKey {
@@ -606,33 +634,6 @@ func GetStringValue(kvs []*commonpb.KeyValuePair, key string) (result string, ex
 	return kv.GetValue(), true
 }
 
-func GetCollectionTTL(kvs []*commonpb.KeyValuePair) (time.Duration, error) {
-	value, parseErr, exist := GetInt64Value(kvs, CollectionTTLConfigKey)
-	if parseErr != nil {
-		return 0, parseErr
-	}
-
-	if !exist {
-		return -1, nil
-	}
-
-	return time.Duration(value) * time.Second, nil
-}
-
-func GetCollectionTTLFromMap(kvs map[string]string) (time.Duration, error) {
-	value, exist := kvs[CollectionTTLConfigKey]
-	if !exist {
-		return -1, nil
-	}
-
-	ttlSeconds, err := strconv.ParseInt(value, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-
-	return time.Duration(ttlSeconds) * time.Second, nil
-}
-
 func CheckNamespace(schema *schemapb.CollectionSchema, namespace *string) error {
 	enabled, _, err := ParseNamespaceProp(schema.Properties...)
 	if err != nil {
@@ -656,10 +657,7 @@ func ConvertWKTToWKB(wktStr string) ([]byte, error) {
 	return wkb.Marshal(geomT, wkb.NDR, wkbcommon.WKBOptionEmptyPointHandling(wkbcommon.EmptyPointHandlingNaN))
 }
 
-func ConvertWKBToWKT(wkbData []byte) (string, error) {
-	geomT, err := wkb.Unmarshal(wkbData, wkbcommon.WKBOptionEmptyPointHandling(wkbcommon.EmptyPointHandlingNaN))
-	if err != nil {
-		return "", err
-	}
-	return wkt.Marshal(geomT)
+func ConvertSMILESToPickle(molData string) ([]byte, error) {
+	// TODO: implement this function
+	return []byte(molData), nil
 }
