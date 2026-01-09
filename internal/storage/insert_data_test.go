@@ -476,3 +476,511 @@ func (s *ArrayFieldDataSuite) TestArrayFieldData() {
 	s.False(insertData.IsEmpty())
 	s.Equal(115, insertData.GetRowSize(0))
 }
+
+type MolFieldDataSuite struct {
+	suite.Suite
+}
+
+func TestMolFieldDataSuite(t *testing.T) {
+	suite.Run(t, new(MolFieldDataSuite))
+}
+
+func (s *MolFieldDataSuite) TestRowNum() {
+	s.Run("empty data", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+		s.Equal(0, data.RowNum())
+	})
+
+	s.Run("single row", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{[]byte("CCO")},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+		s.Equal(1, data.RowNum())
+	})
+
+	s.Run("multiple rows", func() {
+		data := &MolFieldData{
+			Data: [][]byte{
+				[]byte("CCO"),
+				[]byte("CC(C)CC1=CC=C(C=C1)C(C)C(=O)O"),
+				[]byte("C1=CC=CC=C1"),
+			},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+		s.Equal(3, data.RowNum())
+	})
+}
+
+func (s *MolFieldDataSuite) TestAppendRow() {
+	s.Run("append []byte to non-nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		err := data.AppendRow([]byte("CCO"))
+		s.NoError(err)
+		s.Equal(1, data.RowNum())
+		s.Equal([][]byte{[]byte("CCO")}, data.Data)
+		s.Equal(0, len(data.ValidData))
+	})
+
+	s.Run("append string to non-nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		err := data.AppendRow("CC(C)CC1=CC=C(C=C1)C(C)C(=O)O")
+		s.NoError(err)
+		s.Equal(1, data.RowNum())
+		s.Equal([][]byte{[]byte("CC(C)CC1=CC=C(C=C1)C(C)C(=O)O")}, data.Data)
+		s.Equal(0, len(data.ValidData))
+	})
+
+	s.Run("append []byte to nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		err := data.AppendRow([]byte("CCO"))
+		s.NoError(err)
+		s.Equal(1, data.RowNum())
+		s.Equal([][]byte{[]byte("CCO")}, data.Data)
+		s.Equal(1, len(data.ValidData))
+		s.True(data.ValidData[0])
+	})
+
+	s.Run("append string to nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		err := data.AppendRow("C1=CC=CC=C1")
+		s.NoError(err)
+		s.Equal(1, data.RowNum())
+		s.Equal([][]byte{[]byte("C1=CC=CC=C1")}, data.Data)
+		s.Equal(1, len(data.ValidData))
+		s.True(data.ValidData[0])
+	})
+
+	s.Run("append nil to nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		err := data.AppendRow(nil)
+		s.NoError(err)
+		s.Equal(1, data.RowNum())
+		s.Equal(1, len(data.Data))
+		s.Equal([]byte(nil), data.Data[0])
+		s.Equal(1, len(data.ValidData))
+		s.False(data.ValidData[0])
+	})
+
+	s.Run("append nil to non-nullable field should fail", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		err := data.AppendRow(nil)
+		s.Error(err)
+		s.Contains(err.Error(), "Wrong row type")
+		s.Equal(0, data.RowNum())
+	})
+
+	s.Run("append invalid type should fail", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		err := data.AppendRow(123)
+		s.Error(err)
+		s.Contains(err.Error(), "Wrong row type")
+		s.Equal(0, data.RowNum())
+	})
+
+	s.Run("append multiple rows", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		err := data.AppendRow([]byte("CCO"))
+		s.NoError(err)
+		err = data.AppendRow("C1=CC=CC=C1")
+		s.NoError(err)
+		err = data.AppendRow(nil)
+		s.NoError(err)
+
+		s.Equal(3, data.RowNum())
+		s.Equal([][]byte{
+			[]byte("CCO"),
+			[]byte("C1=CC=CC=C1"),
+			nil,
+		}, data.Data)
+		s.Equal([]bool{true, true, false}, data.ValidData)
+	})
+}
+
+func (s *MolFieldDataSuite) TestAppendDataRows() {
+	s.Run("append [][]byte to non-nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		rows := [][]byte{
+			[]byte("CCO"),
+			[]byte("CC(C)CC1=CC=C(C=C1)C(C)C(=O)O"),
+		}
+
+		err := data.AppendDataRows(rows)
+		s.NoError(err)
+		s.Equal(2, data.RowNum())
+		s.Equal(rows, data.Data)
+		s.Equal(0, len(data.ValidData))
+	})
+
+	s.Run("append []string to non-nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		rows := []string{
+			"CCO",
+			"C1=CC=CC=C1",
+			"CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
+		}
+
+		err := data.AppendDataRows(rows)
+		s.NoError(err)
+		s.Equal(3, data.RowNum())
+		s.Equal([][]byte{
+			[]byte("CCO"),
+			[]byte("C1=CC=CC=C1"),
+			[]byte("CN1C=NC2=C1C(=O)N(C(=O)N2C)C"),
+		}, data.Data)
+		s.Equal(0, len(data.ValidData))
+	})
+
+	s.Run("append [][]byte to nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		rows := [][]byte{
+			[]byte("CCO"),
+			[]byte("C1=CC=CC=C1"),
+		}
+
+		err := data.AppendDataRows(rows)
+		s.NoError(err)
+		s.Equal(2, data.RowNum())
+		s.Equal(rows, data.Data)
+		// AppendDataRows 不会更新 ValidData
+		s.Equal(0, len(data.ValidData))
+	})
+
+	s.Run("append []string to nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		rows := []string{
+			"CCO",
+			"CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
+		}
+
+		err := data.AppendDataRows(rows)
+		s.NoError(err)
+		s.Equal(2, data.RowNum())
+		s.Equal([][]byte{
+			[]byte("CCO"),
+			[]byte("CC(C)CC1=CC=C(C=C1)C(C)C(=O)O"),
+		}, data.Data)
+		// AppendDataRows 不会更新 ValidData
+		s.Equal(0, len(data.ValidData))
+	})
+
+	s.Run("append invalid type should fail", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		err := data.AppendDataRows([]int{1, 2, 3})
+		s.Error(err)
+		s.Contains(err.Error(), "Wrong rows type")
+		s.Equal(0, data.RowNum())
+	})
+
+	s.Run("append empty slice", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		err := data.AppendDataRows([][]byte{})
+		s.NoError(err)
+		s.Equal(0, data.RowNum())
+
+		err = data.AppendDataRows([]string{})
+		s.NoError(err)
+		s.Equal(0, data.RowNum())
+	})
+}
+
+func (s *MolFieldDataSuite) TestGetRow() {
+	s.Run("get row from non-nullable field", func() {
+		data := &MolFieldData{
+			Data: [][]byte{
+				[]byte("CCO"),
+				[]byte("C1=CC=CC=C1"),
+			},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		row0 := data.GetRow(0)
+		s.Equal([]byte("CCO"), row0)
+
+		row1 := data.GetRow(1)
+		s.Equal([]byte("C1=CC=CC=C1"), row1)
+	})
+
+	s.Run("get row from nullable field with valid data", func() {
+		data := &MolFieldData{
+			Data: [][]byte{
+				[]byte("CCO"),
+				[]byte("C1=CC=CC=C1"),
+			},
+			ValidData: []bool{true, true},
+			Nullable:  true,
+		}
+
+		row0 := data.GetRow(0)
+		s.Equal([]byte("CCO"), row0)
+
+		row1 := data.GetRow(1)
+		s.Equal([]byte("C1=CC=CC=C1"), row1)
+	})
+
+	s.Run("get null row from nullable field", func() {
+		data := &MolFieldData{
+			Data: [][]byte{
+				[]byte("CCO"),
+				nil,
+				[]byte("C1=CC=CC=C1"),
+			},
+			ValidData: []bool{true, false, true},
+			Nullable:  true,
+		}
+
+		row0 := data.GetRow(0)
+		s.Equal([]byte("CCO"), row0)
+
+		row1 := data.GetRow(1)
+		s.Nil(row1)
+
+		row2 := data.GetRow(2)
+		s.Equal([]byte("C1=CC=CC=C1"), row2)
+	})
+
+	s.Run("get row with out of bounds index should panic", func() {
+		data := &MolFieldData{
+			Data: [][]byte{
+				[]byte("CCO"),
+			},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		s.Panics(func() {
+			_ = data.GetRow(1)
+		})
+	})
+}
+
+func (s *MolFieldDataSuite) TestNullable() {
+	s.Run("non-nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		s.False(data.GetNullable())
+	})
+
+	s.Run("nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		s.True(data.GetNullable())
+	})
+
+	s.Run("nullable field with null values", func() {
+		data := &MolFieldData{
+			Data: [][]byte{
+				[]byte("CCO"),
+				nil,
+			},
+			ValidData: []bool{true, false},
+			Nullable:  true,
+		}
+
+		s.True(data.GetNullable())
+		s.Equal(2, data.RowNum())
+		s.Nil(data.GetRow(1))
+		s.Equal([]byte("CCO"), data.GetRow(0))
+	})
+}
+
+func (s *MolFieldDataSuite) TestGetDataRows() {
+	data := &MolFieldData{
+		Data: [][]byte{
+			[]byte("CCO"),
+			[]byte("C1=CC=CC=C1"),
+			[]byte("CN1C=NC2=C1C(=O)N(C(=O)N2C)C"),
+		},
+		ValidData: []bool{},
+		Nullable:  false,
+	}
+
+	rows := data.GetDataRows()
+	s.Equal([][]byte{
+		[]byte("CCO"),
+		[]byte("C1=CC=CC=C1"),
+		[]byte("CN1C=NC2=C1C(=O)N(C(=O)N2C)C"),
+	}, rows)
+}
+
+func (s *MolFieldDataSuite) TestGetDataType() {
+	data := &MolFieldData{
+		Data:      [][]byte{},
+		ValidData: []bool{},
+		Nullable:  false,
+	}
+
+	s.Equal(schemapb.DataType_Mol, data.GetDataType())
+}
+
+func (s *MolFieldDataSuite) TestMolFieldDataIntegration() {
+	s.Run("complete workflow with nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  true,
+		}
+
+		// Append using AppendRow
+		err := data.AppendRow([]byte("CCO"))
+		s.NoError(err)
+
+		err = data.AppendRow("C1=CC=CC=C1")
+		s.NoError(err)
+
+		err = data.AppendRow(nil)
+		s.NoError(err)
+
+		// Append using AppendDataRows - need to update ValidData manually
+		err = data.AppendDataRows([]string{
+			"CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
+			"CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
+		})
+		s.NoError(err)
+		// Manually update ValidData for rows added via AppendDataRows
+		data.ValidData = append(data.ValidData, true, true)
+
+		// Verify data
+		s.Equal(5, data.RowNum())
+		s.Equal(5, len(data.ValidData))
+		s.True(data.ValidData[0])
+		s.True(data.ValidData[1])
+		s.False(data.ValidData[2])
+		s.True(data.ValidData[3])
+		s.True(data.ValidData[4])
+
+		// Verify GetRow
+		s.Equal([]byte("CCO"), data.GetRow(0))
+		s.Equal([]byte("C1=CC=CC=C1"), data.GetRow(1))
+		s.Nil(data.GetRow(2))
+		s.Equal([]byte("CN1C=NC2=C1C(=O)N(C(=O)N2C)C"), data.GetRow(3))
+		s.Equal([]byte("CC(C)CC1=CC=C(C=C1)C(C)C(=O)O"), data.GetRow(4))
+
+		// Verify GetDataType
+		s.Equal(schemapb.DataType_Mol, data.GetDataType())
+
+		// Verify GetNullable
+		s.True(data.GetNullable())
+	})
+
+	s.Run("complete workflow with non-nullable field", func() {
+		data := &MolFieldData{
+			Data:      [][]byte{},
+			ValidData: []bool{},
+			Nullable:  false,
+		}
+
+		// Append using AppendRow
+		err := data.AppendRow([]byte("CCO"))
+		s.NoError(err)
+
+		err = data.AppendRow("C1=CC=CC=C1")
+		s.NoError(err)
+
+		// Append using AppendDataRows
+		err = data.AppendDataRows([][]byte{
+			[]byte("CN1C=NC2=C1C(=O)N(C(=O)N2C)C"),
+		})
+		s.NoError(err)
+
+		// Verify data
+		s.Equal(3, data.RowNum())
+		s.Equal(0, len(data.ValidData)) // Non-nullable fields don't track ValidData
+
+		// Verify GetRow
+		s.Equal([]byte("CCO"), data.GetRow(0))
+		s.Equal([]byte("C1=CC=CC=C1"), data.GetRow(1))
+		s.Equal([]byte("CN1C=NC2=C1C(=O)N(C(=O)N2C)C"), data.GetRow(2))
+
+		// Verify GetDataType
+		s.Equal(schemapb.DataType_Mol, data.GetDataType())
+
+		// Verify GetNullable
+		s.False(data.GetNullable())
+	})
+}
