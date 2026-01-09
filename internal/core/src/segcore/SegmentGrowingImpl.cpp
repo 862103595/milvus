@@ -1158,6 +1158,16 @@ SegmentGrowingImpl::bulk_subscript(milvus::OpContext* op_ctx,
                                                      ->mutable_data());
             break;
         }
+        case DataType::MOL: {
+            bulk_subscript_ptr_impl<std::string>(op_ctx,
+                                                 vec_ptr,
+                                                 seg_offsets,
+                                                 count,
+                                                 result->mutable_scalars()
+                                                     ->mutable_mol_smiles_data()
+                                                     ->mutable_data());
+            break;
+        }
         case DataType::ARRAY: {
             // element
             bulk_subscript_array_impl(op_ctx,

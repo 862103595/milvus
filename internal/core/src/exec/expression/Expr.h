@@ -1346,6 +1346,9 @@ class SegmentExpr : public Expr {
                     case DataType::GEOMETRY: {
                         return ProcessIndexChunksForValid<std::string>();
                     }
+                    case DataType::MOL: {
+                        return ProcessIndexChunksForValid<std::string>();
+                    }
                     default:
                         ThrowInfo(DataTypeInvalid,
                                   "unsupported element type: {}",
