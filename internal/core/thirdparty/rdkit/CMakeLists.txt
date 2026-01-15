@@ -34,21 +34,31 @@ if(EXISTS "${RDKIT_SOURCE_DIR}/CMakeLists.txt")
     set(RDKIT_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/rdkit-build")
     
     # RDKit CMake configuration options
-    # Disable Python wrappers and other unnecessary components for Milvus
+    # Minimal build: only SMILES parsing, fingerprints, pickle serialization, substructure matching
+    # Required modules:
+    #   - SmilesParse: SMILES parsing
+    #   - Fingerprints: fingerprint generation (Morgan, RDKit, MACCS)
+    #   - SubstructMatch: substructure matching
+    #   - PicklerOps (in RDGeneral): pickle serialization
     set(RDKIT_CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
         -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
         -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
         -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
         -DRDK_BUILD_PYTHON_WRAPPERS=OFF
-        -DRDK_BUILD_INCHI_SUPPORT=ON
-        -DRDK_BUILD_AVALON_SUPPORT=ON
+        -DRDK_BUILD_INCHI_SUPPORT=OFF
+        -DRDK_BUILD_AVALON_SUPPORT=OFF
         -DRDK_BUILD_CPP_TESTS=OFF
         -DRDK_BUILD_SWIG_WRAPPERS=OFF
         -DRDK_BUILD_DESCRIPTORS3D=OFF
         -DRDK_BUILD_MOLINTERCHANGE_SUPPORT=OFF
         -DRDK_BUILD_FREETYPE_SUPPORT=OFF
         -DRDK_BUILD_COORDGEN_SUPPORT=OFF
+        -DRDK_BUILD_CAIRO_SUPPORT=OFF
+        -DRDK_BUILD_QT_SUPPORT=OFF
+        -DRDK_BUILD_CHEMDRAW_SUPPORT=OFF
+        -DRDK_BUILD_MAEPARSER_SUPPORT=OFF
+        -DRDK_BUILD_THREADSAFE_SSS=ON
         -DBOOST_ROOT=${CONAN_BOOST_ROOT}
         -DBoost_NO_BOOST_CMAKE=ON
     )
@@ -126,8 +136,8 @@ else()
     include(FetchContent)
     
     # RDKit Git repository and version
-    set(RDKIT_VERSION "Release_2024_03_1" CACHE STRING "RDKit version/tag to use")
-    set(RDKIT_GIT_REPOSITORY "https://github.com/rdkit/rdkit.git" CACHE STRING "RDKit Git repository")
+    set(RDKIT_VERSION "milvus-modifications" CACHE STRING "RDKit version/branch to use")
+    set(RDKIT_GIT_REPOSITORY "https://github.com/862103595/rdkit.git" CACHE STRING "RDKit Git repository")
     
     FetchContent_Declare(
         rdkit
@@ -142,13 +152,31 @@ else()
         FetchContent_Populate(rdkit)
         
         # Configure RDKit build options
+        # Minimal build: only SMILES parsing, fingerprints, pickle serialization, substructure matching
+        # Required modules:
+        #   - SmilesParse: SMILES parsing
+        #   - Fingerprints: fingerprint generation (Morgan, RDKit, MACCS)
+        #   - SubstructMatch: substructure matching
+        #   - PicklerOps (in RDGeneral): pickle serialization
         set(RDKIT_CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+            -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
             -DRDK_BUILD_PYTHON_WRAPPERS=OFF
-            -DRDK_BUILD_INCHI_SUPPORT=ON
-            -DRDK_BUILD_AVALON_SUPPORT=ON
+            -DRDK_BUILD_INCHI_SUPPORT=OFF
+            -DRDK_BUILD_AVALON_SUPPORT=OFF
             -DRDK_BUILD_CPP_TESTS=OFF
             -DRDK_BUILD_SWIG_WRAPPERS=OFF
+            -DRDK_BUILD_DESCRIPTORS3D=OFF
+            -DRDK_BUILD_MOLINTERCHANGE_SUPPORT=OFF
+            -DRDK_BUILD_FREETYPE_SUPPORT=OFF
+            -DRDK_BUILD_COORDGEN_SUPPORT=OFF
+            -DRDK_BUILD_CAIRO_SUPPORT=OFF
+            -DRDK_BUILD_QT_SUPPORT=OFF
+            -DRDK_BUILD_CHEMDRAW_SUPPORT=OFF
+            -DRDK_BUILD_MAEPARSER_SUPPORT=OFF
+            -DRDK_BUILD_THREADSAFE_SSS=ON
             -DBOOST_ROOT=${CONAN_BOOST_ROOT}
             -DBoost_NO_BOOST_CMAKE=ON
         )
@@ -162,9 +190,15 @@ else()
             BINARY_DIR ${rdkit_BINARY_DIR}
             CMAKE_ARGS ${RDKIT_CMAKE_ARGS}
             ${EP_LOG_OPTIONS}
+            BUILD_BYPRODUCTS 
+                "${CMAKE_INSTALL_PREFIX}/lib/libRDKitGraphMol${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                "${CMAKE_INSTALL_PREFIX}/lib/libRDKitGraphMol${CMAKE_STATIC_LIBRARY_SUFFIX}"
+                "${CMAKE_INSTALL_PREFIX}/lib/libRDKitDescriptors${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                "${CMAKE_INSTALL_PREFIX}/lib/libRDKitFingerprints${CMAKE_SHARED_LIBRARY_SUFFIX}"
         )
         
-        # Create imported targets (same as above)
+        # Create imported library targets for RDKit components
+        # Main GraphMol library
         add_library(RDKit::RDKitGraphMol SHARED IMPORTED)
         set_target_properties(RDKit::RDKitGraphMol
             PROPERTIES
@@ -172,6 +206,35 @@ else()
             INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/include/rdkit"
         )
         add_dependencies(RDKit::RDKitGraphMol rdkit_ep)
+        
+        # Descriptors library (for fingerprint generation)
+        add_library(RDKit::RDKitDescriptors SHARED IMPORTED)
+        set_target_properties(RDKit::RDKitDescriptors
+            PROPERTIES
+            IMPORTED_LOCATION "${CMAKE_INSTALL_PREFIX}/lib/libRDKitDescriptors${CMAKE_SHARED_LIBRARY_SUFFIX}"
+            INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/include/rdkit"
+            INTERFACE_LINK_LIBRARIES RDKit::RDKitGraphMol
+        )
+        add_dependencies(RDKit::RDKitDescriptors rdkit_ep)
+        
+        # Fingerprints library
+        add_library(RDKit::RDKitFingerprints SHARED IMPORTED)
+        set_target_properties(RDKit::RDKitFingerprints
+            PROPERTIES
+            IMPORTED_LOCATION "${CMAKE_INSTALL_PREFIX}/lib/libRDKitFingerprints${CMAKE_SHARED_LIBRARY_SUFFIX}"
+            INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/include/rdkit"
+            INTERFACE_LINK_LIBRARIES RDKit::RDKitGraphMol
+        )
+        add_dependencies(RDKit::RDKitFingerprints rdkit_ep)
+        
+        # Convenience target that links all RDKit libraries
+        add_library(RDKit::RDKit INTERFACE IMPORTED)
+        set_target_properties(RDKit::RDKit
+            PROPERTIES
+            INTERFACE_LINK_LIBRARIES 
+                "RDKit::RDKitGraphMol;RDKit::RDKitDescriptors;RDKit::RDKitFingerprints"
+            INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/include/rdkit"
+        )
         
         set(RDKIT_INCLUDE_DIR "${CMAKE_INSTALL_PREFIX}/include" CACHE INTERNAL "RDKit include directory")
         set(RDKIT_LIB_DIR "${CMAKE_INSTALL_PREFIX}/lib" CACHE INTERNAL "RDKit library directory")
