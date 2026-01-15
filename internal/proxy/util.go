@@ -789,7 +789,6 @@ func injectVirtualPKForExternalCollection(schema *schemapb.CollectionSchema) err
 
 	// Prepend virtual PK field to the schema fields
 	schema.Fields = append([]*schemapb.FieldSchema{virtualPKField}, schema.Fields...)
-
 	return nil
 }
 
