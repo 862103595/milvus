@@ -432,7 +432,7 @@ SetUpScalarFieldData(milvus::proto::schema::ScalarField*& scalar_array,
             break;
         }
         case DataType::MOL: {
-            auto obj = scalar_array->mutable_mol_smiles_data();
+            auto obj = scalar_array->mutable_mol_data();
             obj->mutable_data()->Reserve(count);
             for (int i = 0; i < count; i++) {
                 *(obj->mutable_data()->Add()) = std::string();
@@ -641,7 +641,7 @@ CreateScalarDataArrayFrom(const void* data_raw,
         }
         case DataType::MOL: {
             auto data = reinterpret_cast<const std::string*>(data_raw);
-            auto obj = scalar_array->mutable_mol_smiles_data();
+            auto obj = scalar_array->mutable_mol_data();
             for (auto i = 0; i < count; i++) {
                 *(obj->mutable_data()->Add()) =
                     std::string(data[i].data(), data[i].size());
@@ -971,7 +971,7 @@ MergeDataArray(std::vector<MergeBase>& merge_bases,
             }
             case DataType::MOL: {
                 auto& data = FIELD_DATA(src_field_data, mol);
-                auto obj = scalar_array->mutable_mol_smiles_data();
+                auto obj = scalar_array->mutable_mol_data();
                 *(obj->mutable_data()->Add()) = std::string(
                     data[src_offset].data(), data[src_offset].size());
                 break;
