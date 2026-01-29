@@ -1050,12 +1050,25 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 				return err
 			}
 		}
+		if fieldData.Type == schemapb.DataType_Mol {
+			if err := validateMOLFieldSearchResult(&fieldsData[i]); err != nil {
+				log.Warn("fail to validate MOL field search result", zap.Error(err))
+				return err
+			}
+		}
 	}
-	if t.result.GetResults().GetGroupByFieldValue() != nil &&
-		t.result.GetResults().GetGroupByFieldValue().GetType() == schemapb.DataType_Geometry {
-		if err := validateGeometryFieldSearchResult(&t.result.Results.GroupByFieldValue); err != nil {
-			log.Warn("fail to validate geometry field search result", zap.Error(err))
-			return err
+	if t.result.GetResults().GetGroupByFieldValue() != nil {
+		if t.result.GetResults().GetGroupByFieldValue().GetType() == schemapb.DataType_Geometry {
+			if err := validateGeometryFieldSearchResult(&t.result.Results.GroupByFieldValue); err != nil {
+				log.Warn("fail to validate geometry field search result", zap.Error(err))
+				return err
+			}
+		}
+		if t.result.GetResults().GetGroupByFieldValue().GetType() == schemapb.DataType_Mol {
+			if err := validateMOLFieldSearchResult(&t.result.Results.GroupByFieldValue); err != nil {
+				log.Warn("fail to validate MOL field search result", zap.Error(err))
+				return err
+			}
 		}
 	}
 
