@@ -19,7 +19,10 @@
 package mol
 
 // GenerateRDKitFingerprint generates an RDKit fingerprint for a SMILES string
-// This is a placeholder implementation. In production, this should call RDKit C++ library via CGO
+// minPath: minimum path length (commonly 1)
+// maxPath: maximum path length (commonly 7)
+// fingerprintSize: number of bits (commonly 2048)
+// Returns binary fingerprint as []byte
 func GenerateRDKitFingerprint(smiles string, minPath int, maxPath int, fingerprintSize int) ([]byte, error) {
 	if len(smiles) == 0 {
 		byteSize := fingerprintSize / 8
@@ -29,32 +32,36 @@ func GenerateRDKitFingerprint(smiles string, minPath int, maxPath int, fingerpri
 		return make([]byte, byteSize), nil
 	}
 
-	// TODO: Implement actual RDKit CGO call
-	// For now, return a placeholder implementation
-	// This should be replaced with actual CGO call to RDKit:
-	//  1. Parse SMILES string using RDKit
-	//  2. Generate RDKit fingerprint with specified min_path and max_path
-	//  3. Convert to binary vector of specified size
-	
-	// Placeholder: return zero vector for now
-	// In production, this should be:
-	//   fp := C.generate_rdkit_fingerprint(C.CString(smiles), C.int(minPath), C.int(maxPath), C.int(fingerprintSize))
-	//   defer C.free(unsafe.Pointer(fp.data))
-	//   return C.GoBytes(fp.data, fp.size), nil
-	
-	byteSize := fingerprintSize / 8
-	if fingerprintSize%8 != 0 {
-		byteSize++
+	return cgoGenerateRDKitFingerprint(smiles, minPath, maxPath, fingerprintSize)
+}
+
+// RDKitFingerprintToFloatVector converts binary RDKit fingerprint to float32 vector
+// Each bit becomes 0.0 or 1.0
+func RDKitFingerprintToFloatVector(fingerprint []byte, numBits int) []float32 {
+	result := make([]float32, numBits)
+	for i := 0; i < numBits && i/8 < len(fingerprint); i++ {
+		if fingerprint[i/8]&(1<<(i%8)) != 0 {
+			result[i] = 1.0
+		}
 	}
-	fingerprint := make([]byte, byteSize)
-	
-	// Simple hash-based placeholder (NOT production code)
-	// This is just to make the code compile and run
-	// Replace with actual RDKit CGO implementation
-	hash := simpleHash(smiles)
-	for i := 0; i < len(fingerprint) && i < 8; i++ {
-		fingerprint[i] = byte(hash >> (i * 8))
+	return result
+}
+
+// GenerateRDKitFingerprintAsFloatVector generates RDKit fingerprint and converts to float32 vector
+func GenerateRDKitFingerprintAsFloatVector(smiles string, minPath int, maxPath int, fingerprintSize int) ([]float32, error) {
+	fp, err := GenerateRDKitFingerprint(smiles, minPath, maxPath, fingerprintSize)
+	if err != nil {
+		return nil, err
 	}
-	
-	return fingerprint, nil
+	return RDKitFingerprintToFloatVector(fp, fingerprintSize), nil
+}
+
+// ConvertSMILESToPickle converts SMILES string to RDKit pickle format for storage
+func ConvertSMILESToPickle(smiles string) ([]byte, error) {
+	return cgoConvertSMILESToPickle(smiles)
+}
+
+// ConvertPickleToSMILES converts RDKit pickle format back to SMILES string
+func ConvertPickleToSMILES(pickle []byte) (string, error) {
+	return cgoConvertPickleToSMILES(pickle)
 }

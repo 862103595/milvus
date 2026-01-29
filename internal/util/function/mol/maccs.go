@@ -18,36 +18,39 @@
 
 package mol
 
+const (
+	// MACCSNumBits is the fixed size of MACCS fingerprint
+	MACCSNumBits = 167
+)
+
 // GenerateMACCSFingerprint generates a MACCS fingerprint for a SMILES string
 // MACCS fingerprint is fixed at 167 bits
-// This is a placeholder implementation. In production, this should call RDKit C++ library via CGO
+// Returns binary fingerprint as []byte
 func GenerateMACCSFingerprint(smiles string) ([]byte, error) {
 	if len(smiles) == 0 {
-		return make([]byte, 167/8+1), nil
+		return make([]byte, MACCSNumBits/8+1), nil
 	}
 
-	// TODO: Implement actual RDKit CGO call
-	// For now, return a placeholder implementation
-	// This should be replaced with actual CGO call to RDKit:
-	//  1. Parse SMILES string using RDKit
-	//  2. Generate MACCS fingerprint (fixed 167 bits)
-	//  3. Convert to binary vector
-	
-	// Placeholder: return zero vector for now
-	// In production, this should be:
-	//   fp := C.generate_maccs_fingerprint(C.CString(smiles))
-	//   defer C.free(unsafe.Pointer(fp.data))
-	//   return C.GoBytes(fp.data, fp.size), nil
-	
-	fingerprint := make([]byte, 167/8+1)
-	
-	// Simple hash-based placeholder (NOT production code)
-	// This is just to make the code compile and run
-	// Replace with actual RDKit CGO implementation
-	hash := simpleHash(smiles)
-	for i := 0; i < len(fingerprint) && i < 8; i++ {
-		fingerprint[i] = byte(hash >> (i * 8))
+	return cgoGenerateMACCSFingerprint(smiles)
+}
+
+// MACCSFingerprintToFloatVector converts binary MACCS fingerprint to float32 vector
+// Each bit becomes 0.0 or 1.0
+func MACCSFingerprintToFloatVector(fingerprint []byte) []float32 {
+	result := make([]float32, MACCSNumBits)
+	for i := 0; i < MACCSNumBits && i/8 < len(fingerprint); i++ {
+		if fingerprint[i/8]&(1<<(i%8)) != 0 {
+			result[i] = 1.0
+		}
 	}
-	
-	return fingerprint, nil
+	return result
+}
+
+// GenerateMACCSFingerprintAsFloatVector generates MACCS fingerprint and converts to float32 vector
+func GenerateMACCSFingerprintAsFloatVector(smiles string) ([]float32, error) {
+	fp, err := GenerateMACCSFingerprint(smiles)
+	if err != nil {
+		return nil, err
+	}
+	return MACCSFingerprintToFloatVector(fp), nil
 }
