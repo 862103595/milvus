@@ -293,10 +293,19 @@ func getEmbeddingFieldDatas(datas []*schemapb.FieldData, fieldIDs ...int64) ([]a
 	return result, nil
 }
 
-func getEmbeddingFieldData(datas []*schemapb.FieldData, fieldID int64) ([]string, error) {
+func getEmbeddingFieldData(datas []*schemapb.FieldData, fieldID int64) (any, error) {
 	for _, data := range datas {
 		if data.GetFieldId() == fieldID {
-			return data.GetScalars().GetStringData().GetData(), nil
+			// Handle String/VarChar/Text types
+			if stringData := data.GetScalars().GetStringData(); stringData != nil {
+				return stringData.GetData(), nil
+			}
+			// Handle MOL type: return [][]byte (pickle format) directly
+			// The MolFingerprintFunctionRunner will convert pickle to SMILES
+			if molData := data.GetScalars().GetMolData(); molData != nil {
+				return molData.GetData(), nil
+			}
+			return nil, fmt.Errorf("field %d has unsupported data type for embedding", fieldID)
 		}
 	}
 	return nil, fmt.Errorf("field %d not found", fieldID)

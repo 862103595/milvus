@@ -256,12 +256,14 @@ func (eNode *embeddingNode) molFingerprintEmbedding(runner function.FunctionRunn
 			return errors.New("MOL fingerprint embedding failed: input field data not found")
 		}
 
-		// Extract string data from field
+		// Extract data from field - MOL data is stored as [][]byte (pickle format)
 		switch fd := fieldData.(type) {
+		case *storage.MolFieldData:
+			datas = append(datas, fd.Data)
 		case *storage.StringFieldData:
 			datas = append(datas, fd.Data)
 		default:
-			return errors.New("MOL fingerprint embedding failed: input field data must be string/varchar")
+			return errors.New("MOL fingerprint embedding failed: input field data must be MOL or string/varchar")
 		}
 	}
 

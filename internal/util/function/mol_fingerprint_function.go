@@ -85,7 +85,53 @@ type MolFingerprintFunctionRunner struct {
 	maxPath         int
 }
 
+// ValidateMolFingerprintFunction validates MolFingerprint function using FieldNames
+// This is used during collection creation when FieldIds are not yet assigned
+func ValidateMolFingerprintFunction(collSchema *schemapb.CollectionSchema, funSchema *schemapb.FunctionSchema) error {
+	// check input field count
+	if len(funSchema.GetInputFieldNames()) != 1 {
+		return fmt.Errorf("mol fingerprint function should only have one input field, but now %d", len(funSchema.GetInputFieldNames()))
+	}
+	if len(funSchema.GetOutputFieldNames()) != 1 {
+		return fmt.Errorf("mol fingerprint function should only have one output field, but now %d", len(funSchema.GetOutputFieldNames()))
+	}
+
+	// Find fields by name (since FieldIDs may not be assigned yet during validation)
+	inputFieldName := funSchema.GetInputFieldNames()[0]
+	outputFieldName := funSchema.GetOutputFieldNames()[0]
+
+	var inputField, outputField *schemapb.FieldSchema
+	for _, field := range collSchema.GetFields() {
+		if field.GetName() == inputFieldName {
+			inputField = field
+		}
+		if field.GetName() == outputFieldName {
+			outputField = field
+		}
+	}
+
+	if inputField == nil {
+		return fmt.Errorf("mol fingerprint function input field '%s' not found", inputFieldName)
+	}
+	if outputField == nil {
+		return fmt.Errorf("mol fingerprint function output field '%s' not found", outputFieldName)
+	}
+
+	// Validate input field type
+	if inputField.GetDataType() != schemapb.DataType_Mol {
+		return fmt.Errorf("mol fingerprint function input field must be MOL type, got %s", inputField.GetDataType().String())
+	}
+
+	// Validate output field type
+	if outputField.GetDataType() != schemapb.DataType_BinaryVector {
+		return fmt.Errorf("mol fingerprint function output field must be BINARY_VECTOR type, got %s", outputField.GetDataType().String())
+	}
+
+	return nil
+}
+
 // NewMolFingerprintFunctionRunner creates a new MolFingerprintFunctionRunner
+// This is used after collection creation when FieldIds are assigned
 func NewMolFingerprintFunctionRunner(coll *schemapb.CollectionSchema, schema *schemapb.FunctionSchema) (FunctionRunner, error) {
 	if len(schema.GetOutputFieldIds()) != 1 {
 		return nil, fmt.Errorf("mol fingerprint function should only have one output field, but now %d", len(schema.GetOutputFieldIds()))
@@ -218,16 +264,25 @@ func (v *MolFingerprintFunctionRunner) BatchRun(inputs ...any) ([]any, error) {
 	}
 
 	// Extract SMILES strings from input
-	// Input can be []string (SMILES strings) or [][]byte (pickle data)
+	// Input can be []string (SMILES strings) or [][]byte (pickle data from MOL field)
 	var smilesData []string
 	switch input := inputs[0].(type) {
 	case []string:
 		smilesData = input
 	case [][]byte:
-		// Convert [][]byte to []string
+		// MOL field stores data in pickle format, need to convert to SMILES first
 		smilesData = make([]string, len(input))
-		for i, bytes := range input {
-			smilesData[i] = string(bytes)
+		for i, pickleBytes := range input {
+			if len(pickleBytes) == 0 {
+				smilesData[i] = ""
+				continue
+			}
+			// Convert pickle to SMILES
+			smiles, err := mol.ConvertPickleToSMILES(pickleBytes)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert pickle to SMILES at index %d: %w", i, err)
+			}
+			smilesData[i] = smiles
 		}
 	default:
 		return nil, fmt.Errorf("mol fingerprint function batch input must be []string or [][]byte, got %T", inputs[0])
