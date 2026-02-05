@@ -252,6 +252,11 @@ MolChunkWriter::calculate_size(const arrow::ArrayVector& array_vec) {
     size_t size = 0;
     for (const auto& data : array_vec) {
         auto array = std::dynamic_pointer_cast<arrow::BinaryArray>(data);
+        for (int64_t i = 0; i < array->length(); ++i) {
+            auto str = array->GetView(i);
+            size += str.size();
+        }
+        row_nums_ += array->length();
     }
     if (nullable_) {
         size += (row_nums_ + 7) / 8;
