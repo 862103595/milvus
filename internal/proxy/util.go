@@ -636,14 +636,6 @@ func ValidateField(field *schemapb.FieldSchema, schema *schemapb.CollectionSchem
 	if err = ValidateAutoIndexMmapConfig(isVectorType, indexParams); err != nil {
 		return err
 	}
-
-	// Validate warmup policy if specified in field TypeParams
-	if warmupPolicy, exist := common.GetWarmupPolicy(field.GetTypeParams()...); exist {
-		if err = common.ValidateWarmupPolicy(warmupPolicy); err != nil {
-			return merr.WrapErrParameterInvalidMsg("invalid warmup policy for field %s: %s", field.Name, err.Error())
-		}
-	}
-
 	return nil
 }
 
@@ -692,27 +684,12 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 	if field.GetNullable() {
 		return fmt.Errorf("nullable is not supported for fields in struct array now, fieldName = %s", field.Name)
 	}
-
-	// Validate warmup policy if specified in field TypeParams
-	if warmupPolicy, exist := common.GetWarmupPolicy(field.GetTypeParams()...); exist {
-		if err = common.ValidateWarmupPolicy(warmupPolicy); err != nil {
-			return merr.WrapErrParameterInvalidMsg("invalid warmup policy for field %s: %s", field.Name, err.Error())
-		}
-	}
-
 	return nil
 }
 
 func ValidateStructArrayField(structArrayField *schemapb.StructArrayFieldSchema, schema *schemapb.CollectionSchema) error {
 	if len(structArrayField.Fields) == 0 {
 		return fmt.Errorf("struct array field %s has no sub-fields", structArrayField.Name)
-	}
-
-	// Validate warmup policy if specified in struct field TypeParams
-	if warmupPolicy, exist := common.GetWarmupPolicy(structArrayField.GetTypeParams()...); exist {
-		if err := common.ValidateWarmupPolicy(warmupPolicy); err != nil {
-			return merr.WrapErrParameterInvalidMsg("invalid warmup policy for struct field %s: %s", structArrayField.Name, err.Error())
-		}
 	}
 
 	for _, subField := range structArrayField.Fields {
@@ -789,6 +766,7 @@ func injectVirtualPKForExternalCollection(schema *schemapb.CollectionSchema) err
 
 	// Prepend virtual PK field to the schema fields
 	schema.Fields = append([]*schemapb.FieldSchema{virtualPKField}, schema.Fields...)
+
 	return nil
 }
 
@@ -842,7 +820,7 @@ func validateMetricType(dataType schemapb.DataType, metricTypeStrRaw string) err
 		if typeutil.IsFloatVectorType(dataType) {
 			return nil
 		}
-	case metric.JACCARD, metric.HAMMING, metric.SUBSTRUCTURE, metric.SUPERSTRUCTURE, metric.MHJACCARD:
+	case metric.JACCARD, metric.HAMMING, metric.MHJACCARD:
 		if dataType == schemapb.DataType_BinaryVector {
 			return nil
 		}
@@ -1466,11 +1444,6 @@ func ValidateCollectionName(entity string) error {
 		return nil
 	}
 	return validateName(entity, "collection name")
-}
-
-// ValidateSnapshotName validates snapshot name using standard naming rules.
-func ValidateSnapshotName(snapshotName string) error {
-	return validateName(snapshotName, "snapshot name")
 }
 
 func ValidateObjectType(entity string) error {
