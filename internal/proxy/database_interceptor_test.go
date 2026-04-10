@@ -49,6 +49,7 @@ func TestDatabaseInterceptor(t *testing.T) {
 		availableReqs := []proto.Message{
 			&milvuspb.CreateCollectionRequest{},
 			&milvuspb.DropCollectionRequest{},
+			&milvuspb.TruncateCollectionRequest{},
 			&milvuspb.HasCollectionRequest{},
 			&milvuspb.LoadCollectionRequest{},
 			&milvuspb.ReleaseCollectionRequest{},
@@ -59,6 +60,9 @@ func TestDatabaseInterceptor(t *testing.T) {
 			&milvuspb.ShowCollectionsRequest{},
 			&milvuspb.AlterCollectionRequest{},
 			&milvuspb.AlterCollectionFieldRequest{},
+			&milvuspb.AddCollectionFunctionRequest{},
+			&milvuspb.DropCollectionFunctionRequest{},
+			&milvuspb.AlterCollectionFunctionRequest{},
 			&milvuspb.CreatePartitionRequest{},
 			&milvuspb.DropPartitionRequest{},
 			&milvuspb.HasPartitionRequest{},
@@ -98,6 +102,8 @@ func TestDatabaseInterceptor(t *testing.T) {
 			&milvuspb.SelectGrantRequest{Entity: &milvuspb.GrantEntity{}},
 			&milvuspb.ManualCompactionRequest{},
 			&milvuspb.RunAnalyzerRequest{},
+			&milvuspb.RefreshExternalCollectionRequest{},
+			&milvuspb.ListRefreshExternalCollectionJobsRequest{},
 		}
 
 		md := metadata.Pairs(util.HeaderDBName, "db")

@@ -58,6 +58,54 @@ func (_c *MockRecoveryStorage_Close_Call) RunAndReturn(run func()) *MockRecovery
 	return _c
 }
 
+// GetFlusherCheckpointByTimeTick provides a mock function with given fields: ctx
+func (_m *MockRecoveryStorage) GetFlusherCheckpointByTimeTick(ctx context.Context) *recovery.WALCheckpoint {
+	ret := _m.Called(ctx)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetFlusherCheckpointByTimeTick")
+	}
+
+	var r0 *recovery.WALCheckpoint
+	if rf, ok := ret.Get(0).(func(context.Context) *recovery.WALCheckpoint); ok {
+		r0 = rf(ctx)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*recovery.WALCheckpoint)
+		}
+	}
+
+	return r0
+}
+
+// MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetFlusherCheckpointByTimeTick'
+type MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call struct {
+	*mock.Call
+}
+
+// GetFlusherCheckpointByTimeTick is a helper method to define mock.On call
+//   - ctx context.Context
+func (_e *MockRecoveryStorage_Expecter) GetFlusherCheckpointByTimeTick(ctx interface{}) *MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call {
+	return &MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call{Call: _e.mock.On("GetFlusherCheckpointByTimeTick", ctx)}
+}
+
+func (_c *MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call) Run(run func(ctx context.Context)) *MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context))
+	})
+	return _c
+}
+
+func (_c *MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call) Return(_a0 *recovery.WALCheckpoint) *MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call) RunAndReturn(run func(context.Context) *recovery.WALCheckpoint) *MockRecoveryStorage_GetFlusherCheckpointByTimeTick_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // GetSchema provides a mock function with given fields: ctx, vchannel, timetick
 func (_m *MockRecoveryStorage) GetSchema(ctx context.Context, vchannel string, timetick uint64) (*schemapb.CollectionSchema, error) {
 	ret := _m.Called(ctx, vchannel, timetick)

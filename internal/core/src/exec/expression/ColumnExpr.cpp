@@ -16,6 +16,15 @@
 
 #include "ColumnExpr.h"
 
+#include <cstdint>
+#include <functional>
+
+#include "bitset/bitset.h"
+#include "boost/variant/get.hpp"
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "opentelemetry/trace/span.h"
+
 namespace milvus {
 namespace exec {
 
@@ -71,6 +80,9 @@ PhyColumnExpr::Eval(EvalCtx& context, VectorPtr& result) {
 template <typename T>
 VectorPtr
 PhyColumnExpr::DoEval(OffsetVector* input) {
+    AssertInfo(!expr_->GetColumn().element_level_,
+               "ColumnExpr of row-level access is not supported");
+
     // similar to PhyCompareFilterExpr::ExecCompareExprDispatcher(OpType op)
     // take offsets as input
     if (has_offset_input_) {

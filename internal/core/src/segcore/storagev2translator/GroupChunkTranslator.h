@@ -38,12 +38,15 @@ class GroupChunkTranslator
  public:
     GroupChunkTranslator(
         int64_t segment_id,
+        GroupChunkType group_chunk_type,
         const std::unordered_map<FieldId, FieldMeta>& field_metas,
         FieldDataInfo column_group_info,
         std::vector<std::string> insert_files,
         bool use_mmap,
+        bool mmap_populate,
         int64_t num_fields,
-        milvus::proto::common::LoadPriority load_priority);
+        milvus::proto::common::LoadPriority load_priority,
+        const std::string& warmup_policy);
 
     ~GroupChunkTranslator() override;
 
@@ -62,14 +65,14 @@ class GroupChunkTranslator
 
     std::vector<std::pair<milvus::cachinglayer::cid_t,
                           std::unique_ptr<milvus::GroupChunk>>>
-    get_cells(const std::vector<milvus::cachinglayer::cid_t>& cids) override;
+    get_cells(milvus::OpContext* ctx,
+              const std::vector<milvus::cachinglayer::cid_t>& cids) override;
 
     std::pair<size_t, size_t>
-    get_file_and_row_group_index(milvus::cachinglayer::cid_t cid) const;
+    get_file_and_row_group_offset(size_t global_row_group_idx) const;
 
     milvus::cachinglayer::cid_t
-    get_cid_from_file_and_row_group_index(size_t file_idx,
-                                          size_t row_group_idx) const;
+    get_global_row_group_idx(size_t file_idx, size_t row_group_idx) const;
 
     milvus::cachinglayer::Meta*
     meta() override {
@@ -82,12 +85,8 @@ class GroupChunkTranslator
         constexpr int64_t MIN_STORAGE_BYTES = 1 * 1024 * 1024;
         int64_t total_size = 0;
         for (auto cid : cids) {
-            auto [file_idx, row_group_idx] = get_file_and_row_group_index(cid);
-            auto& row_group_meta =
-                row_group_meta_list_[file_idx].Get(row_group_idx);
             total_size +=
-                std::max(static_cast<int64_t>(row_group_meta.memory_size()),
-                         MIN_STORAGE_BYTES);
+                std::max(meta_.chunk_memory_size_[cid], MIN_STORAGE_BYTES);
         }
         return total_size;
     }
@@ -103,11 +102,13 @@ class GroupChunkTranslator
     }
 
  private:
+    // Load a single cell which may contain multiple row groups
     std::unique_ptr<milvus::GroupChunk>
-    load_group_chunk(const std::shared_ptr<arrow::Table>& table,
+    load_group_chunk(const std::vector<std::shared_ptr<arrow::Table>>& tables,
                      const milvus::cachinglayer::cid_t cid);
 
     int64_t segment_id_;
+    GroupChunkType group_chunk_type_{GroupChunkType::DEFAULT};
     std::string key_;
     std::unordered_map<FieldId, FieldMeta> field_metas_;
     FieldDataInfo column_group_info_;
@@ -115,12 +116,10 @@ class GroupChunkTranslator
     std::vector<milvus_storage::RowGroupMetadataVector> row_group_meta_list_;
     std::vector<size_t> file_row_group_prefix_sum_;
     SchemaPtr schema_;
-    bool is_sorted_by_pk_;
-    ChunkedSegmentSealedImpl* chunked_segment_;
     std::unique_ptr<milvus::segcore::InsertRecord<true>> ir_;
     GroupCTMeta meta_;
-    int64_t timestamp_offet_;
     bool use_mmap_;
+    bool mmap_populate_;
     milvus::proto::common::LoadPriority load_priority_{
         milvus::proto::common::LoadPriority::HIGH};
     std::vector<std::shared_ptr<parquet::FileMetaData>> parquet_file_metadata_;

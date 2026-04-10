@@ -31,6 +31,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	mixcoord "github.com/milvus-io/milvus/internal/coordinator"
 	mix "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
@@ -141,7 +142,8 @@ func (s *Server) init() error {
 		etcdConfig.EtcdTLSCert.GetValue(),
 		etcdConfig.EtcdTLSKey.GetValue(),
 		etcdConfig.EtcdTLSCACert.GetValue(),
-		etcdConfig.EtcdTLSMinVersion.GetValue())
+		etcdConfig.EtcdTLSMinVersion.GetValue(),
+		etcdConfig.ClientOptions()...)
 	if err != nil {
 		log.Warn("MixCoord connect to etcd failed", zap.Error(err))
 		return err
@@ -337,6 +339,10 @@ func (s *Server) AlterDatabase(ctx context.Context, request *rootcoordpb.AlterDa
 	return s.mixCoord.AlterDatabase(ctx, request)
 }
 
+func (s *Server) BackupEzk(ctx context.Context, request *internalpb.BackupEzkRequest) (*internalpb.BackupEzkResponse, error) {
+	return s.mixCoord.BackupEzk(ctx, request)
+}
+
 func (s *Server) CheckHealth(ctx context.Context, request *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error) {
 	return s.mixCoord.CheckHealth(ctx, request)
 }
@@ -530,6 +536,22 @@ func (s *Server) AlterCollectionField(ctx context.Context, request *milvuspb.Alt
 	return s.mixCoord.AlterCollectionField(ctx, request)
 }
 
+func (s *Server) AlterCollectionSchema(ctx context.Context, request *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error) {
+	return s.mixCoord.AlterCollectionSchema(ctx, request)
+}
+
+func (s *Server) AddCollectionFunction(ctx context.Context, request *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.mixCoord.AddCollectionFunction(ctx, request)
+}
+
+func (s *Server) AlterCollectionFunction(ctx context.Context, request *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.mixCoord.AlterCollectionFunction(ctx, request)
+}
+
+func (s *Server) DropCollectionFunction(ctx context.Context, request *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.mixCoord.DropCollectionFunction(ctx, request)
+}
+
 func (s *Server) RenameCollection(ctx context.Context, request *milvuspb.RenameCollectionRequest) (*commonpb.Status, error) {
 	return s.mixCoord.RenameCollection(ctx, request)
 }
@@ -714,6 +736,22 @@ func (s *Server) Flush(ctx context.Context, req *datapb.FlushRequest) (*datapb.F
 
 func (s *Server) FlushAll(ctx context.Context, req *datapb.FlushAllRequest) (*datapb.FlushAllResponse, error) {
 	return s.mixCoord.FlushAll(ctx, req)
+}
+
+func (s *Server) CreateExternalCollection(ctx context.Context, req *msgpb.CreateCollectionRequest) (*datapb.CreateExternalCollectionResponse, error) {
+	return s.mixCoord.CreateExternalCollection(ctx, req)
+}
+
+func (s *Server) RefreshExternalCollection(ctx context.Context, req *datapb.RefreshExternalCollectionRequest) (*datapb.RefreshExternalCollectionResponse, error) {
+	return s.mixCoord.RefreshExternalCollection(ctx, req)
+}
+
+func (s *Server) GetRefreshExternalCollectionProgress(ctx context.Context, req *datapb.GetRefreshExternalCollectionProgressRequest) (*datapb.GetRefreshExternalCollectionProgressResponse, error) {
+	return s.mixCoord.GetRefreshExternalCollectionProgress(ctx, req)
+}
+
+func (s *Server) ListRefreshExternalCollectionJobs(ctx context.Context, req *datapb.ListRefreshExternalCollectionJobsRequest) (*datapb.ListRefreshExternalCollectionJobsResponse, error) {
+	return s.mixCoord.ListRefreshExternalCollectionJobs(ctx, req)
 }
 
 // AssignSegmentID requests to allocate segment space for insert
@@ -924,8 +962,12 @@ func (s *Server) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerReques
 	return s.mixCoord.RunAnalyzer(ctx, req)
 }
 
-func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*commonpb.Status, error) {
+func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
 	return s.mixCoord.ValidateAnalyzer(ctx, req)
+}
+
+func (s *Server) ComputePhraseMatchSlop(ctx context.Context, req *querypb.ComputePhraseMatchSlopRequest) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	return s.mixCoord.ComputePhraseMatchSlop(ctx, req)
 }
 
 // AddFileResource add file resource
@@ -941,4 +983,63 @@ func (s *Server) RemoveFileResource(ctx context.Context, req *milvuspb.RemoveFil
 // ListFileResources list file resources
 func (s *Server) ListFileResources(ctx context.Context, req *milvuspb.ListFileResourcesRequest) (*milvuspb.ListFileResourcesResponse, error) {
 	return s.mixCoord.ListFileResources(ctx, req)
+}
+
+// TruncateCollection truncate a collection
+func (s *Server) TruncateCollection(ctx context.Context, in *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	return s.mixCoord.TruncateCollection(ctx, in)
+}
+
+func (s *Server) CreateSnapshot(ctx context.Context, req *datapb.CreateSnapshotRequest) (*commonpb.Status, error) {
+	return s.mixCoord.CreateSnapshot(ctx, req)
+}
+
+func (s *Server) DropSnapshot(ctx context.Context, req *datapb.DropSnapshotRequest) (*commonpb.Status, error) {
+	return s.mixCoord.DropSnapshot(ctx, req)
+}
+
+func (s *Server) DescribeSnapshot(ctx context.Context, req *datapb.DescribeSnapshotRequest) (*datapb.DescribeSnapshotResponse, error) {
+	return s.mixCoord.DescribeSnapshot(ctx, req)
+}
+
+func (s *Server) ListSnapshots(ctx context.Context, req *datapb.ListSnapshotsRequest) (*datapb.ListSnapshotsResponse, error) {
+	return s.mixCoord.ListSnapshots(ctx, req)
+}
+
+// RestoreSnapshot is the DataCoord API for restoring snapshot.
+// DataCoord creates collection/partitions via RootCoord, then creates copy segment jobs.
+func (s *Server) RestoreSnapshot(ctx context.Context, req *datapb.RestoreSnapshotRequest) (*datapb.RestoreSnapshotResponse, error) {
+	return s.mixCoord.RestoreSnapshot(ctx, req)
+}
+
+func (s *Server) GetRestoreSnapshotState(ctx context.Context, req *datapb.GetRestoreSnapshotStateRequest) (*datapb.GetRestoreSnapshotStateResponse, error) {
+	return s.mixCoord.GetRestoreSnapshotState(ctx, req)
+}
+
+func (s *Server) ListRestoreSnapshotJobs(ctx context.Context, req *datapb.ListRestoreSnapshotJobsRequest) (*datapb.ListRestoreSnapshotJobsResponse, error) {
+	return s.mixCoord.ListRestoreSnapshotJobs(ctx, req)
+}
+
+func (s *Server) BatchUpdateManifest(ctx context.Context, req *datapb.BatchUpdateManifestRequest) (*commonpb.Status, error) {
+	return s.mixCoord.BatchUpdateManifest(ctx, req)
+}
+
+// ClientHeartbeat handles client telemetry heartbeat requests
+func (s *Server) ClientHeartbeat(ctx context.Context, req *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error) {
+	return s.mixCoord.ClientHeartbeat(ctx, req)
+}
+
+// GetClientTelemetry retrieves client telemetry data
+func (s *Server) GetClientTelemetry(ctx context.Context, req *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error) {
+	return s.mixCoord.GetClientTelemetry(ctx, req)
+}
+
+// PushClientCommand pushes a command to clients
+func (s *Server) PushClientCommand(ctx context.Context, req *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error) {
+	return s.mixCoord.PushClientCommand(ctx, req)
+}
+
+// DeleteClientCommand deletes a client command
+func (s *Server) DeleteClientCommand(ctx context.Context, req *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error) {
+	return s.mixCoord.DeleteClientCommand(ctx, req)
 }

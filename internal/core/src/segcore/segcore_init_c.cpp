@@ -9,14 +9,22 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include "pthread.h"
+#include <stdlib.h>
+#include <string.h>
+#include <chrono>
+#include <exception>
+#include <mutex>
+#include <string>
+
+#include "cachinglayer/Manager.h"
+#include "common/EasyAssert.h"
 #include "config/ConfigKnowhere.h"
-#include "fmt/core.h"
+#include "glog/logging.h"
 #include "log/Log.h"
+#include "pthread.h"
 #include "segcore/SegcoreConfig.h"
 #include "segcore/segcore_init_c.h"
-#include "cachinglayer/Manager.h"
-#include "cachinglayer/Utils.h"
+
 namespace milvus::segcore {
 
 std::once_flag close_glog_once;
@@ -97,6 +105,20 @@ SegcoreSetDenseVectorInterminIndexRefineWithQuantFlag(const bool value) {
     milvus::segcore::SegcoreConfig& config =
         milvus::segcore::SegcoreConfig::default_config();
     config.set_refine_with_quant_flag(value);
+}
+
+extern "C" void
+SegcoreSetInterimIndexMemExpansionRate(const float value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_interim_index_mem_expansion_rate(value);
+}
+
+extern "C" void
+SegcoreSetMaxGroupByGroups(const int64_t value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_max_group_by_groups(value);
 }
 
 extern "C" void
@@ -211,7 +233,10 @@ ConfigureTieredStorage(const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
                        const float overloaded_memory_threshold_percentage,
                        const float loading_resource_factor,
                        const float max_disk_usage_percentage,
-                       const char* disk_path) {
+                       const char* disk_path,
+                       const int64_t loading_timeout_ms,
+                       const int64_t warmup_loading_timeout_ms,
+                       const uint32_t prefetch_pool_threads) {
     std::string disk_path_str(disk_path);
     milvus::cachinglayer::Manager::ConfigureTieredStorage(
         {scalarFieldCacheWarmupPolicy,
@@ -233,7 +258,29 @@ ConfigureTieredStorage(const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
          overloaded_memory_threshold_percentage,
          max_disk_usage_percentage,
          disk_path_str,
-         loading_resource_factor});
+         loading_resource_factor},
+        std::chrono::milliseconds(loading_timeout_ms),
+        std::chrono::milliseconds(warmup_loading_timeout_ms),
+        prefetch_pool_threads);
+}
+
+extern "C" void
+UpdateTieredStorageConfig(
+    const int64_t loading_timeout_ms,
+    const int64_t warmup_loading_timeout_ms,
+    const bool storage_usage_tracking_enabled,
+    const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
+    const CacheWarmupPolicy vectorFieldCacheWarmupPolicy,
+    const CacheWarmupPolicy scalarIndexCacheWarmupPolicy,
+    const CacheWarmupPolicy vectorIndexCacheWarmupPolicy) {
+    milvus::cachinglayer::Manager::UpdateConfig(
+        std::chrono::milliseconds(loading_timeout_ms),
+        std::chrono::milliseconds(warmup_loading_timeout_ms),
+        storage_usage_tracking_enabled,
+        {scalarFieldCacheWarmupPolicy,
+         vectorFieldCacheWarmupPolicy,
+         scalarIndexCacheWarmupPolicy,
+         vectorIndexCacheWarmupPolicy});
 }
 
 }  // namespace milvus::segcore

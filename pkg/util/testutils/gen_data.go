@@ -26,11 +26,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/twpayne/go-geom/encoding/wkb"
-	"github.com/twpayne/go-geom/encoding/wkt"
 	"github.com/x448/float16"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -105,7 +104,17 @@ func GenerateFloat64Array(numRows int) []float64 {
 func GenerateVarCharArray(numRows int, maxLen int) []string {
 	ret := make([]string, numRows)
 	for i := 0; i < numRows; i++ {
-		ret[i] = funcutil.RandomString(rand.Intn(maxLen))
+		suffix := fmt.Sprintf("_%d", i)
+		suffixLen := len(suffix)
+		availableLen := maxLen - suffixLen
+		if availableLen < 0 {
+			availableLen = 0
+		}
+		randLen := 0
+		if availableLen > 0 {
+			randLen = rand.Intn(availableLen + 1)
+		}
+		ret[i] = funcutil.RandomString(randLen) + suffix
 	}
 	return ret
 }
@@ -166,13 +175,11 @@ func GenerateGeometryArray(numRows int) [][]byte {
 	for i := 0; i < numRows; i++ {
 		// data of wkt string bytes ,consider to be process by proxy
 		if i == numRows-1 {
-			geomT, _ := wkt.Unmarshal("POINT (-84.036 39.997)") // add a special point finally for test
-			wkbdata, _ := wkb.Marshal(geomT, wkb.NDR)
+			wkbdata, _ := common.ConvertWKTToWKB("POINT (-84.036 39.997)") // add a special point finally for test
 			ret = append(ret, wkbdata)
 			continue
 		}
-		geomT, _ := wkt.Unmarshal(wktArray[i%6])
-		wkbdata, _ := wkb.Marshal(geomT, wkb.NDR)
+		wkbdata, _ := common.ConvertWKTToWKB(wktArray[i%6])
 		ret = append(ret, wkbdata)
 	}
 	return ret
@@ -287,6 +294,58 @@ func GenerateArrayOfFloatVectorArray(numRows int, dim int) []*schemapb.VectorFie
 	return ret
 }
 
+func GenerateArrayOfFloat16VectorArray(numRows int, dim int) []*schemapb.VectorField {
+	ret := make([]*schemapb.VectorField, 0, numRows)
+	for i := 0; i < numRows; i++ {
+		ret = append(ret, &schemapb.VectorField{
+			Dim: int64(dim),
+			Data: &schemapb.VectorField_Float16Vector{
+				Float16Vector: GenerateFloat16Vectors(ElemCountOfArray, dim),
+			},
+		})
+	}
+	return ret
+}
+
+func GenerateArrayOfBFloat16VectorArray(numRows int, dim int) []*schemapb.VectorField {
+	ret := make([]*schemapb.VectorField, 0, numRows)
+	for i := 0; i < numRows; i++ {
+		ret = append(ret, &schemapb.VectorField{
+			Dim: int64(dim),
+			Data: &schemapb.VectorField_Bfloat16Vector{
+				Bfloat16Vector: GenerateBFloat16Vectors(ElemCountOfArray, dim),
+			},
+		})
+	}
+	return ret
+}
+
+func GenerateArrayOfInt8VectorArray(numRows int, dim int) []*schemapb.VectorField {
+	ret := make([]*schemapb.VectorField, 0, numRows)
+	for i := 0; i < numRows; i++ {
+		ret = append(ret, &schemapb.VectorField{
+			Dim: int64(dim),
+			Data: &schemapb.VectorField_Int8Vector{
+				Int8Vector: typeutil.Int8ArrayToBytes(GenerateInt8Vectors(ElemCountOfArray, dim)),
+			},
+		})
+	}
+	return ret
+}
+
+func GenerateArrayOfBinaryVectorArray(numRows int, dim int) []*schemapb.VectorField {
+	ret := make([]*schemapb.VectorField, 0, numRows)
+	for i := 0; i < numRows; i++ {
+		ret = append(ret, &schemapb.VectorField{
+			Dim: int64(dim),
+			Data: &schemapb.VectorField_BinaryVector{
+				BinaryVector: GenerateBinaryVectors(ElemCountOfArray, dim),
+			},
+		})
+	}
+	return ret
+}
+
 func GenerateArrayOfStringArray(numRows int) []*schemapb.ScalarField {
 	ret := make([]*schemapb.ScalarField, 0, numRows)
 	for i := 0; i < numRows; i++ {
@@ -353,6 +412,21 @@ func GenerateInt8Vectors(numRows, dim int) []int8 {
 	ret := make([]int8, 0, total)
 	for i := 0; i < total; i++ {
 		ret = append(ret, int8(rand.Intn(256)-128))
+	}
+	return ret
+}
+
+func GenerateFloatVectorsWithInvalidData(numRows, dim int) []float32 {
+	total := numRows * dim
+	ret := make([]float32, 0, total)
+	for i := 0; i < total; i++ {
+		var f float32
+		if i%2 == 0 {
+			f = float32(math.NaN())
+		} else {
+			f = float32(math.Inf(1))
+		}
+		ret = append(ret, f)
 	}
 	return ret
 }
@@ -795,6 +869,82 @@ func NewVectorArrayFieldData(fieldName string, numRows, dim int) *schemapb.Field
 	}
 }
 
+func NewFloat16VectorArrayFieldData(fieldName string, numRows, dim int) *schemapb.FieldData {
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_ArrayOfVector,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Vectors{
+			Vectors: &schemapb.VectorField{
+				Dim: int64(dim),
+				Data: &schemapb.VectorField_VectorArray{
+					VectorArray: &schemapb.VectorArray{
+						Data:        GenerateArrayOfFloat16VectorArray(numRows, dim),
+						ElementType: schemapb.DataType_Float16Vector,
+						Dim:         int64(dim),
+					},
+				},
+			},
+		},
+	}
+}
+
+func NewBFloat16VectorArrayFieldData(fieldName string, numRows, dim int) *schemapb.FieldData {
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_ArrayOfVector,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Vectors{
+			Vectors: &schemapb.VectorField{
+				Dim: int64(dim),
+				Data: &schemapb.VectorField_VectorArray{
+					VectorArray: &schemapb.VectorArray{
+						Data:        GenerateArrayOfBFloat16VectorArray(numRows, dim),
+						ElementType: schemapb.DataType_BFloat16Vector,
+						Dim:         int64(dim),
+					},
+				},
+			},
+		},
+	}
+}
+
+func NewInt8VectorArrayFieldData(fieldName string, numRows, dim int) *schemapb.FieldData {
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_ArrayOfVector,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Vectors{
+			Vectors: &schemapb.VectorField{
+				Dim: int64(dim),
+				Data: &schemapb.VectorField_VectorArray{
+					VectorArray: &schemapb.VectorArray{
+						Data:        GenerateArrayOfInt8VectorArray(numRows, dim),
+						ElementType: schemapb.DataType_Int8Vector,
+						Dim:         int64(dim),
+					},
+				},
+			},
+		},
+	}
+}
+
+func NewBinaryVectorArrayFieldData(fieldName string, numRows, dim int) *schemapb.FieldData {
+	return &schemapb.FieldData{
+		Type:      schemapb.DataType_ArrayOfVector,
+		FieldName: fieldName,
+		Field: &schemapb.FieldData_Vectors{
+			Vectors: &schemapb.VectorField{
+				Dim: int64(dim),
+				Data: &schemapb.VectorField_VectorArray{
+					VectorArray: &schemapb.VectorArray{
+						Data:        GenerateArrayOfBinaryVectorArray(numRows, dim),
+						ElementType: schemapb.DataType_BinaryVector,
+						Dim:         int64(dim),
+					},
+				},
+			},
+		},
+	}
+}
+
 func NewArrayFieldDataWithValue(fieldName string, fieldValue interface{}) *schemapb.FieldData {
 	return &schemapb.FieldData{
 		Type:      schemapb.DataType_Array,
@@ -1157,6 +1307,22 @@ func GenerateArrayOfStructArray(schema *schemapb.StructArrayFieldSchema, numRows
 			ret = append(ret, fieldData)
 		case schemapb.DataType_FloatVector:
 			fieldData := NewVectorArrayFieldData(field.Name, numRows, dim)
+			fieldData.FieldId = field.FieldID
+			ret = append(ret, fieldData)
+		case schemapb.DataType_Float16Vector:
+			fieldData := NewFloat16VectorArrayFieldData(field.Name, numRows, dim)
+			fieldData.FieldId = field.FieldID
+			ret = append(ret, fieldData)
+		case schemapb.DataType_BFloat16Vector:
+			fieldData := NewBFloat16VectorArrayFieldData(field.Name, numRows, dim)
+			fieldData.FieldId = field.FieldID
+			ret = append(ret, fieldData)
+		case schemapb.DataType_Int8Vector:
+			fieldData := NewInt8VectorArrayFieldData(field.Name, numRows, dim)
+			fieldData.FieldId = field.FieldID
+			ret = append(ret, fieldData)
+		case schemapb.DataType_BinaryVector:
+			fieldData := NewBinaryVectorArrayFieldData(field.Name, numRows, dim)
 			fieldData.FieldId = field.FieldID
 			ret = append(ret, fieldData)
 		default:

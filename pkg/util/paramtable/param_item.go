@@ -45,6 +45,7 @@ type ParamItem struct {
 
 	Formatter func(originValue string) string
 	Forbidden bool
+	Immutable bool
 
 	manager *config.Manager
 
@@ -59,6 +60,9 @@ func (pi *ParamItem) Init(manager *config.Manager) {
 	pi.manager = manager
 	if pi.Forbidden {
 		pi.manager.ForbidUpdate(pi.Key)
+	}
+	if pi.Immutable {
+		pi.manager.ImmutableUpdate(pi.Key)
 	}
 
 	currentValue := pi.GetValue()
@@ -129,8 +133,10 @@ func (pi *ParamItem) getWithRaw() (result, raw string, err error) {
 	if pi.manager == nil {
 		panic(fmt.Sprintf("manager is nil %s", pi.Key))
 	}
-	// raw value set only once
+	// raw is always the primary key's value, used for CAS comparison.
+	// effectiveRaw is the value actually used for computing result (may come from fallback).
 	_, raw, err = pi.manager.GetConfig(pi.Key)
+	effectiveRaw := raw
 	if err != nil || raw == pi.DefaultValue {
 		// try fallback if the entry is not exist or default value,
 		//  because default value may already defined in milvus.yaml
@@ -139,16 +145,17 @@ func (pi *ParamItem) getWithRaw() (result, raw string, err error) {
 			var fallbackRaw string
 			_, fallbackRaw, err = pi.manager.GetConfig(key)
 			if err == nil {
-				raw = fallbackRaw
+				effectiveRaw = fallbackRaw
 				break
 			}
 		}
 	}
 	if err != nil {
 		// use default value
+		effectiveRaw = pi.DefaultValue
 		raw = pi.DefaultValue
 	}
-	result = raw
+	result = effectiveRaw
 	if pi.Formatter != nil {
 		result = pi.Formatter(result)
 	}

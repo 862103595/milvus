@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -245,6 +246,12 @@ func Test_NewServer(t *testing.T) {
 	t.Run("DropCollection", func(t *testing.T) {
 		mockProxy.EXPECT().DropCollection(mock.Anything, mock.Anything).Return(nil, nil)
 		_, err := server.DropCollection(ctx, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("TruncateCollection", func(t *testing.T) {
+		mockProxy.EXPECT().TruncateCollection(mock.Anything, mock.Anything).Return(nil, nil)
+		_, err := server.TruncateCollection(ctx, nil)
 		assert.NoError(t, err)
 	})
 
@@ -1124,6 +1131,51 @@ func TestNotImplementedAPIs(t *testing.T) {
 	})
 }
 
+func TestSnapshotAPIs(t *testing.T) {
+	ctx := context.Background()
+	server := getServer(t)
+	mockProxy := server.proxy.(*mocks.MockProxy)
+
+	t.Run("GetRestoreSnapshotState", func(t *testing.T) {
+		req := &milvuspb.GetRestoreSnapshotStateRequest{}
+		mockResp := &milvuspb.GetRestoreSnapshotStateResponse{
+			Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+		}
+		mockProxy.EXPECT().GetRestoreSnapshotState(mock.Anything, req).Return(mockResp, nil)
+		resp, err := server.GetRestoreSnapshotState(ctx, req)
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		assert.Equal(t, mockResp, resp)
+	})
+
+	t.Run("ListRestoreSnapshotJobs", func(t *testing.T) {
+		req := &milvuspb.ListRestoreSnapshotJobsRequest{}
+		mockResp := &milvuspb.ListRestoreSnapshotJobsResponse{
+			Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+		}
+		mockProxy.EXPECT().ListRestoreSnapshotJobs(mock.Anything, req).Return(mockResp, nil)
+		resp, err := server.ListRestoreSnapshotJobs(ctx, req)
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		assert.Equal(t, mockResp, resp)
+	})
+
+	t.Run("BatchUpdateManifest", func(t *testing.T) {
+		req := &milvuspb.BatchUpdateManifestRequest{
+			CollectionName: "test_collection",
+			Items: []*milvuspb.BatchUpdateManifestItem{
+				{SegmentId: 1, ManifestVersion: 10},
+			},
+		}
+		mockResp := &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}
+		mockProxy.EXPECT().BatchUpdateManifest(mock.Anything, req).Return(mockResp, nil)
+		resp, err := server.BatchUpdateManifest(ctx, req)
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		assert.Equal(t, mockResp, resp)
+	})
+}
+
 func TestHttpAuthenticate(t *testing.T) {
 	paramtable.Get().Save(proxy.Params.CommonCfg.AuthorizationEnabled.Key, "true")
 	defer paramtable.Get().Reset(proxy.Params.CommonCfg.AuthorizationEnabled.Key)
@@ -1212,4 +1264,61 @@ func Test_Service_GracefulStop(t *testing.T) {
 	err = group.Wait()
 	assert.Nil(t, err)
 	assert.Equal(t, count, int32(3))
+}
+
+func TestServer_RefreshExternalCollection(t *testing.T) {
+	mockProxy := mocks.NewMockProxy(t)
+	server := &Server{proxy: mockProxy}
+
+	ctx := context.Background()
+	req := &milvuspb.RefreshExternalCollectionRequest{
+		CollectionName: "test_external",
+	}
+
+	m := mockey.Mock(mockey.GetMethod(mockProxy, "RefreshExternalCollection")).Return(&milvuspb.RefreshExternalCollectionResponse{
+		Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+		JobId:  12345,
+	}, nil).Build()
+	defer m.UnPatch()
+
+	resp, err := server.RefreshExternalCollection(ctx, req)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(12345), resp.GetJobId())
+	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+}
+
+func TestServer_GetRefreshExternalCollectionProgress(t *testing.T) {
+	mockProxy := mocks.NewMockProxy(t)
+	server := &Server{proxy: mockProxy}
+
+	ctx := context.Background()
+	req := &milvuspb.GetRefreshExternalCollectionProgressRequest{
+		JobId: 12345,
+	}
+
+	m := mockey.Mock(mockey.GetMethod(mockProxy, "GetRefreshExternalCollectionProgress")).Return(&milvuspb.GetRefreshExternalCollectionProgressResponse{
+		Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+	}, nil).Build()
+	defer m.UnPatch()
+
+	resp, err := server.GetRefreshExternalCollectionProgress(ctx, req)
+	assert.NoError(t, err)
+	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+}
+
+func TestServer_ListRefreshExternalCollectionJobs(t *testing.T) {
+	mockProxy := mocks.NewMockProxy(t)
+	server := &Server{proxy: mockProxy}
+
+	ctx := context.Background()
+	req := &milvuspb.ListRefreshExternalCollectionJobsRequest{}
+
+	m := mockey.Mock(mockey.GetMethod(mockProxy, "ListRefreshExternalCollectionJobs")).Return(&milvuspb.ListRefreshExternalCollectionJobsResponse{
+		Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+	}, nil).Build()
+	defer m.UnPatch()
+
+	resp, err := server.ListRefreshExternalCollectionJobs(ctx, req)
+	assert.NoError(t, err)
+	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 }

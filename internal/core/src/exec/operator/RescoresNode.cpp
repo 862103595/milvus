@@ -15,13 +15,34 @@
 // limitations under the License.
 
 #include "RescoresNode.h"
-#include "common/Tracer.h"
-#include "fmt/format.h"
+
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <ratio>
+#include <utility>
+
+#include "common/EasyAssert.h"
+#include "common/QueryResult.h"
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "common/Utils.h"
+#include "exec/QueryContext.h"
+#include "exec/expression/EvalCtx.h"
+#include "exec/expression/Expr.h"
 #include "exec/operator/Utils.h"
-#include "log/Log.h"
+#include "expr/ITypeExpr.h"
+#include "fmt/core.h"
+#include "folly/FBVector.h"
+#include "knowhere/comp/index_param.h"
 #include "monitor/Monitor.h"
 #include "pb/plan.pb.h"
+#include "plan/PlanNode.h"
+#include "prometheus/histogram.h"
+#include "rescores/Scorer.h"
 
 namespace milvus::exec {
 
@@ -50,6 +71,10 @@ PhyRescoresNode::IsFinished() {
 
 RowVectorPtr
 PhyRescoresNode::GetOutput() {
+    ExecContext* exec_context = operator_context_->get_exec_context();
+    auto query_context_ = exec_context->get_query_context();
+    milvus::exec::checkCancellation(query_context_);
+
     if (is_finished_ || !no_more_input_) {
         return nullptr;
     }
@@ -66,16 +91,16 @@ PhyRescoresNode::GetOutput() {
     std::chrono::high_resolution_clock::time_point scalar_start =
         std::chrono::high_resolution_clock::now();
 
-    ExecContext* exec_context = operator_context_->get_exec_context();
-    auto query_context_ = exec_context->get_query_context();
     auto query_info = exec_context->get_query_config();
     milvus::SearchResult search_result = query_context_->get_search_result();
     auto segment = query_context_->get_segment();
-    auto op_ctx = query_context_->get_op_context();
+    auto op_context = query_context_->get_op_context();
 
     // prepare segment offset
     FixedVector<int32_t> offsets;
     std::vector<size_t> offset_idx;
+    offsets.reserve(search_result.seg_offsets_.size());
+    offset_idx.reserve(search_result.seg_offsets_.size());
 
     for (size_t i = 0; i < search_result.seg_offsets_.size(); i++) {
         // remain offset will be placeholder(-1) if result count not enough (less than topk)
@@ -101,7 +126,7 @@ PhyRescoresNode::GetOutput() {
         // boost for all result if no filter
         if (!filter) {
             scorer->batch_score(
-                op_ctx, segment, function_mode, offsets, boost_scores);
+                op_context, segment, function_mode, offsets, boost_scores);
             continue;
         }
 
@@ -109,7 +134,7 @@ PhyRescoresNode::GetOutput() {
         filters.emplace_back(filter);
         auto expr_set = std::make_unique<ExprSet>(filters, exec_context);
         std::vector<VectorPtr> results;
-        EvalCtx eval_ctx(exec_context, expr_set.get());
+        EvalCtx eval_ctx(exec_context);
 
         const auto& exprs = expr_set->exprs();
         bool is_native_supported = true;
@@ -124,10 +149,20 @@ PhyRescoresNode::GetOutput() {
             expr_set->Eval(0, 1, true, eval_ctx, results);
 
             // filter result for offsets[i] was resut bitset[i]
+            AssertInfo(!results.empty() && results[0] != nullptr,
+                       "PhyRescoresNode: filter expr returned null result, "
+                       "offsets size: {}, filter: {}",
+                       offsets.size(),
+                       filter->ToString());
             auto col_vec = std::dynamic_pointer_cast<ColumnVector>(results[0]);
+            AssertInfo(
+                col_vec != nullptr,
+                "PhyRescoresNode: failed to cast result to ColumnVector, "
+                "filter: {}",
+                filter->ToString());
             auto col_vec_size = col_vec->size();
             TargetBitmapView bitsetview(col_vec->GetRawData(), col_vec_size);
-            scorer->batch_score(op_ctx,
+            scorer->batch_score(op_context,
                                 segment,
                                 function_mode,
                                 offsets,
@@ -138,13 +173,26 @@ PhyRescoresNode::GetOutput() {
             expr_set->Eval(0, 1, true, eval_ctx, results);
 
             // filter result for offsets[i] was bitset[offset[i]]
-            TargetBitmap bitset;
+            AssertInfo(!results.empty() && results[0] != nullptr,
+                       "PhyRescoresNode: filter expr returned null result, "
+                       "filter: {}",
+                       filter->ToString());
             auto col_vec = std::dynamic_pointer_cast<ColumnVector>(results[0]);
+            AssertInfo(
+                col_vec != nullptr,
+                "PhyRescoresNode: failed to cast result to ColumnVector, "
+                "filter: {}",
+                filter->ToString());
+            TargetBitmap bitset;
             auto col_vec_size = col_vec->size();
             TargetBitmapView view(col_vec->GetRawData(), col_vec_size);
             bitset.append(view);
-            scorer->batch_score(
-                op_ctx, segment, function_mode, offsets, bitset, boost_scores);
+            scorer->batch_score(op_context,
+                                segment,
+                                function_mode,
+                                offsets,
+                                bitset,
+                                boost_scores);
         }
     }
 
@@ -170,7 +218,8 @@ PhyRescoresNode::GetOutput() {
             break;
         default:
             ThrowInfo(ErrorCode::UnexpectedError,
-                      fmt::format("unknown boost boost mode: {}", boost_mode));
+                      fmt::format("unknown boost boost mode: {}",
+                                  static_cast<int>(boost_mode)));
     }
 
     knowhere::MetricType metric_type = query_context_->get_metric_type();
@@ -187,6 +236,7 @@ PhyRescoresNode::GetOutput() {
                                                                   1000);
 
     tracer::AddEvent(fmt::format("rescored_count: {}", offsets.size()));
+
     return input_;
 };
 

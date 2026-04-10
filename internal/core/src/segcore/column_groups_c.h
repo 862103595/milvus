@@ -14,25 +14,22 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef void* CColumnGroups;
-
-CColumnGroups
-NewCColumnGroups();
+typedef void* CColumnSplits;
+CColumnSplits
+NewCColumnSplits();
 
 void
-AddCColumnGroup(CColumnGroups cgs, int* group, int group_size);
+AddCColumnSplit(CColumnSplits cgs, int* group, int group_size);
 
 int
-CColumnGroupsSize(CColumnGroups cgs);
+CColumnSplitsSize(CColumnSplits cgs);
 
 void
-FreeCColumnGroups(CColumnGroups cgs);
+FreeCColumnSplits(CColumnSplits cgs);
 
 #ifdef __cplusplus
 }

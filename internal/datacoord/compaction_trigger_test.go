@@ -631,7 +631,7 @@ func Test_compactionTrigger_force(t *testing.T) {
 					Schema:                 schema,
 					PreAllocatedSegmentIDs: &datapb.IDRange{Begin: 101, End: 200},
 					PreAllocatedLogIDs:     &datapb.IDRange{Begin: 100, End: 200},
-					MaxSize:                1342177280,
+					MaxSize:                1073741824,
 					SlotUsage:              paramtable.Get().DataCoordCfg.MixCompactionSlotUsage.GetAsInt64(),
 					JsonParams:             params,
 				},
@@ -642,17 +642,15 @@ func Test_compactionTrigger_force(t *testing.T) {
 		tt.fields.inspector.(*spyCompactionInspector).meta = tt.fields.meta
 		t.Run(tt.name, func(t *testing.T) {
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      make(chan *compactionSignal, 100),
-				manualSignals:                make(chan *compactionSignal, 100),
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:          tt.fields.meta,
+				handler:       newMockHandlerWithMeta(tt.fields.meta),
+				allocator:     tt.fields.allocator,
+				signals:       make(chan *compactionSignal, 100),
+				manualSignals: make(chan *compactionSignal, 100),
+				inspector:     tt.fields.inspector,
+				globalTrigger: tt.fields.globalTrigger,
+				closeCh:       lifetime.NewSafeChan(),
+				testingOnly:   true,
 			}
 			tr.closeWaiter.Add(1)
 			go func() {
@@ -687,17 +685,15 @@ func Test_compactionTrigger_force(t *testing.T) {
 				tt.fields.meta.segments.secondaryIndexes.coll2Segments[segment.GetCollectionID()][segment.GetID()] = segment
 			}
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      make(chan *compactionSignal, 100),
-				manualSignals:                make(chan *compactionSignal, 100),
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:          tt.fields.meta,
+				handler:       newMockHandlerWithMeta(tt.fields.meta),
+				allocator:     tt.fields.allocator,
+				signals:       make(chan *compactionSignal, 100),
+				manualSignals: make(chan *compactionSignal, 100),
+				inspector:     tt.fields.inspector,
+				globalTrigger: tt.fields.globalTrigger,
+				closeCh:       lifetime.NewSafeChan(),
+				testingOnly:   true,
 			}
 			tr.closeWaiter.Add(1)
 			go func() {
@@ -726,17 +722,15 @@ func Test_compactionTrigger_force(t *testing.T) {
 				segment.CollectionID = 1111
 			}
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      make(chan *compactionSignal, 100),
-				manualSignals:                make(chan *compactionSignal, 100),
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:          tt.fields.meta,
+				handler:       newMockHandlerWithMeta(tt.fields.meta),
+				allocator:     tt.fields.allocator,
+				signals:       make(chan *compactionSignal, 100),
+				manualSignals: make(chan *compactionSignal, 100),
+				inspector:     tt.fields.inspector,
+				globalTrigger: tt.fields.globalTrigger,
+				closeCh:       lifetime.NewSafeChan(),
+				testingOnly:   true,
 			}
 			tr.closeWaiter.Add(1)
 			go func() {
@@ -976,17 +970,15 @@ func Test_compactionTrigger_force_maxSegmentLimit(t *testing.T) {
 		(tt.fields.inspector).(*spyCompactionInspector).meta = tt.fields.meta
 		t.Run(tt.name, func(t *testing.T) {
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      make(chan *compactionSignal, 100),
-				manualSignals:                make(chan *compactionSignal, 100),
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:          tt.fields.meta,
+				handler:       newMockHandlerWithMeta(tt.fields.meta),
+				allocator:     tt.fields.allocator,
+				signals:       make(chan *compactionSignal, 100),
+				manualSignals: make(chan *compactionSignal, 100),
+				inspector:     tt.fields.inspector,
+				globalTrigger: tt.fields.globalTrigger,
+				closeCh:       lifetime.NewSafeChan(),
+				testingOnly:   true,
 			}
 			tr.closeWaiter.Add(1)
 			go func() {
@@ -1138,16 +1130,14 @@ func Test_compactionTrigger_noplan(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      make(chan *compactionSignal, 100),
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:          tt.fields.meta,
+				handler:       newMockHandlerWithMeta(tt.fields.meta),
+				allocator:     tt.fields.allocator,
+				signals:       make(chan *compactionSignal, 100),
+				inspector:     tt.fields.inspector,
+				globalTrigger: tt.fields.globalTrigger,
+				closeCh:       lifetime.NewSafeChan(),
+				testingOnly:   true,
 			}
 			tr.start()
 			defer tr.stop()
@@ -1476,17 +1466,15 @@ func Test_compactionTrigger_SmallCandi(t *testing.T) {
 				MsgID:     []byte{1, 2, 3, 4},
 			}
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      make(chan *compactionSignal, 100),
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				indexEngineVersionManager:    newMockVersionManager(),
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:                      tt.fields.meta,
+				handler:                   newMockHandlerWithMeta(tt.fields.meta),
+				allocator:                 tt.fields.allocator,
+				signals:                   make(chan *compactionSignal, 100),
+				inspector:                 tt.fields.inspector,
+				globalTrigger:             tt.fields.globalTrigger,
+				indexEngineVersionManager: newMockVersionManager(),
+				closeCh:                   lifetime.NewSafeChan(),
+				testingOnly:               true,
 			}
 			tr.start()
 			defer tr.stop()
@@ -1837,7 +1825,9 @@ func Test_compactionTrigger_shouldDoSingleCompaction(t *testing.T) {
 	assert.True(t, couldDo)
 
 	mockVersionManager := NewMockVersionManager(t)
-	mockVersionManager.On("GetCurrentIndexEngineVersion", mock.Anything).Return(int32(2), nil)
+	mockVersionManager.On("GetCurrentIndexEngineVersion").Return(int32(2)).Maybe()
+	mockVersionManager.On("GetCurrentScalarIndexEngineVersion").Return(int32(2)).Maybe()
+	mockVersionManager.On("ResolveVecIndexVersion").Return(int32(5)).Maybe()
 	trigger.indexEngineVersionManager = mockVersionManager
 	info4 := &SegmentInfo{
 		SegmentInfo: &datapb.SegmentInfo{
@@ -1893,6 +1883,9 @@ func Test_compactionTrigger_shouldDoSingleCompaction(t *testing.T) {
 			101: {
 				CollectionID: 2,
 				IndexID:      101,
+				IndexParams: []*commonpb.KeyValuePair{
+					{Key: common.IndexTypeKey, Value: "HNSW"},
+				},
 			},
 		},
 	}
@@ -2425,6 +2418,24 @@ func (s *CompactionTriggerSuite) TestHandleSignal() {
 	})
 }
 
+func TestIsCollectionAutoCompactionEnabledExternal(t *testing.T) {
+	coll := &collectionInfo{
+		ID: 1,
+		Schema: &schemapb.CollectionSchema{
+			ExternalSource: "s3://external",
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:       1,
+					Name:          "external_pk",
+					DataType:      schemapb.DataType_Int64,
+					ExternalField: "pk_col",
+				},
+			},
+		},
+	}
+	assert.False(t, isCollectionAutoCompactionEnabled(coll))
+}
+
 func (s *CompactionTriggerSuite) TestHandleGlobalSignal() {
 	schema := &schemapb.CollectionSchema{
 		Fields: []*schemapb.FieldSchema{
@@ -2773,16 +2784,14 @@ func Test_compactionTrigger_generatePlans(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      tt.fields.signals,
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:          tt.fields.meta,
+				handler:       newMockHandlerWithMeta(tt.fields.meta),
+				allocator:     tt.fields.allocator,
+				signals:       tt.fields.signals,
+				inspector:     tt.fields.inspector,
+				globalTrigger: tt.fields.globalTrigger,
+				closeCh:       lifetime.NewSafeChan(),
+				testingOnly:   true,
 			}
 
 			if got := tr.generatePlans(tt.args.segments, tt.args.signal, tt.args.compactTime, tt.args.expectedSize); !reflect.DeepEqual(got, tt.want) {
@@ -3071,16 +3080,14 @@ func Test_compactionTrigger_generatePlansByTime(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := &compactionTrigger{
-				meta:                         tt.fields.meta,
-				handler:                      newMockHandlerWithMeta(tt.fields.meta),
-				allocator:                    tt.fields.allocator,
-				signals:                      tt.fields.signals,
-				inspector:                    tt.fields.inspector,
-				globalTrigger:                tt.fields.globalTrigger,
-				estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-				estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-				closeCh:                      lifetime.NewSafeChan(),
-				testingOnly:                  true,
+				meta:          tt.fields.meta,
+				handler:       newMockHandlerWithMeta(tt.fields.meta),
+				allocator:     tt.fields.allocator,
+				signals:       tt.fields.signals,
+				inspector:     tt.fields.inspector,
+				globalTrigger: tt.fields.globalTrigger,
+				closeCh:       lifetime.NewSafeChan(),
+				testingOnly:   true,
 			}
 
 			got := tr.generatePlans(tt.args.segments, tt.args.signal, tt.args.compactTime, tt.args.expectedSize)
@@ -3092,4 +3099,278 @@ func Test_compactionTrigger_generatePlansByTime(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_compactionTrigger_ShouldCompactExpiryWithTTLField(t *testing.T) {
+	trigger := &compactionTrigger{}
+	ts := time.Now()
+	segment := &SegmentInfo{
+		SegmentInfo: &datapb.SegmentInfo{
+			ID:             1,
+			CollectionID:   2,
+			PartitionID:    1,
+			LastExpireTime: 100,
+			NumOfRows:      100,
+			MaxRowNum:      300,
+			InsertChannel:  "ch1",
+			State:          commonpb.SegmentState_Flushed,
+			ExpirQuantiles: []int64{ts.UnixMicro(), ts.Add(time.Hour).UnixMicro(), ts.Add(2 * time.Hour).UnixMicro(), ts.Add(3 * time.Hour).UnixMicro(), ts.Add(4 * time.Hour).UnixMicro()},
+		},
+	}
+
+	startTime := tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	ct := &compactTime{startTime: startTime, collectionTTL: 0}
+	shouldCompact := trigger.ShouldCompactExpiryWithTTLField(ct, segment)
+	assert.True(t, shouldCompact)
+
+	startTime = tsoutil.ComposeTSByTime(ts.Add(-1*time.Hour), 0)
+	ct = &compactTime{startTime: startTime, collectionTTL: 0}
+	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment)
+	assert.False(t, shouldCompact)
+
+	origin := Params.DataCoordCfg.SingleCompactionRatioThreshold.GetValue()
+	defer Params.Save(Params.DataCoordCfg.SingleCompactionRatioThreshold.Key, origin)
+	Params.Save(Params.DataCoordCfg.SingleCompactionRatioThreshold.Key, "0.1")
+	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	ct = &compactTime{startTime: startTime, collectionTTL: 0}
+	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment)
+	assert.True(t, shouldCompact)
+
+	Params.Save(Params.DataCoordCfg.SingleCompactionRatioThreshold.Key, "5")
+	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	ct = &compactTime{startTime: startTime, collectionTTL: 0}
+	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment)
+	assert.False(t, shouldCompact)
+
+	segment2 := &SegmentInfo{
+		SegmentInfo: &datapb.SegmentInfo{
+			ID:             1,
+			CollectionID:   2,
+			PartitionID:    1,
+			LastExpireTime: 100,
+			NumOfRows:      100,
+			MaxRowNum:      300,
+			InsertChannel:  "ch1",
+			State:          commonpb.SegmentState_Flushed,
+		},
+	}
+
+	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	ct = &compactTime{startTime: startTime, collectionTTL: 0}
+	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment2)
+	assert.False(t, shouldCompact)
+}
+
+func newTestIndexMeta(collID, segID, indexID int64, indexType string, segIdx *model.SegmentIndex) *indexMeta {
+	im := newSegmentIndexMeta(nil)
+	im.indexes[collID] = map[UniqueID]*model.Index{
+		indexID: {
+			CollectionID: collID,
+			IndexID:      indexID,
+			IndexName:    "test_idx",
+			IndexParams: []*commonpb.KeyValuePair{
+				{Key: common.IndexTypeKey, Value: indexType},
+			},
+		},
+	}
+	segIdxMap := typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
+	segIdxMap.Insert(indexID, segIdx)
+	im.segmentIndexes.Insert(segID, segIdxMap)
+	return im
+}
+
+func Test_ShouldRebuildSegmentIndex_AutoUpgrade_ScalarUsesCorrectField(t *testing.T) {
+	paramtable.Init()
+	Params.Save("dataCoord.autoUpgradeSegmentIndex", "true")
+
+	collID, segID, indexID := int64(1), int64(100), int64(10)
+
+	t.Run("scalar auto-upgrade compares CurrentScalarIndexVersion", func(t *testing.T) {
+		// Scalar index with CurrentIndexVersion=5 (vector field) but CurrentScalarIndexVersion=1
+		// Engine scalar version is 2, so 1 < 2 should trigger rebuild
+		segIdx := &model.SegmentIndex{
+			SegmentID:                 segID,
+			CollectionID:              collID,
+			IndexID:                   indexID,
+			IndexFileKeys:             []string{"file1"},
+			CurrentIndexVersion:       5, // vector version field - should NOT be used for scalar
+			CurrentScalarIndexVersion: 1, // scalar version field - should be used
+		}
+		im := newTestIndexMeta(collID, segID, indexID, "INVERTED", segIdx)
+
+		mockVM := NewMockVersionManager(t)
+		mockVM.On("GetCurrentScalarIndexEngineVersion").Return(int32(2)).Maybe()
+		mockVM.On("GetCurrentIndexEngineVersion").Return(int32(5)).Maybe()
+
+		trigger := &compactionTrigger{
+			meta:                      &meta{indexMeta: im, channelCPs: newChannelCps()},
+			indexEngineVersionManager: mockVM,
+		}
+
+		segment := &SegmentInfo{SegmentInfo: &datapb.SegmentInfo{ID: segID, CollectionID: collID}}
+		assert.True(t, trigger.ShouldRebuildSegmentIndex(segment))
+	})
+
+	t.Run("scalar auto-upgrade no rebuild when version matches", func(t *testing.T) {
+		segIdx := &model.SegmentIndex{
+			SegmentID:                 segID,
+			CollectionID:              collID,
+			IndexID:                   indexID,
+			IndexFileKeys:             []string{"file1"},
+			CurrentIndexVersion:       1, // vector version - irrelevant
+			CurrentScalarIndexVersion: 2, // matches engine version
+		}
+		im := newTestIndexMeta(collID, segID, indexID, "INVERTED", segIdx)
+
+		mockVM := NewMockVersionManager(t)
+		mockVM.On("GetCurrentScalarIndexEngineVersion").Return(int32(2)).Maybe()
+		mockVM.On("GetCurrentIndexEngineVersion").Return(int32(5)).Maybe()
+
+		trigger := &compactionTrigger{
+			meta:                      &meta{indexMeta: im, channelCPs: newChannelCps()},
+			indexEngineVersionManager: mockVM,
+		}
+
+		segment := &SegmentInfo{SegmentInfo: &datapb.SegmentInfo{ID: segID, CollectionID: collID}}
+		assert.False(t, trigger.ShouldRebuildSegmentIndex(segment))
+	})
+
+	Params.Save("dataCoord.autoUpgradeSegmentIndex", "false")
+}
+
+func Test_ShouldRebuildSegmentIndex_ForceRebuild_ScalarUsesCorrectField(t *testing.T) {
+	paramtable.Init()
+	Params.Save("dataCoord.autoUpgradeSegmentIndex", "false")
+
+	collID, segID, indexID := int64(1), int64(100), int64(10)
+
+	t.Run("scalar force-rebuild compares CurrentScalarIndexVersion", func(t *testing.T) {
+		Params.Save("dataCoord.forceRebuildScalarSegmentIndex", "true")
+		Params.Save("dataCoord.targetScalarIndexVersion", "3")
+		defer func() {
+			Params.Save("dataCoord.forceRebuildScalarSegmentIndex", "false")
+			Params.Save("dataCoord.targetScalarIndexVersion", "-1")
+		}()
+
+		// CurrentScalarIndexVersion=2 != resolved target=3, should trigger
+		segIdx := &model.SegmentIndex{
+			SegmentID:                 segID,
+			CollectionID:              collID,
+			IndexID:                   indexID,
+			IndexFileKeys:             []string{"file1"},
+			CurrentIndexVersion:       3, // vector version - should NOT be used
+			CurrentScalarIndexVersion: 2, // scalar version - should be used
+		}
+		im := newTestIndexMeta(collID, segID, indexID, "INVERTED", segIdx)
+
+		mockVM := NewMockVersionManager(t)
+		mockVM.On("ResolveScalarIndexVersion").Return(int32(3)).Maybe()
+
+		trigger := &compactionTrigger{
+			meta:                      &meta{indexMeta: im, channelCPs: newChannelCps()},
+			indexEngineVersionManager: mockVM,
+		}
+
+		segment := &SegmentInfo{SegmentInfo: &datapb.SegmentInfo{ID: segID, CollectionID: collID}}
+		assert.True(t, trigger.ShouldRebuildSegmentIndex(segment))
+	})
+
+	t.Run("scalar force-rebuild no trigger when version matches resolved target", func(t *testing.T) {
+		Params.Save("dataCoord.forceRebuildScalarSegmentIndex", "true")
+		Params.Save("dataCoord.targetScalarIndexVersion", "3")
+		defer func() {
+			Params.Save("dataCoord.forceRebuildScalarSegmentIndex", "false")
+			Params.Save("dataCoord.targetScalarIndexVersion", "-1")
+		}()
+
+		segIdx := &model.SegmentIndex{
+			SegmentID:                 segID,
+			CollectionID:              collID,
+			IndexID:                   indexID,
+			IndexFileKeys:             []string{"file1"},
+			CurrentIndexVersion:       1, // irrelevant
+			CurrentScalarIndexVersion: 3, // matches resolved target
+		}
+		im := newTestIndexMeta(collID, segID, indexID, "INVERTED", segIdx)
+
+		mockVM := NewMockVersionManager(t)
+		mockVM.On("ResolveScalarIndexVersion").Return(int32(3)).Maybe()
+
+		trigger := &compactionTrigger{
+			meta:                      &meta{indexMeta: im, channelCPs: newChannelCps()},
+			indexEngineVersionManager: mockVM,
+		}
+
+		segment := &SegmentInfo{SegmentInfo: &datapb.SegmentInfo{ID: segID, CollectionID: collID}}
+		assert.False(t, trigger.ShouldRebuildSegmentIndex(segment))
+	})
+}
+
+func Test_ShouldRebuildSegmentIndex_ForceRebuild_TargetExceedsMax_Converges(t *testing.T) {
+	paramtable.Init()
+	Params.Save("dataCoord.autoUpgradeSegmentIndex", "false")
+
+	collID, segID, indexID := int64(1), int64(100), int64(10)
+
+	t.Run("vec force-rebuild with target>max converges after clamp", func(t *testing.T) {
+		Params.Save("dataCoord.forceRebuildSegmentIndex", "true")
+		Params.Save("dataCoord.targetVecIndexVersion", "30")
+		defer func() {
+			Params.Save("dataCoord.forceRebuildSegmentIndex", "false")
+			Params.Save("dataCoord.targetVecIndexVersion", "-1")
+		}()
+
+		// Index was already rebuilt to clamped version (20), should NOT trigger again
+		segIdx := &model.SegmentIndex{
+			SegmentID:           segID,
+			CollectionID:        collID,
+			IndexID:             indexID,
+			IndexFileKeys:       []string{"file1"},
+			CurrentIndexVersion: 20, // matches resolved (clamped) target
+		}
+		im := newTestIndexMeta(collID, segID, indexID, "HNSW", segIdx)
+
+		mockVM := NewMockVersionManager(t)
+		// ResolveVecIndexVersion clamps target=30 to max=20
+		mockVM.On("ResolveVecIndexVersion").Return(int32(20)).Maybe()
+
+		trigger := &compactionTrigger{
+			meta:                      &meta{indexMeta: im, channelCPs: newChannelCps()},
+			indexEngineVersionManager: mockVM,
+		}
+
+		segment := &SegmentInfo{SegmentInfo: &datapb.SegmentInfo{ID: segID, CollectionID: collID}}
+		assert.False(t, trigger.ShouldRebuildSegmentIndex(segment))
+	})
+
+	t.Run("scalar force-rebuild with target>max converges after clamp", func(t *testing.T) {
+		Params.Save("dataCoord.forceRebuildScalarSegmentIndex", "true")
+		Params.Save("dataCoord.targetScalarIndexVersion", "10")
+		defer func() {
+			Params.Save("dataCoord.forceRebuildScalarSegmentIndex", "false")
+			Params.Save("dataCoord.targetScalarIndexVersion", "-1")
+		}()
+
+		// Index was already rebuilt to clamped version (5), should NOT trigger again
+		segIdx := &model.SegmentIndex{
+			SegmentID:                 segID,
+			CollectionID:              collID,
+			IndexID:                   indexID,
+			IndexFileKeys:             []string{"file1"},
+			CurrentScalarIndexVersion: 5, // matches resolved (clamped) target
+		}
+		im := newTestIndexMeta(collID, segID, indexID, "INVERTED", segIdx)
+
+		mockVM := NewMockVersionManager(t)
+		// ResolveScalarIndexVersion clamps target=10 to max=5
+		mockVM.On("ResolveScalarIndexVersion").Return(int32(5)).Maybe()
+
+		trigger := &compactionTrigger{
+			meta:                      &meta{indexMeta: im, channelCPs: newChannelCps()},
+			indexEngineVersionManager: mockVM,
+		}
+
+		segment := &SegmentInfo{SegmentInfo: &datapb.SegmentInfo{ID: segID, CollectionID: collID}}
+		assert.False(t, trigger.ShouldRebuildSegmentIndex(segment))
+	})
 }

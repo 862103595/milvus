@@ -9,8 +9,24 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include "pb/segcore.pb.h"
+#include <string.h>
+#include <exception>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "NamedType/named_type_impl.hpp"
+#include "NamedType/underlying_functionalities.hpp"
+#include "common/EasyAssert.h"
+#include "common/FieldMeta.h"
+#include "common/IndexMeta.h"
+#include "common/QueryInfo.h"
+#include "common/Schema.h"
+#include "common/Types.h"
 #include "query/Plan.h"
+#include "query/PlanImpl.h"
+#include "query/PlanNode.h"
 #include "segcore/Collection.h"
 #include "segcore/plan_c.h"
 
@@ -21,13 +37,28 @@ CreateSearchPlanByExpr(CCollection c_col,
                        const int64_t size,
                        CSearchPlan* res_plan) {
     auto col = static_cast<milvus::segcore::Collection*>(c_col);
+    auto schema = col->get_schema();
 
     try {
         auto res = milvus::query::CreateSearchPlanByExpr(
-            col->get_schema(), serialized_expr_plan, size);
+            schema, serialized_expr_plan, size);
         auto col_index_meta = col->get_index_meta();
         auto field_id = milvus::query::GetFieldID(res.get());
         AssertInfo(col_index_meta != nullptr, "index meta not exist");
+
+        if (!col_index_meta->HasField(milvus::FieldId(field_id))) {
+            auto status = CStatus();
+            status.error_code = milvus::FieldNotLoaded;
+            auto field_name =
+                (*schema)[milvus::FieldId(field_id)].get_name().get();
+            std::string err_msg =
+                "field " + field_name +
+                " is not loaded, please reload the collection";
+            status.error_msg = strdup(err_msg.c_str());
+            *res_plan = nullptr;
+            return status;
+        }
+
         auto field_index_meta =
             col_index_meta->GetFieldIndexMeta(milvus::FieldId(field_id));
         res->plan_node_->search_info_.metric_type_ =
@@ -174,6 +205,13 @@ DeleteRetrievePlan(CRetrievePlan c_plan) {
 bool
 ShouldIgnoreNonPk(CRetrievePlan c_plan) {
     auto plan = static_cast<milvus::query::RetrievePlan*>(c_plan);
+    // ORDER BY queries must not use two-phase retrieval: the pipeline
+    // returns data in a positional layout [pk, orderby, remaining] that
+    // the Go-side Remap depends on.  RetrieveByOffsets would re-fetch
+    // via FillTargetEntry in field_ids_ order, breaking that layout.
+    if (plan->plan_node_ && plan->plan_node_->has_order_by_) {
+        return false;
+    }
     auto pk_field = plan->schema_->get_primary_field_id();
     auto only_contain_pk = pk_field.has_value() &&
                            plan->field_ids_.size() == 1 &&

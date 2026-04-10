@@ -19,6 +19,7 @@
 #include "arrow/array/builder_binary.h"
 #include "arrow/array/builder_nested.h"
 #include "arrow/array/builder_primitive.h"
+#include <arrow/c/bridge.h>
 #include "arrow/scalar.h"
 #include "arrow/type_fwd.h"
 #include "common/type_c.h"
@@ -43,7 +44,7 @@
 #include "storage/InsertData.h"
 #include "storage/LocalChunkManager.h"
 #include "storage/MemFileManagerImpl.h"
-#include "storage/MinioChunkManager.h"
+#include "storage/minio/MinioChunkManager.h"
 #ifdef USE_OPENDAL
 #include "storage/opendal/OpenDALChunkManager.h"
 #endif
@@ -58,8 +59,12 @@
 #include "storage/KeyRetriever.h"
 #include "segcore/memory_planner.h"
 #include "mmap/Types.h"
+#include "storage/loon_ffi/ffi_reader_c.h"
+#include "storage/loon_ffi/util.h"
+#include "milvus-storage/ffi_c.h"
 #include "milvus-storage/format/parquet/file_reader.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/reader.h"
 
 namespace milvus::storage {
 
@@ -123,13 +128,40 @@ ReadMediumType(BinlogReaderPtr reader) {
 void
 add_vector_payload(std::shared_ptr<arrow::ArrayBuilder> builder,
                    uint8_t* values,
-                   int length) {
+                   const uint8_t* valid_data,
+                   bool nullable,
+                   int length,
+                   int byte_width) {
     AssertInfo(builder != nullptr, "empty arrow builder");
-    auto binary_builder =
-        std::dynamic_pointer_cast<arrow::FixedSizeBinaryBuilder>(builder);
-    auto ast = binary_builder->AppendValues(values, length);
-    AssertInfo(
-        ast.ok(), "append value to arrow builder failed: {}", ast.ToString());
+    AssertInfo((nullable && valid_data) || !nullable,
+               "valid_data is required for nullable vectors");
+    arrow::Status ast;
+
+    if (nullable) {
+        auto binary_builder =
+            std::dynamic_pointer_cast<arrow::BinaryBuilder>(builder);
+        int valid_index = 0;
+        for (int i = 0; i < length; ++i) {
+            auto bit = (valid_data[i >> 3] >> (i & 0x07)) & 1;
+            if (bit) {
+                ast = binary_builder->Append(values + valid_index * byte_width,
+                                             byte_width);
+                valid_index++;
+            } else {
+                ast = binary_builder->AppendNull();
+            }
+            AssertInfo(ast.ok(),
+                       "append value to arrow builder failed: {}",
+                       ast.ToString());
+        }
+    } else {
+        auto binary_builder =
+            std::dynamic_pointer_cast<arrow::FixedSizeBinaryBuilder>(builder);
+        ast = binary_builder->AppendValues(values, length);
+        AssertInfo(ast.ok(),
+                   "append value to arrow builder failed: {}",
+                   ast.ToString());
+    }
 }
 
 // append values for numeric data
@@ -218,12 +250,64 @@ AddPayloadToArrowBuilder(std::shared_ptr<arrow::ArrayBuilder> builder,
             break;
         }
 
-        case DataType::VECTOR_FLOAT16:
-        case DataType::VECTOR_BFLOAT16:
-        case DataType::VECTOR_BINARY:
-        case DataType::VECTOR_INT8:
         case DataType::VECTOR_FLOAT: {
-            add_vector_payload(builder, const_cast<uint8_t*>(raw_data), length);
+            AssertInfo(payload.dimension.has_value(),
+                       "dimension is required for VECTOR_FLOAT");
+            int byte_width = payload.dimension.value() * sizeof(float);
+            add_vector_payload(builder,
+                               const_cast<uint8_t*>(raw_data),
+                               payload.valid_data,
+                               nullable,
+                               length,
+                               byte_width);
+            break;
+        }
+        case DataType::VECTOR_BINARY: {
+            AssertInfo(payload.dimension.has_value(),
+                       "dimension is required for VECTOR_BINARY");
+            int byte_width = (payload.dimension.value() + 7) / 8;
+            add_vector_payload(builder,
+                               const_cast<uint8_t*>(raw_data),
+                               payload.valid_data,
+                               nullable,
+                               length,
+                               byte_width);
+            break;
+        }
+        case DataType::VECTOR_FLOAT16: {
+            AssertInfo(payload.dimension.has_value(),
+                       "dimension is required for VECTOR_FLOAT16");
+            int byte_width = payload.dimension.value() * 2;
+            add_vector_payload(builder,
+                               const_cast<uint8_t*>(raw_data),
+                               payload.valid_data,
+                               nullable,
+                               length,
+                               byte_width);
+            break;
+        }
+        case DataType::VECTOR_BFLOAT16: {
+            AssertInfo(payload.dimension.has_value(),
+                       "dimension is required for VECTOR_BFLOAT16");
+            int byte_width = payload.dimension.value() * 2;
+            add_vector_payload(builder,
+                               const_cast<uint8_t*>(raw_data),
+                               payload.valid_data,
+                               nullable,
+                               length,
+                               byte_width);
+            break;
+        }
+        case DataType::VECTOR_INT8: {
+            AssertInfo(payload.dimension.has_value(),
+                       "dimension is required for VECTOR_INT8");
+            int byte_width = payload.dimension.value() * sizeof(int8_t);
+            add_vector_payload(builder,
+                               const_cast<uint8_t*>(raw_data),
+                               payload.valid_data,
+                               nullable,
+                               length,
+                               byte_width);
             break;
         }
         case DataType::VECTOR_SPARSE_U32_F32: {
@@ -375,32 +459,53 @@ CreateArrowBuilder(DataType data_type) {
 }
 
 std::shared_ptr<arrow::ArrayBuilder>
-CreateArrowBuilder(DataType data_type, DataType element_type, int dim) {
+CreateArrowBuilder(DataType data_type,
+                   DataType element_type,
+                   int dim,
+                   bool nullable) {
     switch (static_cast<DataType>(data_type)) {
         case DataType::VECTOR_FLOAT: {
             AssertInfo(dim > 0, "invalid dim value: {}", dim);
+            if (nullable) {
+                return std::make_shared<arrow::BinaryBuilder>();
+            }
             return std::make_shared<arrow::FixedSizeBinaryBuilder>(
                 arrow::fixed_size_binary(dim * sizeof(float)));
         }
         case DataType::VECTOR_BINARY: {
             AssertInfo(dim % 8 == 0 && dim > 0, "invalid dim value: {}", dim);
+            if (nullable) {
+                return std::make_shared<arrow::BinaryBuilder>();
+            }
             return std::make_shared<arrow::FixedSizeBinaryBuilder>(
                 arrow::fixed_size_binary(dim / 8));
         }
         case DataType::VECTOR_FLOAT16: {
             AssertInfo(dim > 0, "invalid dim value: {}", dim);
+            if (nullable) {
+                return std::make_shared<arrow::BinaryBuilder>();
+            }
             return std::make_shared<arrow::FixedSizeBinaryBuilder>(
                 arrow::fixed_size_binary(dim * sizeof(float16)));
         }
         case DataType::VECTOR_BFLOAT16: {
             AssertInfo(dim > 0, "invalid dim value");
+            if (nullable) {
+                return std::make_shared<arrow::BinaryBuilder>();
+            }
             return std::make_shared<arrow::FixedSizeBinaryBuilder>(
                 arrow::fixed_size_binary(dim * sizeof(bfloat16)));
         }
         case DataType::VECTOR_INT8: {
             AssertInfo(dim > 0, "invalid dim value");
+            if (nullable) {
+                return std::make_shared<arrow::BinaryBuilder>();
+            }
             return std::make_shared<arrow::FixedSizeBinaryBuilder>(
                 arrow::fixed_size_binary(dim * sizeof(int8)));
+        }
+        case DataType::VECTOR_SPARSE_U32_F32: {
+            return std::make_shared<arrow::BinaryBuilder>();
         }
         case DataType::VECTOR_ARRAY: {
             AssertInfo(dim > 0, "invalid dim value");
@@ -571,6 +676,13 @@ CreateArrowSchema(DataType data_type, int dim, bool nullable) {
     switch (static_cast<DataType>(data_type)) {
         case DataType::VECTOR_FLOAT: {
             AssertInfo(dim > 0, "invalid dim value: {}", dim);
+            if (nullable) {
+                auto metadata = std::shared_ptr<arrow::KeyValueMetadata>(
+                    new arrow::KeyValueMetadata());
+                metadata->Append(DIM_KEY, std::to_string(dim));
+                return arrow::schema(
+                    {arrow::field("val", arrow::binary(), nullable, metadata)});
+            }
             return arrow::schema(
                 {arrow::field("val",
                               arrow::fixed_size_binary(dim * sizeof(float)),
@@ -578,11 +690,25 @@ CreateArrowSchema(DataType data_type, int dim, bool nullable) {
         }
         case DataType::VECTOR_BINARY: {
             AssertInfo(dim % 8 == 0 && dim > 0, "invalid dim value: {}", dim);
+            if (nullable) {
+                auto metadata = std::shared_ptr<arrow::KeyValueMetadata>(
+                    new arrow::KeyValueMetadata());
+                metadata->Append(DIM_KEY, std::to_string(dim));
+                return arrow::schema(
+                    {arrow::field("val", arrow::binary(), nullable, metadata)});
+            }
             return arrow::schema({arrow::field(
                 "val", arrow::fixed_size_binary(dim / 8), nullable)});
         }
         case DataType::VECTOR_FLOAT16: {
             AssertInfo(dim > 0, "invalid dim value: {}", dim);
+            if (nullable) {
+                auto metadata = std::shared_ptr<arrow::KeyValueMetadata>(
+                    new arrow::KeyValueMetadata());
+                metadata->Append(DIM_KEY, std::to_string(dim));
+                return arrow::schema(
+                    {arrow::field("val", arrow::binary(), nullable, metadata)});
+            }
             return arrow::schema(
                 {arrow::field("val",
                               arrow::fixed_size_binary(dim * sizeof(float16)),
@@ -590,6 +716,13 @@ CreateArrowSchema(DataType data_type, int dim, bool nullable) {
         }
         case DataType::VECTOR_BFLOAT16: {
             AssertInfo(dim > 0, "invalid dim value");
+            if (nullable) {
+                auto metadata = std::shared_ptr<arrow::KeyValueMetadata>(
+                    new arrow::KeyValueMetadata());
+                metadata->Append(DIM_KEY, std::to_string(dim));
+                return arrow::schema(
+                    {arrow::field("val", arrow::binary(), nullable, metadata)});
+            }
             return arrow::schema(
                 {arrow::field("val",
                               arrow::fixed_size_binary(dim * sizeof(bfloat16)),
@@ -601,6 +734,13 @@ CreateArrowSchema(DataType data_type, int dim, bool nullable) {
         }
         case DataType::VECTOR_INT8: {
             AssertInfo(dim > 0, "invalid dim value");
+            if (nullable) {
+                auto metadata = std::shared_ptr<arrow::KeyValueMetadata>(
+                    new arrow::KeyValueMetadata());
+                metadata->Append(DIM_KEY, std::to_string(dim));
+                return arrow::schema(
+                    {arrow::field("val", arrow::binary(), nullable, metadata)});
+            }
             return arrow::schema(
                 {arrow::field("val",
                               arrow::fixed_size_binary(dim * sizeof(int8)),
@@ -708,7 +848,7 @@ GenIndexPathPrefixByType(ChunkManagerPtr cm,
     boost::filesystem::path path = std::string(index_type);
     boost::filesystem::path path1 =
         GenIndexPathIdentifier(build_id, index_version, segment_id, field_id);
-    return (prefix / path / path1).string();
+    return NormalizePath(prefix / path / path1);
 }
 
 std::string
@@ -744,7 +884,7 @@ GenJsonStatsPathPrefix(ChunkManagerPtr cm,
     boost::filesystem::path path1 =
         GenIndexPathIdentifier(build_id, index_version, segment_id, field_id);
 
-    return (prefix / path / path1).string();
+    return NormalizePath(prefix / path / path1);
 }
 
 std::string
@@ -759,7 +899,7 @@ GenJsonStatsPathIdentifier(int64_t build_id,
         std::to_string(index_version) / std::to_string(collection_id) /
         std::to_string(partition_id) / std::to_string(segment_id) /
         std::to_string(field_id);
-    return p.string() + "/";
+    return NormalizePath(p);
 }
 
 std::string
@@ -779,7 +919,7 @@ GenRemoteJsonStatsPathPrefix(ChunkManagerPtr cm,
                                     partition_id,
                                     segment_id,
                                     field_id);
-    return p.string();
+    return NormalizePath(p);
 }
 
 std::string
@@ -805,16 +945,8 @@ GenFieldRawDataPathPrefix(ChunkManagerPtr cm,
     boost::filesystem::path prefix = cm->GetRootPath();
     boost::filesystem::path path = std::string(RAWDATA_ROOT_PATH);
     boost::filesystem::path path1 =
-        std::to_string(segment_id) + "/" + std::to_string(field_id) + "/";
-    return (prefix / path / path1).string();
-}
-
-std::string
-GetSegmentRawDataPathPrefix(ChunkManagerPtr cm, int64_t segment_id) {
-    boost::filesystem::path prefix = cm->GetRootPath();
-    boost::filesystem::path path = std::string(RAWDATA_ROOT_PATH);
-    boost::filesystem::path path1 = std::to_string(segment_id);
-    return (prefix / path / path1).string();
+        std::to_string(segment_id) + "_" + std::to_string(field_id) + "/";
+    return NormalizePath(prefix / path / path1);
 }
 
 std::pair<std::string, size_t>
@@ -1046,6 +1178,9 @@ InitArrowFileSystem(milvus::storage::StorageConfig storage_config) {
         conf.gcp_credential_json =
             std::string(storage_config.gcp_credential_json);
         conf.use_custom_part_upload = true;
+        conf.max_connections = storage_config.max_connections;
+        conf.tls_min_version = storage_config.tls_min_version;
+        conf.use_crc32c_checksum = storage_config.use_crc32c_checksum;
     }
     return StorageV2FSCache::Instance().Get(conf);
 }
@@ -1097,22 +1232,22 @@ CreateFieldData(const DataType& type,
                 type, nullable, total_num_rows);
         case DataType::VECTOR_FLOAT:
             return std::make_shared<FieldData<FloatVector>>(
-                dim, type, total_num_rows);
+                dim, type, nullable, total_num_rows);
         case DataType::VECTOR_BINARY:
             return std::make_shared<FieldData<BinaryVector>>(
-                dim, type, total_num_rows);
+                dim, type, nullable, total_num_rows);
         case DataType::VECTOR_FLOAT16:
             return std::make_shared<FieldData<Float16Vector>>(
-                dim, type, total_num_rows);
+                dim, type, nullable, total_num_rows);
         case DataType::VECTOR_BFLOAT16:
             return std::make_shared<FieldData<BFloat16Vector>>(
-                dim, type, total_num_rows);
+                dim, type, nullable, total_num_rows);
         case DataType::VECTOR_SPARSE_U32_F32:
             return std::make_shared<FieldData<SparseFloatVector>>(
-                type, total_num_rows);
+                type, nullable, total_num_rows);
         case DataType::VECTOR_INT8:
             return std::make_shared<FieldData<Int8Vector>>(
-                dim, type, total_num_rows);
+                dim, type, nullable, total_num_rows);
         case DataType::VECTOR_ARRAY:
             return std::make_shared<FieldData<VectorArray>>(
                 dim, element_type, total_num_rows);
@@ -1186,10 +1321,9 @@ FetchFieldData(ChunkManager* cm, const std::vector<std::string>& remote_files) {
     std::vector<std::string> batch_files;
     auto FetchRawData = [&]() {
         auto fds = GetObjectData(cm, batch_files);
-        for (size_t i = 0; i < batch_files.size(); ++i) {
-            auto data = fds[i].get()->GetFieldData();
-            field_datas.emplace_back(data);
-        }
+        ProcessFuturesInOrder(fds, [&](std::unique_ptr<DataCodec> codec) {
+            field_datas.emplace_back(codec->GetFieldData());
+        });
     };
 
     auto parallel_degree =
@@ -1301,11 +1435,15 @@ GetFieldDatasFromStorageV2(std::vector<std::vector<std::string>>& remote_files,
     for (auto& column_group_file : remote_chunk_files) {
         // get all row groups for each file
         std::vector<std::vector<int64_t>> row_group_lists;
-        auto reader = std::make_shared<milvus_storage::FileRowGroupReader>(
+        auto result = milvus_storage::FileRowGroupReader::Make(
             fs,
             column_group_file,
             milvus_storage::DEFAULT_READ_BUFFER_SIZE,
             GetReaderProperties());
+        AssertInfo(result.ok(),
+                   "[StorageV2] Failed to create file row group reader: " +
+                       result.status().ToString());
+        auto reader = result.ValueOrDie();
 
         auto row_group_num =
             reader->file_metadata()->GetRowGroupMetadataVector().size();
@@ -1354,8 +1492,175 @@ GetFieldDatasFromStorageV2(std::vector<std::vector<std::string>>& remote_files,
             }
             field_data_list.push_back(field_data);
         }
+        // access underlying feature to get exception if any
+        load_future.get();
     }
     return field_data_list;
+}
+
+std::vector<FieldDataPtr>
+GetFieldDatasFromManifest(
+    const std::string& manifest_path,
+    const std::shared_ptr<milvus_storage::api::Properties>& loon_ffi_properties,
+    const FieldDataMeta& field_meta,
+    std::optional<DataType> data_type,
+    int64_t dim,
+    std::optional<DataType> element_type) {
+    auto loon_manifest = GetLoonManifest(manifest_path, loon_ffi_properties);
+    auto column_groups = std::make_shared<milvus_storage::api::ColumnGroups>(
+        loon_manifest->columnGroups());
+
+    // Determine the column name to use: external fields use their external name,
+    // internal fields use the numeric field ID string.
+    std::string column_name;
+    const auto& ext_field = field_meta.field_schema.external_field();
+    if (!ext_field.empty()) {
+        column_name = ext_field;
+    } else {
+        column_name = std::to_string(field_meta.field_id);
+    }
+
+    // TODO remove manual check after loon support read null for non-exists field
+    bool field_exists = false;
+    for (size_t i = 0; i < column_groups->size() && !field_exists; i++) {
+        auto column_group = column_groups->at(i);
+        for (const auto& column : column_group->columns) {
+            if (column == column_name) {
+                field_exists = true;
+                break;
+            }
+        }
+    }
+    if (!field_exists) {
+        return {};
+    }
+
+    std::vector<std::string> needed_columns = {column_name};
+
+    // Create arrow schema from field meta
+    std::shared_ptr<arrow::Schema> arrow_schema;
+    bool nullable = field_meta.field_schema.nullable();
+
+    if (IsVectorDataType(data_type.value())) {
+        if (data_type.value() == DataType::VECTOR_ARRAY) {
+            arrow_schema = CreateArrowSchema(
+                data_type.value(), static_cast<int>(dim), element_type.value());
+        } else if (IsSparseFloatVectorDataType(data_type.value())) {
+            arrow_schema = CreateArrowSchema(data_type.value(), nullable);
+        } else {
+            arrow_schema = CreateArrowSchema(
+                data_type.value(), static_cast<int>(dim), nullable);
+        }
+    } else if (data_type.value() == DataType::ARRAY) {
+        // For ARRAY types, we use binary representation
+        // Element type information is encoded in the data itself
+        arrow_schema = CreateArrowSchema(data_type.value(), nullable);
+    } else {
+        // For scalar types
+        arrow_schema = CreateArrowSchema(data_type.value(), nullable);
+    }
+
+    auto updated_schema = std::make_shared<arrow::Schema>(
+        arrow::Schema({arrow_schema->field(0)->WithName(column_name)}));
+
+    auto reader = milvus_storage::api::Reader::create(
+        column_groups,
+        updated_schema,
+        std::make_shared<std::vector<std::string>>(needed_columns),
+        *loon_ffi_properties);
+
+    AssertInfo(reader != nullptr, "Failed to create reader");
+
+    // without predicate
+    auto reader_result = reader->get_record_batch_reader("");
+    AssertInfo(reader_result.ok(),
+               "Failed to get record batch reader: " +
+                   reader_result.status().ToString());
+
+    auto record_batch_reader = reader_result.ValueOrDie();
+
+    // Read all record batches and convert to FieldDataPtr
+    std::vector<FieldDataPtr> field_datas;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto status = record_batch_reader->ReadNext(&batch);
+        AssertInfo(status.ok(),
+                   "Failed to read record batch: " + status.ToString());
+        if (batch == nullptr) {
+            break;  // End of stream
+        }
+
+        // Convert record batch to FieldData
+        auto num_rows = batch->num_rows();
+        if (num_rows == 0) {
+            continue;
+        }
+
+        auto column = batch->GetColumnByName(column_name);
+
+        // External parquet files store vectors as List<float> or
+        // FixedSizeList<float>, but Milvus expects FixedSizeBinary.
+        // Normalize here so that FillFieldData sees the right Arrow type.
+        if (!field_meta.field_schema.external_field().empty() &&
+            IsVectorDataType(data_type.value()) &&
+            !IsSparseFloatVectorDataType(data_type.value()) &&
+            column->type_id() != arrow::Type::FIXED_SIZE_BINARY) {
+            int byte_width = GetDataTypeSize(data_type.value(), dim);
+            auto fsb_type = arrow::fixed_size_binary(byte_width);
+            int64_t n = column->length();
+
+            auto buf_res = arrow::AllocateBuffer(n * byte_width);
+            AssertInfo(buf_res.ok(),
+                       "Failed to allocate buffer for vector normalization");
+            auto buffer = std::move(*buf_res);
+            auto dst = buffer->mutable_data();
+
+            if (column->type_id() == arrow::Type::LIST) {
+                auto list_arr =
+                    std::static_pointer_cast<arrow::ListArray>(column);
+                auto values = list_arr->values();
+                int elem_bytes = values->type()->bit_width() / 8;
+                auto raw = reinterpret_cast<const uint8_t*>(
+                    values->data()->buffers[1]->data());
+                for (int64_t i = 0; i < n; i++) {
+                    memcpy(dst + i * byte_width,
+                           raw + list_arr->value_offset(i) * elem_bytes,
+                           byte_width);
+                }
+            } else if (column->type_id() == arrow::Type::FIXED_SIZE_LIST) {
+                auto fsl_arr =
+                    std::static_pointer_cast<arrow::FixedSizeListArray>(column);
+                auto values = fsl_arr->values();
+                int elem_bytes = values->type()->bit_width() / 8;
+                auto raw = reinterpret_cast<const uint8_t*>(
+                    values->data()->buffers[1]->data());
+                for (int64_t i = 0; i < n; i++) {
+                    memcpy(dst + i * byte_width,
+                           raw + fsl_arr->value_offset(i) * elem_bytes,
+                           byte_width);
+                }
+            } else {
+                ThrowInfo(Unsupported,
+                          "Unsupported arrow type for external vector "
+                          "normalization: {}",
+                          column->type()->ToString());
+            }
+
+            column = std::make_shared<arrow::FixedSizeBinaryArray>(
+                fsb_type, n, std::move(buffer));
+        }
+
+        auto chunked_array = std::make_shared<arrow::ChunkedArray>(column);
+        auto field_data = CreateFieldData(data_type.value(),
+                                          element_type.value(),
+                                          batch->schema()->field(0)->nullable(),
+                                          dim,
+                                          num_rows);
+        field_data->FillFieldData(chunked_array);
+        field_datas.push_back(field_data);
+    }
+
+    return field_datas;
 }
 
 std::vector<FieldDataPtr>
@@ -1363,11 +1668,6 @@ CacheRawDataAndFillMissing(const MemFileManagerImplPtr& file_manager,
                            const Config& config) {
     // download field data
     auto field_datas = file_manager->CacheRawDataToMemory(config);
-
-    // check storage version
-    auto storage_version =
-        index::GetValueFromConfig<int64_t>(config, STORAGE_VERSION_KEY)
-            .value_or(0);
 
     int64_t lack_binlog_rows =
         index::GetValueFromConfig<int64_t>(config, INDEX_NUM_ROWS_KEY)
@@ -1420,12 +1720,16 @@ GetFieldIDList(FieldId column_group_id,
         field_id_list.Add(column_group_id.get());
         return field_id_list;
     }
-    auto file_reader = std::make_shared<milvus_storage::FileRowGroupReader>(
+    auto result = milvus_storage::FileRowGroupReader::Make(
         fs,
         filepath,
         arrow_schema,
         milvus_storage::DEFAULT_READ_BUFFER_SIZE,
         GetReaderProperties());
+    AssertInfo(result.ok(),
+               "[StorageV2] Failed to create file row group reader: " +
+                   result.status().ToString());
+    auto file_reader = result.ValueOrDie();
     field_id_list =
         file_reader->file_metadata()->GetGroupFieldIDList().GetFieldIDList(
             column_group_id.get());

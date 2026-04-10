@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/querynodev2/tasks"
 	"github.com/milvus-io/milvus/internal/util/reduce"
+	"github.com/milvus-io/milvus/internal/util/segmentutil"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
@@ -96,6 +97,7 @@ func loadGrowingSegments(ctx context.Context, delegator delegator.ShardDelegator
 					InsertChannel:  segmentInfo.InsertChannel,
 					StartPosition:  segmentInfo.GetStartPosition(),
 					StorageVersion: segmentInfo.GetStorageVersion(),
+					ManifestPath:   segmentInfo.GetManifestPath(),
 				})
 			} else {
 				log.Info("skip segment which binlog is empty", zap.Int64("segmentID", segmentInfo.ID))
@@ -118,7 +120,7 @@ func (node *QueryNode) loadDeltaLogs(ctx context.Context, req *querypb.LoadSegme
 			continue
 		}
 
-		err := node.loader.LoadDeltaLogs(ctx, segment, info.GetDeltalogs())
+		err := node.loader.LoadDeltaLogs(ctx, segment, info)
 		if err != nil {
 			if finalErr == nil {
 				finalErr = err
@@ -159,12 +161,6 @@ func (node *QueryNode) loadIndex(ctx context.Context, req *querypb.LoadSegmentsR
 			continue
 		}
 
-		if localSegment.IsLazyLoad() {
-			localSegment.SetLoadInfo(info)
-			localSegment.SetNeedUpdatedVersion(req.GetVersion())
-			node.manager.DiskCache.MarkItemNeedReload(ctx, localSegment.ID())
-			return nil
-		}
 		err := node.loader.LoadIndex(ctx, localSegment, info, req.Version)
 		if err != nil {
 			log.Warn("failed to load index", zap.Error(err))
@@ -198,12 +194,6 @@ func (node *QueryNode) loadStats(ctx context.Context, req *querypb.LoadSegmentsR
 			continue
 		}
 
-		if localSegment.IsLazyLoad() {
-			localSegment.SetLoadInfo(info)
-			localSegment.SetNeedUpdatedVersion(req.GetVersion())
-			node.manager.DiskCache.MarkItemNeedReload(ctx, localSegment.ID())
-			return nil
-		}
 		err := node.loader.LoadJSONIndex(ctx, localSegment, info)
 		if err != nil {
 			log.Warn("failed to load stats", zap.Error(err))
@@ -213,6 +203,21 @@ func (node *QueryNode) loadStats(ctx context.Context, req *querypb.LoadSegmentsR
 	}
 
 	return status
+}
+
+func (node *QueryNode) reopenSegments(ctx context.Context, req *querypb.LoadSegmentsRequest) *commonpb.Status {
+	log := log.Ctx(ctx).With(
+		zap.Int64("collectionID", req.GetCollectionID()),
+		zap.Int64s("segmentIDs", lo.Map(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) int64 { return info.GetSegmentID() })),
+	)
+
+	log.Info("start to reopen segments")
+	err := node.loader.ReopenSegments(ctx, req.GetInfos())
+	if err != nil {
+		log.Warn("failed to reopen segments", zap.Error(err))
+		return merr.Status(err)
+	}
+	return merr.Success()
 }
 
 func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryRequest, channel string) (*internalpb.RetrieveResults, error) {
@@ -275,13 +280,34 @@ func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryReque
 		node.manager.Collection.Unref(req.GetReq().GetCollectionID(), 1)
 	}()
 
-	reducer := segments.CreateInternalReducer(req, collection.Schema())
-
-	resp, err := reducer.Reduce(ctx, results)
+	resp, err := segments.RunDelegatorQueryPipeline(ctx, req, collection.Schema(), results)
 	if err != nil {
 		return nil, err
 	}
+	// aggregate cost
+	requestCosts := lo.FilterMap(results, func(result *internalpb.RetrieveResults, _ int) (*internalpb.CostAggregation, bool) {
+		if paramtable.Get().QueryNodeCfg.EnableWorkerSQCostMetrics.GetAsBool() {
+			return result.GetCostAggregation(), true
+		}
 
+		if result.GetBase().GetSourceID() == paramtable.GetNodeID() {
+			return result.GetCostAggregation(), true
+		}
+
+		return nil, false
+	})
+	resp.CostAggregation = segmentutil.MergeRequestCost(requestCosts)
+	if resp.CostAggregation == nil {
+		resp.CostAggregation = &internalpb.CostAggregation{}
+	}
+	relatedDataSize := lo.SumBy(results, func(t *internalpb.RetrieveResults) int64 {
+		cost := t.GetCostAggregation()
+		if cost == nil {
+			return 0
+		}
+		return cost.GetTotalRelatedDataSize()
+	})
+	resp.CostAggregation.TotalRelatedDataSize = relatedDataSize
 	tr.CtxElapse(ctx, fmt.Sprintf("do query with channel done , vChannel = %s, segmentIDs = %v",
 		channel,
 		req.GetSegmentIDs(),
@@ -387,26 +413,26 @@ func (node *QueryNode) searchChannel(ctx context.Context, req *querypb.SearchReq
 		zap.String("scope", req.GetScope().String()),
 		zap.Int64("nq", req.GetReq().GetNq()),
 	)
-	traceID := trace.SpanFromContext(ctx).SpanContext().TraceID()
 
 	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
 		return nil, err
 	}
 	defer node.lifetime.Done()
 
+	nodeIDStr := paramtable.GetStringNodeID()
+	collIDStr := strconv.FormatInt(req.GetReq().GetCollectionID(), 10)
+
 	var err error
-	metrics.QueryNodeSQCount.WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.SearchLabel, metrics.TotalLabel, metrics.Leader, fmt.Sprint(req.GetReq().GetCollectionID())).Inc()
+	metrics.QueryNodeSQCount.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.TotalLabel, metrics.Leader, collIDStr).Inc()
 	defer func() {
 		if err != nil {
-			metrics.QueryNodeSQCount.WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.SearchLabel, metrics.FailLabel, metrics.Leader, fmt.Sprint(req.GetReq().GetCollectionID())).Inc()
+			metrics.QueryNodeSQCount.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.FailLabel, metrics.Leader, collIDStr).Inc()
 		}
 	}()
 
 	log.Debug("start to search channel",
 		zap.Int64s("segmentIDs", req.GetSegmentIDs()),
 	)
-	searchCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	// From Proxy
 	tr := timerecord.NewTimeRecorder("searchDelegator")
@@ -418,38 +444,36 @@ func (node *QueryNode) searchChannel(ctx context.Context, req *querypb.SearchReq
 		return nil, err
 	}
 	// do search
-	results, err := sd.Search(searchCtx, req)
+	results, err := sd.Search(ctx, req)
 	if err != nil {
 		log.Warn("failed to search on delegator", zap.Error(err))
 		return nil, err
 	}
 
-	// reduce result
-	tr.CtxElapse(ctx, fmt.Sprintf("start reduce query result, traceID = %s,  vChannel = %s, segmentIDs = %v",
-		traceID,
-		channel,
-		req.GetSegmentIDs(),
-	))
+	tr.CtxElapse(ctx, "start reduce query result, ch="+channel)
 
 	resp, err := segments.ReduceSearchOnQueryNode(ctx, results,
 		reduce.NewReduceSearchResultInfo(req.GetReq().GetNq(),
 			req.GetReq().GetTopk()).WithMetricType(req.GetReq().GetMetricType()).WithGroupByField(req.GetReq().GetGroupByFieldId()).
 			WithGroupSize(req.GetReq().GetGroupSize()).WithAdvance(req.GetReq().GetIsAdvanced()))
+
+	reduceLatency := tr.RecordSpan()
+	metrics.QueryNodeReduceLatency.
+		WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.ReduceShards, metrics.BatchReduce).
+		Observe(float64(reduceLatency.Milliseconds()))
+
 	if err != nil {
 		return nil, err
 	}
 
-	tr.CtxElapse(ctx, fmt.Sprintf("do search with channel done , vChannel = %s, segmentIDs = %v",
-		channel,
-		req.GetSegmentIDs(),
-	))
+	tr.CtxElapse(ctx, "search with channel done, ch="+channel)
 
 	// update metric to prometheus
 	latency := tr.ElapseSpan()
-	metrics.QueryNodeSQReqLatency.WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.SearchLabel, metrics.Leader).Observe(float64(latency.Milliseconds()))
-	metrics.QueryNodeSQCount.WithLabelValues(fmt.Sprint(node.GetNodeID()), metrics.SearchLabel, metrics.SuccessLabel, metrics.Leader, fmt.Sprint(req.GetReq().GetCollectionID())).Inc()
-	metrics.QueryNodeSearchNQ.WithLabelValues(fmt.Sprint(node.GetNodeID())).Observe(float64(req.Req.GetNq()))
-	metrics.QueryNodeSearchTopK.WithLabelValues(fmt.Sprint(node.GetNodeID())).Observe(float64(req.Req.GetTopk()))
+	metrics.QueryNodeSQReqLatency.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.Leader).Observe(float64(latency.Milliseconds()))
+	metrics.QueryNodeSQCount.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.SuccessLabel, metrics.Leader, collIDStr).Inc()
+	metrics.QueryNodeSearchNQ.WithLabelValues(nodeIDStr).Observe(float64(req.Req.GetNq()))
+	metrics.QueryNodeSearchTopK.WithLabelValues(nodeIDStr).Observe(float64(req.Req.GetTopk()))
 	return resp, nil
 }
 

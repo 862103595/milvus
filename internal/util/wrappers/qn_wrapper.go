@@ -160,12 +160,28 @@ func (qn *qnServerWrapper) RunAnalyzer(ctx context.Context, in *querypb.RunAnaly
 	return qn.QueryNode.RunAnalyzer(ctx, in)
 }
 
+func (qn *qnServerWrapper) GetHighlight(ctx context.Context, in *querypb.GetHighlightRequest, _ ...grpc.CallOption) (*querypb.GetHighlightResponse, error) {
+	return qn.QueryNode.GetHighlight(ctx, in)
+}
+
 func (qn *qnServerWrapper) DropIndex(ctx context.Context, in *querypb.DropIndexRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return qn.QueryNode.DropIndex(ctx, in)
 }
 
-func (qn *qnServerWrapper) ValidateAnalyzer(ctx context.Context, in *querypb.ValidateAnalyzerRequest, _ ...grpc.CallOption) (*commonpb.Status, error) {
+func (qn *qnServerWrapper) UpdateIndex(ctx context.Context, in *querypb.UpdateIndexRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return qn.QueryNode.UpdateIndex(ctx, in)
+}
+
+func (qn *qnServerWrapper) ValidateAnalyzer(ctx context.Context, in *querypb.ValidateAnalyzerRequest, _ ...grpc.CallOption) (*querypb.ValidateAnalyzerResponse, error) {
 	return qn.QueryNode.ValidateAnalyzer(ctx, in)
+}
+
+func (qn *qnServerWrapper) SyncFileResource(ctx context.Context, in *internalpb.SyncFileResourceRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return qn.QueryNode.SyncFileResource(ctx, in)
+}
+
+func (qn *qnServerWrapper) ComputePhraseMatchSlop(ctx context.Context, in *querypb.ComputePhraseMatchSlopRequest, _ ...grpc.CallOption) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	return qn.QueryNode.ComputePhraseMatchSlop(ctx, in)
 }
 
 func WrapQueryNodeServerAsClient(qn types.QueryNode) types.QueryNodeClient {

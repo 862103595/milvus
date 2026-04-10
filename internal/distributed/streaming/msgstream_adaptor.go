@@ -95,7 +95,7 @@ func (m *delegatorMsgstreamAdaptor) Seek(ctx context.Context, msgPositions []*ms
 		panic("should never be called if len(msgPositions) is not 1")
 	}
 	position := msgPositions[0]
-	startFrom := adaptor.MustGetMessageIDFromMQWrapperIDBytes(position.MsgID)
+	startFrom := adaptor.MustGetMessageIDFromMQWrapperIDBytesWithWALName(message.WALName(position.WALName), position.MsgID)
 	log.Info(
 		"delegator msgstream adaptor seeks from position with scanner",
 		zap.String("channel", position.GetChannelName()),
@@ -127,9 +127,5 @@ func (m *delegatorMsgstreamAdaptor) GetLatestMsgID(channel string) (msgstream.Me
 }
 
 func (m *delegatorMsgstreamAdaptor) CheckTopicValid(channel string) error {
-	panic("should never be called")
-}
-
-func (m *delegatorMsgstreamAdaptor) ForceEnableProduce(can bool) {
 	panic("should never be called")
 }

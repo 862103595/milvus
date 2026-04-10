@@ -74,6 +74,7 @@ type LBPolicyImpl struct {
 	clientMgr      ShardClientMgr
 	balancerMap    map[string]LBBalancer
 	retryOnReplica int
+	blacklist      *ChannelBlacklist
 }
 
 func NewLBPolicyImpl(clientMgr ShardClientMgr) *LBPolicyImpl {
@@ -96,6 +97,7 @@ func NewLBPolicyImpl(clientMgr ShardClientMgr) *LBPolicyImpl {
 		clientMgr:      clientMgr,
 		balancerMap:    balancerMap,
 		retryOnReplica: retryOnReplica,
+		blacklist:      NewChannelBlacklist(),
 	}
 }
 
@@ -103,6 +105,7 @@ func (lb *LBPolicyImpl) Start(ctx context.Context) {
 	for _, lb := range lb.balancerMap {
 		lb.Start(ctx)
 	}
+	lb.blacklist.Start()
 }
 
 // GetShard will retry until ctx done, except the collection is not loaded.
@@ -234,8 +237,10 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 		zap.String("channelName", workload.Channel),
 	)
 	var lastErr error
-	excludeNodes := typeutil.NewUniqueSet()
 	tryExecute := func() (bool, error) {
+		// Get fresh blacklist on each retry to include newly blacklisted nodes
+		blacklist := lb.blacklist.GetBlacklistedNodes(workload.Channel)
+		excludeNodes := typeutil.NewUniqueSet(blacklist...)
 		balancer := lb.getBalancer()
 		targetNode, err := lb.selectNode(ctx, balancer, workload, &excludeNodes)
 		if err != nil {
@@ -257,7 +262,7 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 			log.Warn("search/query channel failed, node not available",
 				zap.Int64("nodeID", targetNode.NodeID),
 				zap.Error(err))
-			excludeNodes.Insert(targetNode.NodeID)
+			lb.blacklist.Add(workload.Channel, targetNode.NodeID)
 
 			lastErr = errors.Wrapf(err, "failed to get delegator %d for channel %s", targetNode.NodeID, workload.Channel)
 			return true, lastErr
@@ -268,7 +273,7 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 			log.Warn("search/query channel failed",
 				zap.Int64("nodeID", targetNode.NodeID),
 				zap.Error(err))
-			excludeNodes.Insert(targetNode.NodeID)
+			lb.blacklist.Add(workload.Channel, targetNode.NodeID)
 			lastErr = errors.Wrapf(err, "failed to search/query delegator %d for channel %s", targetNode.NodeID, workload.Channel)
 			return true, lastErr
 		}
@@ -308,8 +313,19 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 		return merr.WrapErrCollectionNotLoaded(workload.CollectionID)
 	}
 
+	// Single channel fast path: skip errgroup/goroutine overhead
+	if len(channelList) == 1 {
+		return lb.ExecuteWithRetry(ctx, ChannelWorkload{
+			Db:             workload.Db,
+			CollectionName: workload.CollectionName,
+			CollectionID:   workload.CollectionID,
+			Channel:        channelList[0],
+			Nq:             workload.Nq,
+			Exec:           workload.Exec,
+		})
+	}
+
 	wg, _ := errgroup.WithContext(ctx)
-	// Launch a goroutine for each channel
 	for _, channel := range channelList {
 		wg.Go(func() error {
 			return lb.ExecuteWithRetry(ctx, ChannelWorkload{
@@ -355,4 +371,5 @@ func (lb *LBPolicyImpl) Close() {
 	for _, lb := range lb.balancerMap {
 		lb.Close()
 	}
+	lb.blacklist.Close()
 }

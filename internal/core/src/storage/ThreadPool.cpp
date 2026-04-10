@@ -15,11 +15,17 @@
 // limitations under the License.
 
 #include "ThreadPool.h"
+
+#include <chrono>
+
 #include "log/Log.h"
+#include "storage/SafeQueue.h"
 
 namespace milvus {
 
 int CPU_NUM = DEFAULT_CPU_NUM;
+std::atomic<int> THREAD_POOL_MAX_THREADS_SIZE(
+    DEFAULT_THREAD_POOL_MAX_THREADS_SIZE);
 
 std::atomic<float> HIGH_PRIORITY_THREAD_CORE_COEFFICIENT(
     DEFAULT_HIGH_PRIORITY_THREAD_CORE_COEFFICIENT);
@@ -52,6 +58,12 @@ SetLowPriorityThreadCoreCoefficient(const float coefficient) {
 void
 InitCpuNum(const int num) {
     CPU_NUM = num;
+}
+
+void
+SetThreadPoolMaxThreadsSize(const int size) {
+    THREAD_POOL_MAX_THREADS_SIZE.store(size);
+    LOG_INFO("set thread pool max threads size: {}", size);
 }
 
 void
@@ -130,6 +142,7 @@ ThreadPool::Worker() {
         lock.unlock();
         if (dequeue) {
             func();
+            func = nullptr;
         }
     }
 }

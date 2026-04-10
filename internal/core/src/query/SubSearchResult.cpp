@@ -10,6 +10,8 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <cmath>
+#include <iterator>
+#include <string>
 
 #include "common/EasyAssert.h"
 #include "query/SubSearchResult.h"
@@ -27,17 +29,18 @@ SubSearchResult::merge_impl(const SubSearchResult& right) {
     AssertInfo(is_desc == PositivelyRelated(metric_type_),
                "[SubSearchResult]Metric type isn't desc");
 
+    // Pre-allocate buffers outside the loop to avoid per-iteration allocations
+    std::vector<float> buf_distances(topk_);
+    std::vector<int64_t> buf_ids(topk_);
+
     for (int64_t qn = 0; qn < num_queries_; ++qn) {
         auto offset = qn * topk_;
 
-        int64_t* __restrict__ left_ids = this->get_seg_offsets() + offset;
+        int64_t* __restrict__ left_ids = this->get_offsets() + offset;
         float* __restrict__ left_distances = this->get_distances() + offset;
 
         auto right_ids = right.get_ids() + offset;
         auto right_distances = right.get_distances() + offset;
-
-        std::vector<float> buf_distances(topk_);
-        std::vector<int64_t> buf_ids(topk_);
 
         auto lit = 0;  // left iter
         auto rit = 0;  // right iter

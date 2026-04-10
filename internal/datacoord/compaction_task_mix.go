@@ -14,6 +14,7 @@ import (
 	"github.com/milvus-io/milvus/internal/compaction"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/session"
+	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
@@ -56,7 +57,10 @@ func (t *mixCompactionTask) GetTaskSlot() int64 {
 		if t.GetTaskProto().GetType() == datapb.CompactionType_SortCompaction {
 			segment := t.meta.GetHealthySegment(context.Background(), t.GetTaskProto().GetInputSegments()[0])
 			if segment != nil {
-				slotUsage = calculateStatsTaskSlot(segment.getSegmentSize())
+				segSize := segment.getSegmentSize()
+				slotUsage = calculateStatsTaskSlot(segSize)
+				log.Info("mixCompactionTask get task slot",
+					zap.Int64("segment size", segSize), zap.Int64("task slot", slotUsage))
 			}
 		}
 		t.slotUsage.Store(slotUsage)
@@ -126,23 +130,16 @@ func (t *mixCompactionTask) QueryTaskOnWorker(cluster session.Cluster) {
 		PlanID: t.GetTaskProto().GetPlanID(),
 	})
 	if err != nil || result == nil {
-		if errors.Is(err, merr.ErrNodeNotFound) {
-			if err := t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID)); err != nil {
-				log.Warn("mixCompactionTask failed to updateAndSaveTaskMeta", zap.Error(err))
-			}
-		}
 		log.Warn("mixCompactionTask failed to get compaction result", zap.Error(err))
+		if err := t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_pipelining), setNodeID(NullNodeID)); err != nil {
+			log.Warn("mixCompactionTask failed to updateAndSaveTaskMeta", zap.Error(err))
+		}
 		return
 	}
 	switch result.GetState() {
 	case datapb.CompactionTaskState_completed:
 		if len(result.GetSegments()) == 0 {
-			log.Info("illegal compaction results")
-			err := t.updateAndSaveTaskMeta(setState(datapb.CompactionTaskState_failed))
-			if err != nil {
-				log.Warn("mixCompactionTask failed to setState failed", zap.Error(err))
-			}
-			return
+			log.Info("compaction result is empty, all data may have been deleted")
 		}
 		err = t.meta.ValidateSegmentStateBeforeCompleteCompactionMutation(t.GetTaskProto())
 		if err != nil {
@@ -384,8 +381,19 @@ func (t *mixCompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, er
 		SlotUsage:                 t.GetSlotUsage(),
 		MaxSize:                   taskProto.GetMaxSize(),
 		JsonParams:                compactionParams,
-		CurrentScalarIndexVersion: t.ievm.GetCurrentScalarIndexEngineVersion(),
+		CurrentScalarIndexVersion: t.ievm.ResolveScalarIndexVersion(),
 	}
+
+	// set analyzer resource for text match index if use ref mode
+	if fileresource.IsRefMode(paramtable.Get().CommonCfg.DNFileResourceMode.GetValue()) && taskProto.GetType() == datapb.CompactionType_SortCompaction && len(taskProto.GetSchema().GetFileResourceIds()) > 0 {
+		resources, err := t.meta.GetFileResources(context.Background(), taskProto.GetSchema().GetFileResourceIds()...)
+		if err != nil {
+			log.Warn("get file resources for collection failed", zap.Int64("collectionID", taskProto.GetCollectionID()), zap.Error(err))
+			return nil, errors.Errorf("get file resources for sort compaction failed: %v", err)
+		}
+		plan.FileResources = resources
+	}
+
 	segIDMap := make(map[int64][]*datapb.FieldBinlog, len(plan.SegmentBinlogs))
 	segments := make([]*SegmentInfo, 0, len(taskProto.GetInputSegments()))
 	for _, segID := range taskProto.GetInputSegments() {
@@ -403,7 +411,9 @@ func (t *mixCompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, er
 			Field2StatslogPaths: segInfo.GetStatslogs(),
 			Deltalogs:           segInfo.GetDeltalogs(),
 			IsSorted:            segInfo.GetIsSorted(),
+			IsSortedByNamespace: segInfo.GetIsSortedByNamespace(),
 			StorageVersion:      segInfo.GetStorageVersion(),
+			Manifest:            segInfo.GetManifestPath(),
 		})
 		segIDMap[segID] = segInfo.GetDeltalogs()
 		segments = append(segments, segInfo)

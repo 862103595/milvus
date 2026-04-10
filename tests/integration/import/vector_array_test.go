@@ -47,7 +47,7 @@ func TestGenerateJsonFileWithVectorArray(t *testing.T) {
 		maxArrayCapacity = 10
 	)
 
-	collectionName := "TestBulkInsert_VectorArray_" + funcutil.GenRandomStr()
+	collectionName := "TestBulkInsert_VectorArray_" + funcutil.RandomString(8)
 
 	// Create schema with StructArrayField containing vector array
 	schema := integration.ConstructSchema(collectionName, 0, true, &schemapb.FieldSchema{
@@ -127,7 +127,7 @@ func (s *BulkInsertSuite) runForStructArray() {
 	ctx, cancel := context.WithTimeout(c.GetContext(), 600*time.Second)
 	defer cancel()
 
-	collectionName := "TestBulkInsert_VectorArray_" + funcutil.GenRandomStr()
+	collectionName := "TestBulkInsert_VectorArray_" + funcutil.RandomString(8)
 
 	// Create schema with StructArrayField containing vector array
 	schema := integration.ConstructSchema(collectionName, 0, true, &schemapb.FieldSchema{
@@ -158,7 +158,7 @@ func (s *BulkInsertSuite) runForStructArray() {
 				Name:         "vector_array_field",
 				IsPrimaryKey: false,
 				DataType:     schemapb.DataType_ArrayOfVector,
-				ElementType:  schemapb.DataType_FloatVector,
+				ElementType:  s.vecType,
 				TypeParams: []*commonpb.KeyValuePair{
 					{
 						Key:   common.DimKey,
@@ -302,11 +302,26 @@ func (s *BulkInsertSuite) runForStructArray() {
 
 func (s *BulkInsertSuite) TestImportWithVectorArray() {
 	fileTypeArr := []importutilv2.FileType{importutilv2.CSV, importutilv2.JSON, importutilv2.Parquet}
+
+	vectorTypeConfigs := []struct {
+		vecType    schemapb.DataType
+		indexType  string
+		metricType string
+	}{
+		{schemapb.DataType_FloatVector, integration.IndexHNSW, metric.MaxSim},
+		{schemapb.DataType_Float16Vector, integration.IndexHNSW, metric.MaxSim},
+		{schemapb.DataType_BFloat16Vector, integration.IndexHNSW, metric.MaxSim},
+		{schemapb.DataType_Int8Vector, integration.IndexHNSW, metric.MaxSim},
+		{schemapb.DataType_BinaryVector, integration.IndexHNSW, metric.MaxSimHamming},
+	}
+
 	for _, fileType := range fileTypeArr {
-		s.fileType = fileType
-		s.vecType = schemapb.DataType_FloatVector
-		s.indexType = integration.IndexHNSW
-		s.metricType = metric.MaxSim
-		s.runForStructArray()
+		for _, vtConfig := range vectorTypeConfigs {
+			s.fileType = fileType
+			s.vecType = vtConfig.vecType
+			s.indexType = vtConfig.indexType
+			s.metricType = vtConfig.metricType
+			s.runForStructArray()
+		}
 	}
 }

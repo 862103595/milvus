@@ -50,8 +50,9 @@ type ReplicaObserverSuite struct {
 
 	kv kv.MetaKv
 	// dependency
-	meta    *meta.Meta
-	distMgr *meta.DistributionManager
+	meta      *meta.Meta
+	distMgr   *meta.DistributionManager
+	targetMgr *meta.MockTargetManager
 
 	nodeMgr  *session.NodeManager
 	observer *ReplicaObserver
@@ -91,7 +92,8 @@ func (suite *ReplicaObserverSuite) SetupTest() {
 	suite.meta = meta.NewMeta(idAllocator, store, suite.nodeMgr)
 
 	suite.distMgr = meta.NewDistributionManager(suite.nodeMgr)
-	suite.observer = NewReplicaObserver(suite.meta, suite.distMgr)
+	suite.targetMgr = meta.NewMockTargetManager(suite.T())
+	suite.observer = NewReplicaObserver(suite.meta, suite.distMgr, suite.targetMgr)
 	suite.observer.Start()
 	suite.collectionID = int64(1000)
 	suite.partitionID = int64(100)
@@ -224,7 +226,7 @@ func (suite *ReplicaObserverSuite) TestCheckSQnodesInReplica() {
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	b.EXPECT().GetAllStreamingNodes(mock.Anything).RunAndReturn(func(ctx context.Context) (map[int64]*types.StreamingNodeInfo, error) {
+	b.EXPECT().GetAvailableStreamingNodes(mock.Anything).RunAndReturn(func(ctx context.Context) (map[int64]*types.StreamingNodeInfo, error) {
 		pchans := []map[int64]*types.StreamingNodeInfo{
 			{
 				1: {ServerID: 1, Address: "localhost:1"},
@@ -244,7 +246,7 @@ func (suite *ReplicaObserverSuite) TestCheckSQnodesInReplica() {
 		}
 	})
 	balance.Register(b)
-	suite.observer = NewReplicaObserver(suite.meta, suite.distMgr)
+	suite.observer = NewReplicaObserver(suite.meta, suite.distMgr, suite.targetMgr)
 	suite.observer.Start()
 
 	ctx := context.Background()

@@ -5,8 +5,10 @@ package mocks
 import (
 	context "context"
 
-	milvuspb "github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	metastore "github.com/milvus-io/milvus/internal/metastore"
+	internalpb "github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+
+	milvuspb "github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 
 	mock "github.com/stretchr/testify/mock"
 
@@ -655,53 +657,6 @@ func (_c *RootCoordCatalog_CreateCollection_Call) RunAndReturn(run func(context.
 	return _c
 }
 
-// CreateCredential provides a mock function with given fields: ctx, credential
-func (_m *RootCoordCatalog) CreateCredential(ctx context.Context, credential *model.Credential) error {
-	ret := _m.Called(ctx, credential)
-
-	if len(ret) == 0 {
-		panic("no return value specified for CreateCredential")
-	}
-
-	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, *model.Credential) error); ok {
-		r0 = rf(ctx, credential)
-	} else {
-		r0 = ret.Error(0)
-	}
-
-	return r0
-}
-
-// RootCoordCatalog_CreateCredential_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'CreateCredential'
-type RootCoordCatalog_CreateCredential_Call struct {
-	*mock.Call
-}
-
-// CreateCredential is a helper method to define mock.On call
-//   - ctx context.Context
-//   - credential *model.Credential
-func (_e *RootCoordCatalog_Expecter) CreateCredential(ctx interface{}, credential interface{}) *RootCoordCatalog_CreateCredential_Call {
-	return &RootCoordCatalog_CreateCredential_Call{Call: _e.mock.On("CreateCredential", ctx, credential)}
-}
-
-func (_c *RootCoordCatalog_CreateCredential_Call) Run(run func(ctx context.Context, credential *model.Credential)) *RootCoordCatalog_CreateCredential_Call {
-	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(*model.Credential))
-	})
-	return _c
-}
-
-func (_c *RootCoordCatalog_CreateCredential_Call) Return(_a0 error) *RootCoordCatalog_CreateCredential_Call {
-	_c.Call.Return(_a0)
-	return _c
-}
-
-func (_c *RootCoordCatalog_CreateCredential_Call) RunAndReturn(run func(context.Context, *model.Credential) error) *RootCoordCatalog_CreateCredential_Call {
-	_c.Call.Return(run)
-	return _c
-}
-
 // CreateDatabase provides a mock function with given fields: ctx, db, ts
 func (_m *RootCoordCatalog) CreateDatabase(ctx context.Context, db *model.Database, ts uint64) error {
 	ret := _m.Called(ctx, db, ts)
@@ -891,6 +846,55 @@ func (_c *RootCoordCatalog_DeleteGrant_Call) Return(_a0 error) *RootCoordCatalog
 }
 
 func (_c *RootCoordCatalog_DeleteGrant_Call) RunAndReturn(run func(context.Context, string, *milvuspb.RoleEntity) error) *RootCoordCatalog_DeleteGrant_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// DeleteGrantByCollectionName provides a mock function with given fields: ctx, tenant, dbName, collectionName
+func (_m *RootCoordCatalog) DeleteGrantByCollectionName(ctx context.Context, tenant string, dbName string, collectionName string) error {
+	ret := _m.Called(ctx, tenant, dbName, collectionName)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DeleteGrantByCollectionName")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, string) error); ok {
+		r0 = rf(ctx, tenant, dbName, collectionName)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// RootCoordCatalog_DeleteGrantByCollectionName_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DeleteGrantByCollectionName'
+type RootCoordCatalog_DeleteGrantByCollectionName_Call struct {
+	*mock.Call
+}
+
+// DeleteGrantByCollectionName is a helper method to define mock.On call
+//   - ctx context.Context
+//   - tenant string
+//   - dbName string
+//   - collectionName string
+func (_e *RootCoordCatalog_Expecter) DeleteGrantByCollectionName(ctx interface{}, tenant interface{}, dbName interface{}, collectionName interface{}) *RootCoordCatalog_DeleteGrantByCollectionName_Call {
+	return &RootCoordCatalog_DeleteGrantByCollectionName_Call{Call: _e.mock.On("DeleteGrantByCollectionName", ctx, tenant, dbName, collectionName)}
+}
+
+func (_c *RootCoordCatalog_DeleteGrantByCollectionName_Call) Run(run func(ctx context.Context, tenant string, dbName string, collectionName string)) *RootCoordCatalog_DeleteGrantByCollectionName_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].(string), args[3].(string))
+	})
+	return _c
+}
+
+func (_c *RootCoordCatalog_DeleteGrantByCollectionName_Call) Return(_a0 error) *RootCoordCatalog_DeleteGrantByCollectionName_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *RootCoordCatalog_DeleteGrantByCollectionName_Call) RunAndReturn(run func(context.Context, string, string, string) error) *RootCoordCatalog_DeleteGrantByCollectionName_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -1768,6 +1772,71 @@ func (_c *RootCoordCatalog_ListDatabases_Call) RunAndReturn(run func(context.Con
 	return _c
 }
 
+// ListFileResource provides a mock function with given fields: ctx
+func (_m *RootCoordCatalog) ListFileResource(ctx context.Context) ([]*internalpb.FileResourceInfo, uint64, error) {
+	ret := _m.Called(ctx)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ListFileResource")
+	}
+
+	var r0 []*internalpb.FileResourceInfo
+	var r1 uint64
+	var r2 error
+	if rf, ok := ret.Get(0).(func(context.Context) ([]*internalpb.FileResourceInfo, uint64, error)); ok {
+		return rf(ctx)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context) []*internalpb.FileResourceInfo); ok {
+		r0 = rf(ctx)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]*internalpb.FileResourceInfo)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context) uint64); ok {
+		r1 = rf(ctx)
+	} else {
+		r1 = ret.Get(1).(uint64)
+	}
+
+	if rf, ok := ret.Get(2).(func(context.Context) error); ok {
+		r2 = rf(ctx)
+	} else {
+		r2 = ret.Error(2)
+	}
+
+	return r0, r1, r2
+}
+
+// RootCoordCatalog_ListFileResource_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ListFileResource'
+type RootCoordCatalog_ListFileResource_Call struct {
+	*mock.Call
+}
+
+// ListFileResource is a helper method to define mock.On call
+//   - ctx context.Context
+func (_e *RootCoordCatalog_Expecter) ListFileResource(ctx interface{}) *RootCoordCatalog_ListFileResource_Call {
+	return &RootCoordCatalog_ListFileResource_Call{Call: _e.mock.On("ListFileResource", ctx)}
+}
+
+func (_c *RootCoordCatalog_ListFileResource_Call) Run(run func(ctx context.Context)) *RootCoordCatalog_ListFileResource_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context))
+	})
+	return _c
+}
+
+func (_c *RootCoordCatalog_ListFileResource_Call) Return(_a0 []*internalpb.FileResourceInfo, _a1 uint64, _a2 error) *RootCoordCatalog_ListFileResource_Call {
+	_c.Call.Return(_a0, _a1, _a2)
+	return _c
+}
+
+func (_c *RootCoordCatalog_ListFileResource_Call) RunAndReturn(run func(context.Context) ([]*internalpb.FileResourceInfo, uint64, error)) *RootCoordCatalog_ListFileResource_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // ListGrant provides a mock function with given fields: ctx, tenant, entity
 func (_m *RootCoordCatalog) ListGrant(ctx context.Context, tenant string, entity *milvuspb.GrantEntity) ([]*milvuspb.GrantEntity, error) {
 	ret := _m.Called(ctx, tenant, entity)
@@ -2126,6 +2195,105 @@ func (_c *RootCoordCatalog_ListUserRole_Call) RunAndReturn(run func(context.Cont
 	return _c
 }
 
+// MigrateGrantCollectionName provides a mock function with given fields: ctx, tenant, oldDBName, oldName, newDBName, newName
+func (_m *RootCoordCatalog) MigrateGrantCollectionName(ctx context.Context, tenant string, oldDBName string, oldName string, newDBName string, newName string) error {
+	ret := _m.Called(ctx, tenant, oldDBName, oldName, newDBName, newName)
+
+	if len(ret) == 0 {
+		panic("no return value specified for MigrateGrantCollectionName")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, string, string, string) error); ok {
+		r0 = rf(ctx, tenant, oldDBName, oldName, newDBName, newName)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// RootCoordCatalog_MigrateGrantCollectionName_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'MigrateGrantCollectionName'
+type RootCoordCatalog_MigrateGrantCollectionName_Call struct {
+	*mock.Call
+}
+
+// MigrateGrantCollectionName is a helper method to define mock.On call
+//   - ctx context.Context
+//   - tenant string
+//   - oldDBName string
+//   - oldName string
+//   - newDBName string
+//   - newName string
+func (_e *RootCoordCatalog_Expecter) MigrateGrantCollectionName(ctx interface{}, tenant interface{}, oldDBName interface{}, oldName interface{}, newDBName interface{}, newName interface{}) *RootCoordCatalog_MigrateGrantCollectionName_Call {
+	return &RootCoordCatalog_MigrateGrantCollectionName_Call{Call: _e.mock.On("MigrateGrantCollectionName", ctx, tenant, oldDBName, oldName, newDBName, newName)}
+}
+
+func (_c *RootCoordCatalog_MigrateGrantCollectionName_Call) Run(run func(ctx context.Context, tenant string, oldDBName string, oldName string, newDBName string, newName string)) *RootCoordCatalog_MigrateGrantCollectionName_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].(string), args[3].(string), args[4].(string), args[5].(string))
+	})
+	return _c
+}
+
+func (_c *RootCoordCatalog_MigrateGrantCollectionName_Call) Return(_a0 error) *RootCoordCatalog_MigrateGrantCollectionName_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *RootCoordCatalog_MigrateGrantCollectionName_Call) RunAndReturn(run func(context.Context, string, string, string, string, string) error) *RootCoordCatalog_MigrateGrantCollectionName_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// RemoveFileResource provides a mock function with given fields: ctx, resourceID, version
+func (_m *RootCoordCatalog) RemoveFileResource(ctx context.Context, resourceID int64, version uint64) error {
+	ret := _m.Called(ctx, resourceID, version)
+
+	if len(ret) == 0 {
+		panic("no return value specified for RemoveFileResource")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64, uint64) error); ok {
+		r0 = rf(ctx, resourceID, version)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// RootCoordCatalog_RemoveFileResource_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'RemoveFileResource'
+type RootCoordCatalog_RemoveFileResource_Call struct {
+	*mock.Call
+}
+
+// RemoveFileResource is a helper method to define mock.On call
+//   - ctx context.Context
+//   - resourceID int64
+//   - version uint64
+func (_e *RootCoordCatalog_Expecter) RemoveFileResource(ctx interface{}, resourceID interface{}, version interface{}) *RootCoordCatalog_RemoveFileResource_Call {
+	return &RootCoordCatalog_RemoveFileResource_Call{Call: _e.mock.On("RemoveFileResource", ctx, resourceID, version)}
+}
+
+func (_c *RootCoordCatalog_RemoveFileResource_Call) Run(run func(ctx context.Context, resourceID int64, version uint64)) *RootCoordCatalog_RemoveFileResource_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(int64), args[2].(uint64))
+	})
+	return _c
+}
+
+func (_c *RootCoordCatalog_RemoveFileResource_Call) Return(_a0 error) *RootCoordCatalog_RemoveFileResource_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *RootCoordCatalog_RemoveFileResource_Call) RunAndReturn(run func(context.Context, int64, uint64) error) *RootCoordCatalog_RemoveFileResource_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // RestoreRBAC provides a mock function with given fields: ctx, tenant, meta
 func (_m *RootCoordCatalog) RestoreRBAC(ctx context.Context, tenant string, meta *milvuspb.RBACMeta) error {
 	ret := _m.Called(ctx, tenant, meta)
@@ -2170,6 +2338,54 @@ func (_c *RootCoordCatalog_RestoreRBAC_Call) Return(_a0 error) *RootCoordCatalog
 }
 
 func (_c *RootCoordCatalog_RestoreRBAC_Call) RunAndReturn(run func(context.Context, string, *milvuspb.RBACMeta) error) *RootCoordCatalog_RestoreRBAC_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// SaveFileResource provides a mock function with given fields: ctx, resource, version
+func (_m *RootCoordCatalog) SaveFileResource(ctx context.Context, resource *internalpb.FileResourceInfo, version uint64) error {
+	ret := _m.Called(ctx, resource, version)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SaveFileResource")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, *internalpb.FileResourceInfo, uint64) error); ok {
+		r0 = rf(ctx, resource, version)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// RootCoordCatalog_SaveFileResource_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SaveFileResource'
+type RootCoordCatalog_SaveFileResource_Call struct {
+	*mock.Call
+}
+
+// SaveFileResource is a helper method to define mock.On call
+//   - ctx context.Context
+//   - resource *internalpb.FileResourceInfo
+//   - version uint64
+func (_e *RootCoordCatalog_Expecter) SaveFileResource(ctx interface{}, resource interface{}, version interface{}) *RootCoordCatalog_SaveFileResource_Call {
+	return &RootCoordCatalog_SaveFileResource_Call{Call: _e.mock.On("SaveFileResource", ctx, resource, version)}
+}
+
+func (_c *RootCoordCatalog_SaveFileResource_Call) Run(run func(ctx context.Context, resource *internalpb.FileResourceInfo, version uint64)) *RootCoordCatalog_SaveFileResource_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*internalpb.FileResourceInfo), args[2].(uint64))
+	})
+	return _c
+}
+
+func (_c *RootCoordCatalog_SaveFileResource_Call) Return(_a0 error) *RootCoordCatalog_SaveFileResource_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *RootCoordCatalog_SaveFileResource_Call) RunAndReturn(run func(context.Context, *internalpb.FileResourceInfo, uint64) error) *RootCoordCatalog_SaveFileResource_Call {
 	_c.Call.Return(run)
 	return _c
 }

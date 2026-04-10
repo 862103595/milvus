@@ -18,6 +18,7 @@ package datacoord
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sync/atomic"
 	"testing"
@@ -41,12 +42,15 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/kv"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
@@ -89,11 +93,14 @@ func (suite *MetaReloadSuite) TestReloadFromKV() {
 		}, nil)
 		suite.catalog.EXPECT().ListSegments(mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
 		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
-		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything).Return([]*model.SegmentIndex{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
 		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
 
 		_, err := newMeta(ctx, suite.catalog, nil, brk)
 		suite.Error(err)
@@ -106,11 +113,14 @@ func (suite *MetaReloadSuite) TestReloadFromKV() {
 		suite.catalog.EXPECT().ListSegments(mock.Anything, mock.Anything).Return([]*datapb.SegmentInfo{}, nil)
 		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, errors.New("mock"))
 		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
-		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything).Return([]*model.SegmentIndex{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
 		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
 
 		_, err := newMeta(ctx, suite.catalog, nil, brk)
 		suite.Error(err)
@@ -129,9 +139,8 @@ func (suite *MetaReloadSuite) TestReloadFromKV() {
 			},
 		}, nil)
 
-		suite.catalog.EXPECT().ListFileResource(mock.Anything).Return([]*model.FileResource{}, nil)
 		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
-		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything).Return([]*model.SegmentIndex{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
 		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
@@ -151,11 +160,128 @@ func (suite *MetaReloadSuite) TestReloadFromKV() {
 				Timestamp:   1000,
 			},
 		}, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
 
 		_, err := newMeta(ctx, suite.catalog, nil, brk)
 		suite.NoError(err)
 
-		suite.MetricsEqual(metrics.DataCoordNumSegments.WithLabelValues(metrics.FlushedSegmentLabel, datapb.SegmentLevel_Legacy.String(), "unsorted"), 1)
+		suite.MetricsEqual(metrics.DataCoordNumSegments.WithLabelValues(metrics.FlushedSegmentLabel, datapb.SegmentLevel_Legacy.String(), "unsorted", "0"), 1)
+	})
+
+	suite.Run("ListIndexes_fail", func() {
+		defer suite.resetMock()
+		brk := broker.NewMockBroker(suite.T())
+		brk.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return(nil, errors.New("mock"))
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
+		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+
+		_, err := newMeta(ctx, suite.catalog, nil, brk)
+		suite.Error(err)
+	})
+
+	suite.Run("ListAnalyzeTasks_fail", func() {
+		defer suite.resetMock()
+		brk := broker.NewMockBroker(suite.T())
+		brk.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
+		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, errors.New("mock"))
+		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+
+		_, err := newMeta(ctx, suite.catalog, nil, brk)
+		suite.Error(err)
+	})
+
+	suite.Run("ListPartitionStatsInfos_fail", func() {
+		defer suite.resetMock()
+		brk := broker.NewMockBroker(suite.T())
+		brk.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
+		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, errors.New("mock"))
+		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+
+		_, err := newMeta(ctx, suite.catalog, nil, brk)
+		suite.Error(err)
+	})
+
+	suite.Run("ListCompactionTask_fail", func() {
+		defer suite.resetMock()
+		brk := broker.NewMockBroker(suite.T())
+		brk.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
+		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, errors.New("mock"))
+		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+
+		_, err := newMeta(ctx, suite.catalog, nil, brk)
+		suite.Error(err)
+	})
+
+	suite.Run("ListStatsTasks_fail", func() {
+		defer suite.resetMock()
+		brk := broker.NewMockBroker(suite.T())
+		brk.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
+		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, errors.New("mock"))
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+
+		_, err := newMeta(ctx, suite.catalog, nil, brk)
+		suite.Error(err)
+	})
+
+	suite.Run("ListSnapshots_fail", func() {
+		defer suite.resetMock()
+		brk := broker.NewMockBroker(suite.T())
+		brk.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
+		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, errors.New("mock"))
+		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+
+		_, err := newMeta(ctx, suite.catalog, nil, brk)
+		suite.Error(err)
 	})
 
 	suite.Run("test list segments", func() {
@@ -175,14 +301,16 @@ func (suite *MetaReloadSuite) TestReloadFromKV() {
 			},
 		}, nil)
 
-		suite.catalog.EXPECT().ListFileResource(mock.Anything).Return([]*model.FileResource{}, nil)
 		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
-		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything).Return([]*model.SegmentIndex{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
 		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
 		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
 
 		suite.catalog.EXPECT().ListSegments(mock.Anything, mock.Anything).RunAndReturn(
 			func(ctx context.Context, collectionID int64) ([]*datapb.SegmentInfo, error) {
@@ -295,6 +423,46 @@ func (suite *MetaBasicSuite) TestCompleteCompactionMutation() {
 
 	mockChMgr := mocks.NewChunkManager(suite.T())
 
+	suite.Run("test complete with empty result segments", func() {
+		// Test case: when all data is deleted, compaction result should have empty Segments slice
+		// This verifies that completeMixCompactionMutation correctly handles the case
+		// where no output segments are produced (all data deleted during compaction)
+		latestSegments := getLatestSegments()
+
+		result := &datapb.CompactionPlanResult{
+			Segments: []*datapb.CompactionSegment{}, // Empty - all data deleted
+		}
+		task := &datapb.CompactionTask{
+			InputSegments: []UniqueID{1, 2},
+			Type:          datapb.CompactionType_MixCompaction,
+		}
+		m := &meta{
+			catalog:      &datacoord.Catalog{MetaKv: NewMetaMemoryKV()},
+			segments:     latestSegments,
+			chunkManager: mockChMgr,
+		}
+
+		infos, mutation, err := m.CompleteCompactionMutation(context.TODO(), task, result)
+		suite.NoError(err)
+		suite.Empty(infos) // No output segments when all data deleted
+		suite.NotNil(mutation)
+
+		// check compactFrom segments are marked as Dropped
+		for _, segID := range []int64{1, 2} {
+			seg := m.GetSegment(context.TODO(), segID)
+			suite.Equal(commonpb.SegmentState_Dropped, seg.GetState())
+			suite.NotEmpty(seg.GetDroppedAt())
+			suite.True(seg.GetCompacted())
+		}
+
+		// check mutation metrics - only input segments changed to Dropped
+		suite.EqualValues(-4, mutation.rowCountChange)
+		flushedUnsorted := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Flushed.String()][getSortStatus(false)]["0"]
+		suite.EqualValues(-2, flushedUnsorted)
+		droppedUnsorted := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Dropped.String()][getSortStatus(false)]["0"]
+		suite.EqualValues(2, droppedUnsorted)
+	})
+
 	suite.Run("test complete with compactTo 0 num of rows", func() {
 		latestSegments := getLatestSegments()
 		compactToSeg := &datapb.CompactionSegment{
@@ -349,10 +517,10 @@ func (suite *MetaBasicSuite) TestCompleteCompactionMutation() {
 		suite.EqualValues(2, len(mutation.stateChange[datapb.SegmentLevel_L1.String()]))
 		suite.EqualValues(-4, mutation.rowCountChange)
 		suite.EqualValues(0, mutation.rowCountAccChange)
-		flushedUnsorted := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Flushed.String()][getSortStatus(false)]
+		flushedUnsorted := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Flushed.String()][getSortStatus(false)]["0"]
 		suite.EqualValues(-2, flushedUnsorted)
 
-		droppedUnsorted := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Dropped.String()][getSortStatus(false)]
+		droppedUnsorted := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Dropped.String()][getSortStatus(false)]["0"]
 		suite.EqualValues(3, droppedUnsorted)
 	})
 
@@ -423,10 +591,10 @@ func (suite *MetaBasicSuite) TestCompleteCompactionMutation() {
 		suite.EqualValues(2, len(mutation.stateChange[datapb.SegmentLevel_L1.String()]))
 		suite.EqualValues(-2, mutation.rowCountChange)
 		suite.EqualValues(2, mutation.rowCountAccChange)
-		flushedCount := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Flushed.String()][getSortStatus(false)]
+		flushedCount := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Flushed.String()][getSortStatus(false)]["0"]
 		suite.EqualValues(-1, flushedCount)
 
-		droppedCount := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Dropped.String()][getSortStatus(false)]
+		droppedCount := mutation.stateChange[datapb.SegmentLevel_L1.String()][commonpb.SegmentState_Dropped.String()][getSortStatus(false)]["0"]
 		suite.EqualValues(2, droppedCount)
 	})
 
@@ -703,6 +871,7 @@ func TestMeta_Basic(t *testing.T) {
 		metakv.EXPECT().MultiSave(mock.Anything, mock.Anything).Return(errors.New("failed")).Maybe()
 		metakv.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 		metakv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).Return(nil, nil, nil).Maybe()
+		metakv.EXPECT().Has(mock.Anything, datacoord.FileResourceVersionKey).Return(false, nil).Maybe()
 		catalog := datacoord.NewCatalog(metakv, "", "")
 		broker := broker.NewMockBroker(t)
 		broker.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
@@ -714,6 +883,7 @@ func TestMeta_Basic(t *testing.T) {
 
 		metakv2 := mockkv.NewMetaKv(t)
 		metakv2.EXPECT().Save(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		metakv2.EXPECT().Has(mock.Anything, datacoord.FileResourceVersionKey).Return(false, nil).Maybe()
 		metakv2.EXPECT().MultiSave(mock.Anything, mock.Anything).Return(nil).Maybe()
 		metakv2.EXPECT().Remove(mock.Anything, mock.Anything).Return(errors.New("failed")).Maybe()
 		metakv2.EXPECT().MultiRemove(mock.Anything, mock.Anything).Return(errors.New("failed")).Maybe()
@@ -875,6 +1045,99 @@ func TestGetUnFlushedSegments(t *testing.T) {
 	assert.EqualValues(t, 1, len(segments))
 	assert.EqualValues(t, 0, segments[0].ID)
 	assert.NotEqualValues(t, commonpb.SegmentState_Flushed, segments[0].State)
+}
+
+func TestAlterSegmentsWithRecovery(t *testing.T) {
+	rootPath := "AlterSegmentsWithRecovery-" + funcutil.RandomString(10)
+	meta, _ := newMetaWithEtcd(t, rootPath)
+	etcdCli, _ := kvfactory.GetEtcdAndPath()
+
+	collectionID := int64(1)
+	partitionID := int64(1)
+	segmentID := int64(1)
+	fieldID := int64(1)
+	segment1 := NewSegmentInfo(&datapb.SegmentInfo{
+		CollectionID:  collectionID,
+		PartitionID:   partitionID,
+		ID:            segmentID,
+		State:         commonpb.SegmentState_Growing,
+		Binlogs:       []*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+		Statslogs:     []*datapb.FieldBinlog{getFieldBinlogIDs(1, 334)},
+		Deltalogs:     []*datapb.FieldBinlog{getFieldBinlogIDs(1, 100)},
+		Bm25Statslogs: []*datapb.FieldBinlog{getFieldBinlogIDs(1, 20)},
+	})
+	err := meta.AddSegment(context.TODO(), segment1)
+	require.NoError(t, err)
+
+	segmentPath := fmt.Sprintf("%s/%s/%d/%d/%d", rootPath, datacoord.SegmentPrefix, collectionID, partitionID, segmentID)
+	binlogsPath := fmt.Sprintf("%s/%s/%d/%d/%d/%d", rootPath, datacoord.SegmentBinlogPathPrefix, collectionID, partitionID, segmentID, fieldID)
+	statslogsPath := fmt.Sprintf("%s/%s/%d/%d/%d/%d", rootPath, datacoord.SegmentStatslogPathPrefix, collectionID, partitionID, segmentID, fieldID)
+	deltalogsPath := fmt.Sprintf("%s/%s/%d/%d/%d/%d", rootPath, datacoord.SegmentDeltalogPathPrefix, collectionID, partitionID, segmentID, fieldID)
+	bm25StatslogsPath := fmt.Sprintf("%s/%s/%d/%d/%d/%d", rootPath, datacoord.SegmentBM25logPathPrefix, collectionID, partitionID, segmentID, fieldID)
+
+	checkVersion := func(sVersion int64, bVersion int64, stVersion int64, dVersion int64, bm25Version int64) {
+		kv, err := etcdCli.Get(context.TODO(), segmentPath)
+		require.NoError(t, err)
+		require.Equal(t, kv.Kvs[0].Version, sVersion)
+		kv, err = etcdCli.Get(context.TODO(), binlogsPath)
+		require.NoError(t, err)
+		require.Equal(t, kv.Kvs[0].Version, bVersion)
+		kv, err = etcdCli.Get(context.TODO(), statslogsPath)
+		require.NoError(t, err)
+		require.Equal(t, kv.Kvs[0].Version, stVersion)
+		kv, err = etcdCli.Get(context.TODO(), deltalogsPath)
+		require.NoError(t, err)
+		require.Equal(t, kv.Kvs[0].Version, dVersion)
+		kv, err = etcdCli.Get(context.TODO(), bm25StatslogsPath)
+		require.NoError(t, err)
+		require.Equal(t, kv.Kvs[0].Version, bm25Version)
+	}
+	checkVersion(1, 1, 1, 1, 1)
+
+	err = meta.UpdateSegmentsInfo(context.TODO(), AddBinlogsOperator(1,
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+		nil,
+		nil,
+		nil,
+	))
+	require.NoError(t, err)
+	checkVersion(2, 2, 1, 1, 1)
+
+	err = meta.UpdateSegmentsInfo(context.TODO(), AddBinlogsOperator(1,
+		nil,
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+		nil,
+		nil,
+	))
+	require.NoError(t, err)
+	checkVersion(3, 2, 2, 1, 1)
+
+	err = meta.UpdateSegmentsInfo(context.TODO(), AddBinlogsOperator(1,
+		nil,
+		nil,
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+		nil,
+	))
+	require.NoError(t, err)
+	checkVersion(4, 2, 2, 2, 1)
+
+	err = meta.UpdateSegmentsInfo(context.TODO(), AddBinlogsOperator(1,
+		nil,
+		nil,
+		nil,
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+	))
+	require.NoError(t, err)
+	checkVersion(5, 2, 2, 2, 2)
+
+	err = meta.UpdateSegmentsInfo(context.TODO(), AddBinlogsOperator(1,
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+		[]*datapb.FieldBinlog{getFieldBinlogIDs(1, 10, 333)},
+	))
+	require.NoError(t, err)
+	checkVersion(6, 3, 3, 3, 3)
 }
 
 func TestUpdateSegmentsInfo(t *testing.T) {
@@ -1173,6 +1436,7 @@ func TestUpdateSegmentsInfo(t *testing.T) {
 		metakv.EXPECT().MultiSave(mock.Anything, mock.Anything).Return(errors.New("mocked fail")).Maybe()
 		metakv.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 		metakv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).Return(nil, nil, nil).Maybe()
+		metakv.EXPECT().Has(mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		catalog := datacoord.NewCatalog(metakv, "", "")
 		broker := broker.NewMockBroker(t)
 		broker.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
@@ -1208,6 +1472,137 @@ func TestUpdateSegmentsInfo(t *testing.T) {
 		assert.Equal(t, commonpb.SegmentState_Growing, segmentInfo.State)
 		assert.Nil(t, segmentInfo.Binlogs)
 		assert.Nil(t, segmentInfo.StartPosition)
+	})
+}
+
+func TestUpdateManifestVersion(t *testing.T) {
+	t.Run("segment not found", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		operator := UpdateManifestVersion(999, 10)
+		pack := &updateSegmentPack{
+			meta:     meta,
+			segments: make(map[int64]*SegmentInfo),
+		}
+		assert.False(t, operator(pack))
+	})
+
+	t.Run("empty manifest path", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		meta.AddSegment(context.Background(), &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				State:        commonpb.SegmentState_Flushed,
+				ManifestPath: "",
+			},
+		})
+
+		operator := UpdateManifestVersion(1, 10)
+		pack := &updateSegmentPack{
+			meta:     meta,
+			segments: make(map[int64]*SegmentInfo),
+		}
+		assert.False(t, operator(pack))
+	})
+
+	t.Run("invalid manifest path - unmarshal error", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		meta.AddSegment(context.Background(), &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				State:        commonpb.SegmentState_Flushed,
+				ManifestPath: "not-json",
+			},
+		})
+
+		operator := UpdateManifestVersion(1, 10)
+		pack := &updateSegmentPack{
+			meta:     meta,
+			segments: make(map[int64]*SegmentInfo),
+		}
+		assert.False(t, operator(pack))
+	})
+
+	t.Run("same version - no update", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		manifestPath := packed.MarshalManifestPath("/data/segments/1", 10)
+		meta.AddSegment(context.Background(), &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				State:        commonpb.SegmentState_Flushed,
+				ManifestPath: manifestPath,
+			},
+		})
+
+		operator := UpdateManifestVersion(1, 10)
+		pack := &updateSegmentPack{
+			meta:     meta,
+			segments: make(map[int64]*SegmentInfo),
+		}
+		assert.False(t, operator(pack))
+	})
+
+	t.Run("success - version updated", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		manifestPath := packed.MarshalManifestPath("/data/segments/1", 5)
+		meta.AddSegment(context.Background(), &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				State:        commonpb.SegmentState_Flushed,
+				ManifestPath: manifestPath,
+			},
+		})
+
+		operator := UpdateManifestVersion(1, 10)
+		pack := &updateSegmentPack{
+			meta:     meta,
+			segments: make(map[int64]*SegmentInfo),
+		}
+		assert.True(t, operator(pack))
+
+		// Verify the manifest path was updated
+		seg := pack.Get(1)
+		assert.NotNil(t, seg)
+		basePath, version, err := packed.UnmarshalManifestPath(seg.ManifestPath)
+		assert.NoError(t, err)
+		assert.Equal(t, "/data/segments/1", basePath)
+		assert.Equal(t, int64(10), version)
+	})
+
+	t.Run("success - via UpdateSegmentsInfo", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		manifestPath := packed.MarshalManifestPath("/data/segments/1", 1)
+		meta.AddSegment(context.Background(), &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				State:        commonpb.SegmentState_Flushed,
+				ManifestPath: manifestPath,
+			},
+		})
+
+		err = meta.UpdateSegmentsInfo(
+			context.TODO(),
+			UpdateManifestVersion(1, 5),
+		)
+		assert.NoError(t, err)
+
+		updated := meta.GetHealthySegment(context.TODO(), 1)
+		assert.NotNil(t, updated)
+		basePath, version, err := packed.UnmarshalManifestPath(updated.ManifestPath)
+		assert.NoError(t, err)
+		assert.Equal(t, "/data/segments/1", basePath)
+		assert.Equal(t, int64(5), version)
 	})
 }
 
@@ -1521,6 +1916,102 @@ func TestChannelCP(t *testing.T) {
 		err = meta.UpdateChannelCheckpoint(context.TODO(), mockVChannel, pos)
 		assert.NoError(t, err)
 		err = meta.DropChannelCheckpoint(mockVChannel)
+		assert.NoError(t, err)
+	})
+
+	t.Run("WatchChannelCheckpoint", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		err = meta.UpdateChannelCheckpoint(context.TODO(), mockVChannel, pos)
+		assert.NoError(t, err)
+		err = meta.WatchChannelCheckpoint(context.TODO(), mockVChannel, pos.Timestamp-1)
+		assert.NoError(t, err)
+	})
+
+	t.Run("TruncateChannelByTime", func(t *testing.T) {
+		meta, err := newMemoryMeta(t)
+		assert.NoError(t, err)
+
+		flushTs := uint64(2000)
+		channelName := mockVChannel
+
+		// Test case 1: No segments to drop
+		err = meta.TruncateChannelByTime(context.TODO(), channelName, flushTs)
+		assert.NoError(t, err)
+
+		// Test case 2: Add segments that should be dropped (timestamp <= flushTs)
+		seg1 := &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:            1,
+				CollectionID:  1,
+				PartitionID:   1,
+				InsertChannel: channelName,
+				State:         commonpb.SegmentState_Flushed,
+				DmlPosition: &msgpb.MsgPosition{
+					ChannelName: channelName,
+					Timestamp:   flushTs - 100, // less than flushTs
+				},
+			},
+		}
+		err = meta.AddSegment(context.TODO(), seg1)
+		assert.NoError(t, err)
+
+		// Test case 3: Add segment that should NOT be dropped (timestamp > flushTs)
+		seg2 := &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:            2,
+				CollectionID:  1,
+				PartitionID:   1,
+				InsertChannel: channelName,
+				State:         commonpb.SegmentState_Flushed,
+				DmlPosition: &msgpb.MsgPosition{
+					ChannelName: channelName,
+					Timestamp:   flushTs + 100, // greater than flushTs
+				},
+			},
+		}
+		err = meta.AddSegment(context.TODO(), seg2)
+		assert.NoError(t, err)
+
+		// Test case 4: Add segment that is already dropped (should be skipped)
+		seg3 := &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:            3,
+				CollectionID:  1,
+				PartitionID:   1,
+				InsertChannel: channelName,
+				State:         commonpb.SegmentState_Dropped,
+				DmlPosition: &msgpb.MsgPosition{
+					ChannelName: channelName,
+					Timestamp:   flushTs - 100, // less than flushTs but already dropped
+				},
+			},
+		}
+		err = meta.AddSegment(context.TODO(), seg3)
+		assert.NoError(t, err)
+
+		// Test case 5: TruncateChannelByTime should drop seg1 but not seg2 or seg3
+		err = meta.TruncateChannelByTime(context.TODO(), channelName, flushTs)
+		assert.NoError(t, err)
+
+		// Verify seg1 is dropped
+		seg1After := meta.GetSegment(context.TODO(), seg1.ID)
+		assert.NotNil(t, seg1After)
+		assert.Equal(t, commonpb.SegmentState_Dropped, seg1After.GetState())
+
+		// Verify seg2 is not dropped
+		seg2After := meta.GetSegment(context.TODO(), seg2.ID)
+		assert.NotNil(t, seg2After)
+		assert.NotEqual(t, commonpb.SegmentState_Dropped, seg2After.GetState())
+
+		// Verify seg3 remains dropped
+		seg3After := meta.GetSegment(context.TODO(), seg3.ID)
+		assert.NotNil(t, seg3After)
+		assert.Equal(t, commonpb.SegmentState_Dropped, seg3After.GetState())
+
+		// Test case 6: Call again with same flushTs, should return nil (no segments to drop)
+		err = meta.TruncateChannelByTime(context.TODO(), channelName, flushTs)
 		assert.NoError(t, err)
 	})
 }

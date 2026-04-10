@@ -58,10 +58,10 @@ func Int8VectorsToPlaceholderGroup(embs [][]int8) *commonpb.PlaceholderGroup {
 	return placeholderGroup
 }
 
-func FieldDataToPlaceholderGroupBytes(fieldData *schemapb.FieldData) ([]byte, error) {
+func FieldDataToPlaceholderGroupBytesWithCount(fieldData *schemapb.FieldData) ([]byte, int, error) {
 	placeholderValue, err := fieldDataToPlaceholderValue(fieldData)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	placeholderGroup := &commonpb.PlaceholderGroup{
@@ -69,7 +69,12 @@ func FieldDataToPlaceholderGroupBytes(fieldData *schemapb.FieldData) ([]byte, er
 	}
 
 	bytes, _ := proto.Marshal(placeholderGroup)
-	return bytes, nil
+	return bytes, len(placeholderValue.Values), nil
+}
+
+func FieldDataToPlaceholderGroupBytes(fieldData *schemapb.FieldData) ([]byte, error) {
+	bytes, _, err := FieldDataToPlaceholderGroupBytesWithCount(fieldData)
+	return bytes, err
 }
 
 func fieldDataToPlaceholderValue(fieldData *schemapb.FieldData) (*commonpb.PlaceholderValue, error) {
@@ -96,7 +101,7 @@ func fieldDataToPlaceholderValue(fieldData *schemapb.FieldData) (*commonpb.Place
 		placeholderValue := &commonpb.PlaceholderValue{
 			Tag:    "$0",
 			Type:   commonpb.PlaceholderType_BinaryVector,
-			Values: flattenedByteVectorsToByteVectors(x.BinaryVector, int(vectors.Dim)),
+			Values: flattenedBinaryVectorsToByteVectors(x.BinaryVector, int(vectors.Dim)),
 		}
 		return placeholderValue, nil
 	case schemapb.DataType_Float16Vector:
@@ -120,7 +125,7 @@ func fieldDataToPlaceholderValue(fieldData *schemapb.FieldData) (*commonpb.Place
 		placeholderValue := &commonpb.PlaceholderValue{
 			Tag:    "$0",
 			Type:   commonpb.PlaceholderType_BFloat16Vector,
-			Values: flattenedFloat16VectorsToByteVectors(x.Bfloat16Vector, int(vectors.Dim)),
+			Values: flattenedBFloat16VectorsToByteVectors(x.Bfloat16Vector, int(vectors.Dim)),
 		}
 		return placeholderValue, nil
 	case schemapb.DataType_SparseFloatVector:
@@ -188,10 +193,11 @@ func floatVectorToByteVector(vector []float32) []byte {
 	return data
 }
 
-func flattenedByteVectorsToByteVectors(flattenedVectors []byte, dimension int) [][]byte {
+func flattenedBinaryVectorsToByteVectors(flattenedVectors []byte, dimension int) [][]byte {
 	result := make([][]byte, 0)
-	for i := 0; i < len(flattenedVectors); i += dimension {
-		result = append(result, flattenedVectors[i:i+dimension])
+	vectorBytes := dimension / 8
+	for i := 0; i < len(flattenedVectors); i += vectorBytes {
+		result = append(result, flattenedVectors[i:i+vectorBytes])
 	}
 	return result
 }

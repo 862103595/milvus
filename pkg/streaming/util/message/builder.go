@@ -6,10 +6,12 @@ import (
 	"reflect"
 
 	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -94,6 +96,12 @@ func MilvusMessageToImmutableMessage(im *commonpb.ImmutableMessage) ImmutableMes
 	return msg
 }
 
+func MilvusMessagesToImmutableMessages(ims []*commonpb.ImmutableMessage) []ImmutableMessage {
+	return lo.Map(ims, func(im *commonpb.ImmutableMessage, _ int) ImmutableMessage {
+		return MilvusMessageToImmutableMessage(im)
+	})
+}
+
 func ImmutableMessageToMilvusMessage(walName string, im ImmutableMessage) *commonpb.ImmutableMessage {
 	msg := im.IntoImmutableMessageProto()
 	return &commonpb.ImmutableMessage{
@@ -155,8 +163,25 @@ func (b *mutableMesasgeBuilder[H, B]) WithVChannel(vchannel string) *mutableMesa
 	return b
 }
 
+// OptBuildBroadcast is the option for building broadcast message.
+type OptBuildBroadcast func(*messagespb.BroadcastHeader)
+
+// OptBuildBroadcastAckSyncUp sets the ack sync up of the broadcast message.
+// Whether the broadcast operation is need to be synced up between the streaming node and the coordinator.
+// If set, the broadcast operation will be acked after the checkpoint of current vchannel reach current message.
+// the fast ack operation can not be applied to speed up the broadcast operation, because the ack operation need to be synced up with streaming node.
+// TODO: current implementation doesn't promise the ack sync up semantic,
+// it only promise FastAck operation will not be applied, wait for 3.0 to implement the ack sync up semantic.
+// only for truncate api now.
+func OptBuildBroadcastAckSyncUp() OptBuildBroadcast {
+	return func(bh *messagespb.BroadcastHeader) {
+		bh.AckSyncUp = true
+	}
+}
+
 // WithBroadcast creates a new builder with broadcast property.
-func (b *mutableMesasgeBuilder[H, B]) WithBroadcast(vchannels []string, resourceKeys ...ResourceKey) *mutableMesasgeBuilder[H, B] {
+// !!! This method should only be called from coordinator side.
+func (b *mutableMesasgeBuilder[H, B]) WithBroadcast(vchannels []string, opts ...OptBuildBroadcast) *mutableMesasgeBuilder[H, B] {
 	if len(vchannels) < 1 {
 		panic("broadcast message must have at least one vchannel")
 	}
@@ -167,15 +192,53 @@ func (b *mutableMesasgeBuilder[H, B]) WithBroadcast(vchannels []string, resource
 		panic("a broadcast message cannot set up vchannel property")
 	}
 	deduplicated := typeutil.NewSet(vchannels...)
+	bhpb := &messagespb.BroadcastHeader{
+		Vchannels: deduplicated.Collect(),
+	}
+	for _, opt := range opts {
+		opt(bhpb)
+	}
 
-	bh, err := EncodeProto(&messagespb.BroadcastHeader{
-		Vchannels:    deduplicated.Collect(),
-		ResourceKeys: newProtoFromResourceKey(resourceKeys...),
-	})
+	bh, err := EncodeProto(bhpb)
 	if err != nil {
 		panic("failed to encode vchannels")
 	}
 	b.properties.Set(messageBroadcastHeader, bh)
+	return b
+}
+
+// WithClusterLevelBroadcast creates a new builder with cluster-level broadcast property.
+// It builds the broadcast channel list from cc by substituting the control channel
+// for the pchannel it resides on, marks the message as pchannel-level.
+// Panics if cc.Channels is empty or cc.ControlChannel does not belong to any pchannel.
+// !!! This method should only be called from coordinator side.
+func (b *mutableMesasgeBuilder[H, B]) WithClusterLevelBroadcast(cc ClusterChannels, opts ...OptBuildBroadcast) *mutableMesasgeBuilder[H, B] {
+	if len(cc.Channels) == 0 {
+		panic("ClusterChannels.Channels must not be empty")
+	}
+	if cc.ControlChannel == "" {
+		panic("ClusterChannels.ControlChannel must not be empty")
+	}
+
+	found := false
+	broadcastChannels := make([]string, 0, len(cc.Channels))
+	for _, ch := range cc.Channels {
+		if funcutil.IsOnPhysicalChannel(cc.ControlChannel, ch) {
+			broadcastChannels = append(broadcastChannels, cc.ControlChannel)
+			found = true
+		} else {
+			if !funcutil.IsPhysicalChannel(ch) {
+				panic(fmt.Sprintf("ClusterChannels.Channels contains non-pchannel %q", ch))
+			}
+			broadcastChannels = append(broadcastChannels, ch)
+		}
+	}
+	if !found {
+		panic(fmt.Sprintf("ClusterChannels.ControlChannel %q does not reside on any pchannel in %v", cc.ControlChannel, cc.Channels))
+	}
+
+	b.WithBroadcast(broadcastChannels, opts...)
+	b.properties.Set(messagePChannelLevel, "")
 	return b
 }
 

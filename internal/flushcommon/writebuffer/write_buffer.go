@@ -3,7 +3,9 @@ package writebuffer
 import (
 	"context"
 	"fmt"
+	"path"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -18,13 +20,17 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache/pkoracle"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -47,6 +53,8 @@ type WriteBuffer interface {
 	GetFlushTimestamp() uint64
 	// SealSegments is the method to perform `Sync` operation with provided options.
 	SealSegments(ctx context.Context, segmentIDs []int64) error
+	// SealAllSegments seal all segments in the write buffer.
+	SealAllSegments(ctx context.Context)
 	// DropPartitions mark segments as Dropped of the partition
 	DropPartitions(partitionIDs []int64)
 	// GetCheckpoint returns current channel checkpoint.
@@ -186,6 +194,15 @@ func (wb *writeBufferBase) SealSegments(ctx context.Context, segmentIDs []int64)
 	return wb.sealSegments(ctx, segmentIDs)
 }
 
+func (wb *writeBufferBase) SealAllSegments(ctx context.Context) {
+	wb.mut.RLock()
+	defer wb.mut.RUnlock()
+
+	// mark all segments sealed if they were growing
+	wb.metaCache.UpdateSegments(metacache.UpdateState(commonpb.SegmentState_Sealed),
+		metacache.WithSegmentState(commonpb.SegmentState_Growing))
+}
+
 func (wb *writeBufferBase) DropPartitions(partitionIDs []int64) {
 	wb.mut.RLock()
 	defer wb.mut.RUnlock()
@@ -283,6 +300,16 @@ func (wb *writeBufferBase) sealSegments(_ context.Context, segmentIDs []int64) e
 	// mark segment flushing if segment was growing
 	wb.metaCache.UpdateSegments(metacache.UpdateState(commonpb.SegmentState_Sealed),
 		metacache.WithSegmentIDs(segmentIDs...),
+		metacache.WithSegmentState(commonpb.SegmentState_Growing))
+	return nil
+}
+
+func (wb *writeBufferBase) sealAllSegments(ctx context.Context) error {
+	allSegmentIds := wb.metaCache.GetSegmentIDsBy()
+	log.Ctx(ctx).Info("seal all segments", zap.Int64s("segmentIDs", allSegmentIds))
+	// mark segment flushing if segment was growing
+	wb.metaCache.UpdateSegments(metacache.UpdateState(commonpb.SegmentState_Sealed),
+		metacache.WithSegmentIDs(allSegmentIds...),
 		metacache.WithSegmentState(commonpb.SegmentState_Growing))
 	return nil
 }
@@ -499,9 +526,15 @@ func (wb *writeBufferBase) CreateNewGrowingSegment(partitionID int64, segmentID 
 	_, ok := wb.metaCache.GetSegmentByID(segmentID)
 	// new segment
 	if !ok {
-		storageVersion := storage.StorageV1
-		if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
-			storageVersion = storage.StorageV2
+		storageVersion := storage.StorageV2
+		manifestPath := ""
+		if paramtable.Get().CommonCfg.UseLoonFFI.GetAsBool() {
+			storageVersion = storage.StorageV3
+			// set manifest path when creating segment
+			k := metautil.JoinIDPath(wb.collectionID, partitionID, segmentID)
+			basePath := path.Join(paramtable.Get().ServiceParam.MinioCfg.RootPath.GetValue(), common.SegmentInsertLogPath, k)
+			// ManifestEarliest for first write
+			manifestPath = packed.MarshalManifestPath(basePath, packed.ManifestEarliest)
 		}
 		segmentInfo := &datapb.SegmentInfo{
 			ID:             segmentID,
@@ -511,6 +544,7 @@ func (wb *writeBufferBase) CreateNewGrowingSegment(partitionID int64, segmentID 
 			StartPosition:  startPos,
 			State:          commonpb.SegmentState_Growing,
 			StorageVersion: storageVersion,
+			ManifestPath:   manifestPath,
 		}
 		wb.metaCache.AddSegment(segmentInfo, func(_ *datapb.SegmentInfo) pkoracle.PkStat {
 			return pkoracle.NewBloomFilterSetWithBatchSize(wb.getEstBatchSize())
@@ -523,7 +557,7 @@ func (wb *writeBufferBase) CreateNewGrowingSegment(partitionID int64, segmentID 
 func (wb *writeBufferBase) bufferDelete(segmentID int64, pks []storage.PrimaryKey, tss []typeutil.Timestamp, startPos, endPos *msgpb.MsgPosition) {
 	segBuf := wb.getOrCreateBuffer(segmentID, tss[0])
 	bufSize := segBuf.deltaBuffer.Buffer(pks, tss, startPos, endPos)
-	metrics.DataNodeFlowGraphBufferDataSize.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), fmt.Sprint(wb.collectionID)).Add(float64(bufSize))
+	metrics.DataNodeFlowGraphBufferDataSize.WithLabelValues(paramtable.GetStringNodeID(), fmt.Sprint(wb.collectionID)).Add(float64(bufSize))
 }
 
 func (wb *writeBufferBase) getSyncTask(ctx context.Context, segmentID int64) (syncmgr.Task, error) {
@@ -590,14 +624,16 @@ func (wb *writeBufferBase) getSyncTask(ctx context.Context, segmentID int64) (sy
 		pack.WithDrop()
 	}
 
-	metrics.DataNodeFlowGraphBufferDataSize.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), fmt.Sprint(wb.collectionID)).Sub(totalMemSize)
+	metrics.DataNodeFlowGraphBufferDataSize.WithLabelValues(paramtable.GetStringNodeID(), fmt.Sprint(wb.collectionID)).Sub(totalMemSize)
 
 	task := syncmgr.NewSyncTask().
 		WithAllocator(wb.allocator).
 		WithMetaWriter(wb.metaWriter).
 		WithMetaCache(wb.metaCache).
 		WithSchema(schema).
-		WithSyncPack(pack)
+		WithSyncPack(pack).
+		WithStorageConfig(packed.CreateStorageConfig()).
+		WithWriteRetryOptions(retry.AttemptAlways(), retry.MaxSleepTime(10*time.Second))
 	return task, nil
 }
 

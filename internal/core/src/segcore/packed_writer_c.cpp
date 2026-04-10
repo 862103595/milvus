@@ -12,28 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <arrow/c/bridge.h>
+#include <arrow/filesystem/filesystem.h>
+#include <arrow/record_batch.h>
+#include <exception>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "arrow/array/array_base.h"
+#include "arrow/c/abi.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
+#include "arrow/type.h"
+#include "common/EasyAssert.h"
 #include "common/common_type_c.h"
+#include "common/type_c.h"
+#include "milvus-storage/common/config.h"
+#include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/packed/writer.h"
+#include "monitor/scope_metric.h"
 #include "parquet/encryption/encryption.h"
 #include "parquet/properties.h"
 #include "parquet/types.h"
 #include "segcore/column_groups_c.h"
 #include "segcore/packed_writer_c.h"
-#include "milvus-storage/packed/writer.h"
-#include "milvus-storage/common/config.h"
-#include "milvus-storage/filesystem/fs.h"
-#include "storage/PluginLoader.h"
 #include "storage/KeyRetriever.h"
+#include "storage/PluginLoader.h"
 #include "storage/StorageV2FSCache.h"
-
-#include <arrow/c/bridge.h>
-#include <arrow/filesystem/filesystem.h>
-#include <arrow/array.h>
-#include <arrow/record_batch.h>
-#include <arrow/memory_pool.h>
-#include <arrow/device.h>
-#include "common/EasyAssert.h"
-#include "common/type_c.h"
-#include "monitor/scope_metric.h"
+#include "storage/plugin/PluginInterface.h"
 
 CStatus
 NewPackedWriterWithStorageConfig(struct ArrowSchema* schema,
@@ -41,7 +49,7 @@ NewPackedWriterWithStorageConfig(struct ArrowSchema* schema,
                                  char** paths,
                                  int64_t num_paths,
                                  int64_t part_upload_size,
-                                 CColumnGroups column_groups,
+                                 CColumnSplits column_splits,
                                  CStorageConfig c_storage_config,
                                  CPackedWriter* c_packed_writer,
                                  CPluginContext* c_plugin_context) {
@@ -72,6 +80,11 @@ NewPackedWriterWithStorageConfig(struct ArrowSchema* schema,
             false,
             std::string(c_storage_config.gcp_credential_json),
             c_storage_config.use_custom_part_upload,
+            c_storage_config.max_connections,
+            c_storage_config.tls_min_version != nullptr
+                ? std::string(c_storage_config.tls_min_version)
+                : "",
+            c_storage_config.use_crc32c_checksum,
         });
         if (!trueFs) {
             return milvus::FailureCStatus(
@@ -82,7 +95,7 @@ NewPackedWriterWithStorageConfig(struct ArrowSchema* schema,
         auto trueSchema = arrow::ImportSchema(schema).ValueOrDie();
 
         auto columnGroups =
-            *static_cast<std::vector<std::vector<int>>*>(column_groups);
+            *static_cast<std::vector<std::vector<int>>*>(column_splits);
 
         parquet::WriterProperties::Builder builder;
         auto plugin_ptr =
@@ -107,16 +120,21 @@ NewPackedWriterWithStorageConfig(struct ArrowSchema* schema,
         }
 
         auto writer_properties = builder.build();
-        auto writer = std::make_unique<milvus_storage::PackedRecordBatchWriter>(
-            trueFs,
-            truePaths,
-            trueSchema,
-            storage_config,
-            columnGroups,
-            buffer_size,
-            writer_properties);
-        AssertInfo(writer, "[StorageV2] writer pointer is null");
-        *c_packed_writer = writer.release();
+        auto result =
+            milvus_storage::PackedRecordBatchWriter::Make(trueFs,
+                                                          truePaths,
+                                                          trueSchema,
+                                                          storage_config,
+                                                          columnGroups,
+                                                          buffer_size,
+                                                          writer_properties);
+        AssertInfo(result.ok(),
+                   "[StorageV2] Failed to create packed writer: " +
+                       result.status().ToString());
+        auto writer = result.ValueOrDie();
+        *c_packed_writer =
+            new std::shared_ptr<milvus_storage::PackedRecordBatchWriter>(
+                std::move(writer));
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
         return milvus::FailureCStatus(&e);
@@ -129,7 +147,7 @@ NewPackedWriter(struct ArrowSchema* schema,
                 char** paths,
                 int64_t num_paths,
                 int64_t part_upload_size,
-                CColumnGroups column_groups,
+                CColumnSplits column_splits,
                 CPackedWriter* c_packed_writer,
                 CPluginContext* c_plugin_context) {
     SCOPE_CGO_CALL_METRIC();
@@ -151,7 +169,7 @@ NewPackedWriter(struct ArrowSchema* schema,
         auto trueSchema = arrow::ImportSchema(schema).ValueOrDie();
 
         auto columnGroups =
-            *static_cast<std::vector<std::vector<int>>*>(column_groups);
+            *static_cast<std::vector<std::vector<int>>*>(column_splits);
 
         parquet::WriterProperties::Builder builder;
         auto plugin_ptr =
@@ -176,16 +194,21 @@ NewPackedWriter(struct ArrowSchema* schema,
         }
 
         auto writer_properties = builder.build();
-        auto writer = std::make_unique<milvus_storage::PackedRecordBatchWriter>(
-            trueFs,
-            truePaths,
-            trueSchema,
-            conf,
-            columnGroups,
-            buffer_size,
-            writer_properties);
-        AssertInfo(writer, "[StorageV2] writer pointer is null");
-        *c_packed_writer = writer.release();
+        auto result =
+            milvus_storage::PackedRecordBatchWriter::Make(trueFs,
+                                                          truePaths,
+                                                          trueSchema,
+                                                          conf,
+                                                          columnGroups,
+                                                          buffer_size,
+                                                          writer_properties);
+        AssertInfo(result.ok(),
+                   "[StorageV2] Failed to create packed writer: " +
+                       result.status().ToString());
+        auto writer = result.ValueOrDie();
+        *c_packed_writer =
+            new std::shared_ptr<milvus_storage::PackedRecordBatchWriter>(
+                std::move(writer));
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
         return milvus::FailureCStatus(&e);
@@ -200,9 +223,9 @@ WriteRecordBatch(CPackedWriter c_packed_writer,
     SCOPE_CGO_CALL_METRIC();
 
     try {
-        auto packed_writer =
-            static_cast<milvus_storage::PackedRecordBatchWriter*>(
-                c_packed_writer);
+        auto packed_writer = *static_cast<
+            std::shared_ptr<milvus_storage::PackedRecordBatchWriter>*>(
+            c_packed_writer);
 
         auto import_schema = arrow::ImportSchema(schema);
         if (!import_schema.ok()) {
@@ -247,10 +270,10 @@ CloseWriter(CPackedWriter c_packed_writer) {
     SCOPE_CGO_CALL_METRIC();
 
     try {
-        auto packed_writer =
-            static_cast<milvus_storage::PackedRecordBatchWriter*>(
-                c_packed_writer);
-        auto status = packed_writer->Close();
+        auto packed_writer = static_cast<
+            std::shared_ptr<milvus_storage::PackedRecordBatchWriter>*>(
+            c_packed_writer);
+        auto status = (*packed_writer)->Close();
         delete packed_writer;
         if (!status.ok()) {
             return milvus::FailureCStatus(milvus::ErrorCode::FileWriteFailed,
@@ -315,6 +338,11 @@ GetFileSizeWithStorageConfig(const char* path,
             false,
             std::string(c_storage_config.gcp_credential_json),
             c_storage_config.use_custom_part_upload,
+            c_storage_config.max_connections,
+            c_storage_config.tls_min_version != nullptr
+                ? std::string(c_storage_config.tls_min_version)
+                : "",
+            c_storage_config.use_crc32c_checksum,
         });
 
         if (!trueFs) {

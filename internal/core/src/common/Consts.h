@@ -33,6 +33,10 @@ const char MAX_LENGTH[] = "max_length";
 const milvus::FieldId RowFieldID = milvus::FieldId(0);
 const milvus::FieldId TimestampFieldID = milvus::FieldId(1);
 
+// Virtual field ID for two-project mode: carries segment offsets through
+// the pipeline so that deferred fields can be fetched after TopK.
+const milvus::FieldId SegmentOffsetFieldID = milvus::FieldId(-100);
+
 // fill followed extra info to binlog file
 const char ORIGIN_SIZE_KEY[] = "original_size";
 const char INDEX_BUILD_ID_KEY[] = "indexBuildID";
@@ -56,11 +60,13 @@ const char HINTS[] = "hints";
 const char JSON_KEY_INDEX_LOG_ROOT_PATH[] = "json_key_index_log";
 const char NGRAM_LOG_ROOT_PATH[] = "ngram_log";
 constexpr const char* JSON_STATS_ROOT_PATH = "json_stats";
-constexpr const char* JSON_STATS_DATA_FORMAT_VERSION = "2";
+// Version 3: metadata moved to separate meta.json file (instead of parquet metadata)
+constexpr const char* JSON_STATS_DATA_FORMAT_VERSION = "3";
 constexpr const char* JSON_STATS_SHARED_INDEX_PATH = "shared_key_index";
 constexpr const char* JSON_STATS_SHREDDING_DATA_PATH = "shredding_data";
+constexpr const char* JSON_STATS_META_FILE_NAME = "meta.json";
 constexpr const char* JSON_KEY_STATS_SHARED_FIELD_NAME = "__shared";
-// store key layout type in parquet file metadata
+// store key layout type in parquet file metadata (deprecated, now stored in separate file)
 inline constexpr const char* JSON_STATS_META_KEY_LAYOUT_TYPE_MAP =
     "key_layout_type_map";
 // start json stats field id for mock column
@@ -80,6 +86,10 @@ const int64_t DEFAULT_INDEX_FILE_SLICE_SIZE = 16 << 20;  // bytes
 const int64_t DEFAULT_EXEC_EVAL_EXPR_BATCH_SIZE = 8192;
 
 const int64_t DEFAULT_DELETE_DUMP_BATCH_SIZE = 10000;
+
+const bool DEFAULT_ENABLE_LATEST_DELETE_SNAPSHOT_OPTIMIZATION = true;
+
+constexpr const char* COLLECTION_TTL_FIELD_KEY = "ttl_field";
 
 constexpr const char* RADIUS = knowhere::meta::RADIUS;
 constexpr const char* RANGE_FILTER = knowhere::meta::RANGE_FILTER;
@@ -117,10 +127,14 @@ const std::string DIM_KEY = "dim";
 const std::string DATA_TYPE_KEY = "data_type";
 const std::string ELEMENT_TYPE_KEY = "element_type";
 const std::string INDEX_NUM_ROWS_KEY = "index_num_rows";
+const std::string SEGMENT_MANIFEST_KEY = "segment_manifest";
+const std::string LOON_FFI_PROPERTIES_KEY = "loon_ffi_properties";
+const std::string STATS_BASE_PATH_KEY = "stats_base_path";
 
 // storage version
 const int64_t STORAGE_V1 = 1;
 const int64_t STORAGE_V2 = 2;
+const int64_t STORAGE_V3 = 3;
 
 const std::string UNKNOW_CAST_FUNCTION_NAME = "unknown";
 
@@ -131,3 +145,20 @@ const std::string ELEMENT_TYPE_KEY_FOR_ARROW = "elementType";
 // EPSILON value for comparing float numbers
 const float EPSILON = 0.0000000119;
 const std::string NAMESPACE_FIELD_NAME = "$namespace_id";
+const std::string MMAP_ENABLED_KEY = "mmap.enabled";
+
+const int64_t LOGICAL_BITS = 18;
+// Warmup policy keys
+// Field-level key (in field type_params)
+const std::string WARMUP_KEY = "warmup";
+// Collection-level keys (in collection properties)
+const std::string WARMUP_VECTOR_INDEX_KEY = "warmup.vectorIndex";
+const std::string WARMUP_SCALAR_INDEX_KEY = "warmup.scalarIndex";
+const std::string WARMUP_SCALAR_FIELD_KEY = "warmup.scalarField";
+const std::string WARMUP_VECTOR_FIELD_KEY = "warmup.vectorField";
+
+// Scalar index version constants
+// Version 3 introduces hybrid index configuration support
+constexpr int32_t kHybridIndexConfigVersion = 3;
+// The last version before hybrid index config support was added
+constexpr int32_t kLastVersionWithoutHybridIndexConfig = 2;

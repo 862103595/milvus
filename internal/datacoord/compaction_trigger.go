@@ -29,6 +29,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
+	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/util/lifetime"
@@ -128,8 +130,6 @@ type compactionTrigger struct {
 
 	indexEngineVersionManager IndexEngineVersionManager
 
-	estimateNonDiskSegmentPolicy calUpperLimitPolicy
-	estimateDiskSegmentPolicy    calUpperLimitPolicy
 	// A sloopy hack, so we can test with different segment row count without worrying that
 	// they are re-calculated in every compaction.
 	testingOnly bool
@@ -143,16 +143,14 @@ func newCompactionTrigger(
 	indexVersionManager IndexEngineVersionManager,
 ) *compactionTrigger {
 	return &compactionTrigger{
-		meta:                         meta,
-		allocator:                    allocator,
-		signals:                      make(chan *compactionSignal, 100),
-		manualSignals:                make(chan *compactionSignal, 100),
-		inspector:                    inspector,
-		indexEngineVersionManager:    indexVersionManager,
-		estimateDiskSegmentPolicy:    calBySchemaPolicyWithDiskIndex,
-		estimateNonDiskSegmentPolicy: calBySchemaPolicy,
-		handler:                      handler,
-		closeCh:                      lifetime.NewSafeChan(),
+		meta:                      meta,
+		allocator:                 allocator,
+		signals:                   make(chan *compactionSignal, 100),
+		manualSignals:             make(chan *compactionSignal, 100),
+		inspector:                 inspector,
+		indexEngineVersionManager: indexVersionManager,
+		handler:                   handler,
+		closeCh:                   lifetime.NewSafeChan(),
 	}
 }
 
@@ -233,6 +231,13 @@ func (t *compactionTrigger) getCollection(collectionID UniqueID) (*collectionInf
 }
 
 func isCollectionAutoCompactionEnabled(coll *collectionInfo) bool {
+	if coll == nil {
+		return false
+	}
+	if coll.IsExternal() {
+		log.Debug("collection auto compaction disabled for external collection", zap.Int64("collectionID", coll.ID))
+		return false
+	}
 	enabled, err := getCollectionAutoCompactionEnabled(coll.Properties)
 	if err != nil {
 		log.Warn("collection properties auto compaction not valid, returning false", zap.Error(err))
@@ -242,7 +247,7 @@ func isCollectionAutoCompactionEnabled(coll *collectionInfo) bool {
 }
 
 func getCompactTime(ts Timestamp, coll *collectionInfo) (*compactTime, error) {
-	collectionTTL, err := getCollectionTTL(coll.Properties)
+	collectionTTL, err := common.GetCollectionTTLFromMap(coll.Properties)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +368,10 @@ func (t *compactionTrigger) handleSignal(signal *compactionSignal) error {
 		coll, err := t.getCollection(group.collectionID)
 		if err != nil {
 			log.Warn("get collection info failed, skip handling compaction", zap.Error(err))
-			return err
+			if signal.collectionID != 0 {
+				return err
+			}
+			continue
 		}
 
 		if !signal.isForce && !isCollectionAutoCompactionEnabled(coll) {
@@ -408,7 +416,7 @@ func (t *compactionTrigger) handleSignal(signal *compactionSignal) error {
 				ResultSegments: []int64{},
 				TotalRows:      totalRows,
 				Schema:         coll.Schema,
-				MaxSize:        getExpandedSize(expectedSize),
+				MaxSize:        expectedSize,
 				PreAllocatedSegmentIDs: &datapb.IDRange{
 					Begin: startID + 1,
 					End:   endID,
@@ -426,6 +434,7 @@ func (t *compactionTrigger) handleSignal(signal *compactionSignal) error {
 			log.Info("time cost of generating compaction",
 				zap.Int64("planID", task.GetPlanID()),
 				zap.Int64("time cost", time.Since(start).Milliseconds()),
+				zap.Int64("target size", task.GetMaxSize()),
 				zap.Int64s("inputSegments", inputSegmentIDs))
 		}
 	}
@@ -550,7 +559,7 @@ func (t *compactionTrigger) getCandidates(signal *compactionSignal) ([]chanPartS
 				segment.GetLevel() != datapb.SegmentLevel_L0 && // ignore level zero segments
 				segment.GetLevel() != datapb.SegmentLevel_L2 && // ignore l2 segment
 				!segment.GetIsInvisible() &&
-				segment.GetIsSorted()
+				(segment.GetIsSorted() || segment.GetIsSortedByNamespace())
 		}),
 	}
 
@@ -693,6 +702,39 @@ func (t *compactionTrigger) ShouldCompactExpiry(fromTs uint64, compactTime *comp
 	return false
 }
 
+func getExpirQuantilesIndexByRatio(ratio float64, percentilesLen int) int {
+	// expirQuantiles is [20%, 40%, 60%, 80%, 100%] (len = 5).
+	// We map ratio to the nearest lower 20% bucket:
+	// 0~0.39 -> 20%, 0.4~0.59 -> 40%, 0.6~0.79 -> 60%, 0.8~0.99 -> 80%, >=1.0 -> 100%
+	if percentilesLen <= 0 {
+		return 0
+	}
+	step := 0.2
+	idx := int((ratio+0.01)/step) - 1 // add 0.01 to avoid rounding error
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= percentilesLen {
+		idx = percentilesLen - 1
+	}
+	return idx
+}
+
+func (t *compactionTrigger) ShouldCompactExpiryWithTTLField(compactTime *compactTime, segment *SegmentInfo) bool {
+	percentiles := segment.GetExpirQuantiles()
+	if len(percentiles) == 0 {
+		return false
+	}
+
+	ratio := Params.DataCoordCfg.SingleCompactionRatioThreshold.GetAsFloat()
+
+	index := getExpirQuantilesIndexByRatio(ratio, len(percentiles))
+	expirationTime := percentiles[index]
+	// If current time (startTime) is greater than the expiration time at this percentile, trigger compaction
+	startTs := tsoutil.PhysicalTime(compactTime.startTime)
+	return startTs.UnixMicro() >= expirationTime && expirationTime > 0
+}
+
 func (t *compactionTrigger) ShouldDoSingleCompaction(segment *SegmentInfo, compactTime *compactTime) bool {
 	// no longer restricted binlog numbers because this is now related to field numbers
 	log := log.Ctx(context.TODO())
@@ -737,6 +779,14 @@ func (t *compactionTrigger) ShouldDoSingleCompaction(segment *SegmentInfo, compa
 		return true
 	}
 
+	if t.ShouldCompactExpiryWithTTLField(compactTime, segment) {
+		log.Info("ttl field is expired, trigger compaction", zap.Int64("segmentID", segment.ID),
+			zap.Int64("collectionID", segment.CollectionID),
+			zap.Int64("partitionID", segment.PartitionID),
+			zap.String("channel", segment.InsertChannel))
+		return true
+	}
+
 	return false
 }
 
@@ -745,32 +795,93 @@ func (t *compactionTrigger) ShouldRebuildSegmentIndex(segment *SegmentInfo) bool
 		// index version of segment lower than current version and IndexFileKeys should have value, trigger compaction
 		indexIDToSegIdxes := t.meta.indexMeta.GetSegmentIndexes(segment.CollectionID, segment.ID)
 		for _, index := range indexIDToSegIdxes {
-			if index.CurrentIndexVersion < t.indexEngineVersionManager.GetCurrentIndexEngineVersion() &&
-				len(index.IndexFileKeys) > 0 {
+			if len(index.IndexFileKeys) == 0 {
+				continue
+			}
+
+			indexParams := t.meta.indexMeta.GetIndexParams(segment.CollectionID, index.IndexID)
+			indexType := GetIndexType(indexParams)
+			isVectorIndex := vecindexmgr.GetVecIndexMgrInstance().IsVecIndex(indexType)
+
+			var currentEngineVersion int32
+			var segmentIndexVersion int32
+			if isVectorIndex {
+				currentEngineVersion = t.indexEngineVersionManager.GetCurrentIndexEngineVersion()
+				segmentIndexVersion = index.CurrentIndexVersion
+			} else {
+				currentEngineVersion = t.indexEngineVersionManager.GetCurrentScalarIndexEngineVersion()
+				segmentIndexVersion = index.CurrentScalarIndexVersion
+			}
+
+			if segmentIndexVersion < currentEngineVersion {
 				log.Info("index version is too old, trigger compaction",
 					zap.Int64("segmentID", segment.ID),
 					zap.Int64("indexID", index.IndexID),
+					zap.String("indexType", indexType),
+					zap.Bool("isVectorIndex", isVectorIndex),
 					zap.Strings("indexFileKeys", index.IndexFileKeys),
-					zap.Int32("currentIndexVersion", index.CurrentIndexVersion),
-					zap.Int32("currentEngineVersion", t.indexEngineVersionManager.GetCurrentIndexEngineVersion()))
+					zap.Int32("segmentIndexVersion", segmentIndexVersion),
+					zap.Int32("currentEngineVersion", currentEngineVersion))
 				return true
 			}
 		}
 	}
 
-	// enable force rebuild index with target index version
+	// enable force rebuild index with target index version (only for vector index)
 	if Params.DataCoordCfg.ForceRebuildSegmentIndex.GetAsBool() && Params.DataCoordCfg.TargetVecIndexVersion.GetAsInt64() != -1 {
-		// index version of segment lower than current version and IndexFileKeys should have value, trigger compaction
+		resolvedVecTarget := t.indexEngineVersionManager.ResolveVecIndexVersion()
 		indexIDToSegIdxes := t.meta.indexMeta.GetSegmentIndexes(segment.CollectionID, segment.ID)
 		for _, index := range indexIDToSegIdxes {
-			if index.CurrentIndexVersion != Params.DataCoordCfg.TargetVecIndexVersion.GetAsInt32() &&
-				len(index.IndexFileKeys) > 0 {
+			if len(index.IndexFileKeys) == 0 {
+				continue
+			}
+
+			indexParams := t.meta.indexMeta.GetIndexParams(segment.CollectionID, index.IndexID)
+			indexType := GetIndexType(indexParams)
+			isVectorIndex := vecindexmgr.GetVecIndexMgrInstance().IsVecIndex(indexType)
+
+			// ForceRebuildSegmentIndex with TargetVecIndexVersion only applies to vector indexes
+			if !isVectorIndex {
+				continue
+			}
+
+			if index.CurrentIndexVersion != resolvedVecTarget {
 				log.Info("index version is not equal to target vec index version, trigger compaction",
 					zap.Int64("segmentID", segment.ID),
 					zap.Int64("indexID", index.IndexID),
+					zap.String("indexType", indexType),
 					zap.Strings("indexFileKeys", index.IndexFileKeys),
 					zap.Int32("currentIndexVersion", index.CurrentIndexVersion),
-					zap.Int32("targetIndexVersion", Params.DataCoordCfg.TargetVecIndexVersion.GetAsInt32()))
+					zap.Int32("resolvedTargetVersion", resolvedVecTarget))
+				return true
+			}
+		}
+	}
+
+	// enable force rebuild scalar index with target scalar index version
+	if Params.DataCoordCfg.ForceRebuildScalarSegmentIndex.GetAsBool() && Params.DataCoordCfg.TargetScalarIndexVersion.GetAsInt64() != -1 {
+		resolvedScalarTarget := t.indexEngineVersionManager.ResolveScalarIndexVersion()
+		indexIDToSegIdxes := t.meta.indexMeta.GetSegmentIndexes(segment.CollectionID, segment.ID)
+		for _, index := range indexIDToSegIdxes {
+			if len(index.IndexFileKeys) == 0 {
+				continue
+			}
+
+			indexParams := t.meta.indexMeta.GetIndexParams(segment.CollectionID, index.IndexID)
+			indexType := GetIndexType(indexParams)
+			isVectorIndex := vecindexmgr.GetVecIndexMgrInstance().IsVecIndex(indexType)
+
+			if isVectorIndex {
+				continue
+			}
+
+			if index.CurrentScalarIndexVersion != resolvedScalarTarget {
+				log.Info("scalar index version != target, trigger compaction",
+					zap.Int64("segmentID", segment.ID),
+					zap.Int64("indexID", index.IndexID),
+					zap.String("indexType", indexType),
+					zap.Int32("currentScalarIndexVersion", index.CurrentScalarIndexVersion),
+					zap.Int32("resolvedTargetVersion", resolvedScalarTarget))
 				return true
 			}
 		}
@@ -810,14 +921,10 @@ func (t *compactionTrigger) squeezeSmallSegmentsToBuckets(small []*SegmentInfo, 
 	return small
 }
 
-func getExpandedSize(size int64) int64 {
-	return int64(float64(size) * Params.DataCoordCfg.SegmentExpansionRate.GetAsFloat())
-}
-
-func canTriggerSortCompaction(segment *SegmentInfo, isPartitionIsolationEnabled bool) bool {
+func canTriggerSortCompaction(segment *SegmentInfo) bool {
 	return segment.GetState() == commonpb.SegmentState_Flushed &&
 		segment.GetLevel() != datapb.SegmentLevel_L0 &&
-		(!segment.GetIsSorted() || (isPartitionIsolationEnabled && !segment.GetIsPartitionKeySorted())) &&
+		(!segment.GetIsSorted() && !segment.GetIsSortedByNamespace()) &&
 		!segment.GetIsImporting() &&
 		!segment.isCompacting
 }

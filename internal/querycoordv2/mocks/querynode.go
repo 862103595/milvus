@@ -21,7 +21,6 @@ import (
 	"net"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/mock"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -132,7 +131,7 @@ func (node *MockQueryNode) Start() error {
 	}).Maybe()
 
 	// Register
-	node.session.Init(typeutil.QueryNodeRole, node.addr, false, true)
+	node.session.Init(typeutil.QueryNodeRole, node.addr, false)
 	node.session.ServerID = node.ID
 	node.session.Register()
 	log.Ctx(context.TODO()).Debug("mock QueryNode started",
@@ -149,7 +148,7 @@ func (node *MockQueryNode) Stopping() {
 func (node *MockQueryNode) Stop() {
 	node.cancel()
 	node.server.GracefulStop()
-	node.session.Revoke(time.Second)
+	node.session.Stop()
 }
 
 func (node *MockQueryNode) getAllChannels() []*querypb.ChannelVersionInfo {

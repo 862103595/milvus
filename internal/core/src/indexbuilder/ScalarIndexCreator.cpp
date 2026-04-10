@@ -10,18 +10,23 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "indexbuilder/ScalarIndexCreator.h"
+
+#include <cstdint>
+#include <exception>
+#include <map>
+#include <optional>
+#include <string>
+
 #include "common/Consts.h"
-#include "common/FieldDataInterface.h"
+#include "common/EasyAssert.h"
 #include "common/JsonCastType.h"
 #include "common/Types.h"
 #include "index/IndexFactory.h"
 #include "index/IndexInfo.h"
 #include "index/Meta.h"
 #include "index/Utils.h"
-#include "pb/index_cgo_msg.pb.h"
-
-#include <string>
-#include <utility>
+#include "knowhere/dataset.h"
+#include "nlohmann/json.hpp"
 
 namespace milvus::indexbuilder {
 
@@ -67,7 +72,19 @@ ScalarIndexCreator::ScalarIndexCreator(
             config, milvus::index::TANTIVY_INDEX_VERSION)
             .value_or(milvus::index::TANTIVY_INDEX_LATEST_VERSION);
 
+    auto is_text_match_str =
+        milvus::index::GetValueFromConfig<std::string>(config, "is_text_match")
+            .value_or("false");
+    index_info.is_text_match = (is_text_match_str == "true");
+
+    index_info.analyzer_extra_info =
+        milvus::index::GetValueFromConfig<std::string>(config,
+                                                       "analyzer_extra_info")
+            .value_or("");
+
     index_info.field_type = dtype_;
+    index_info.field_name =
+        file_manager_context.fieldDataMeta.field_schema.name();
     index_info.index_type = index_type();
     if (dtype == DataType::JSON) {
         index_info.json_cast_type = milvus::JsonCastType::FromString(
@@ -83,7 +100,11 @@ ScalarIndexCreator::ScalarIndexCreator(
 }
 
 void
-ScalarIndexCreator::Build(const milvus::DatasetPtr& dataset) {
+ScalarIndexCreator::Build(const milvus::DatasetPtr& dataset,
+                          const bool* valid_data,
+                          const int64_t valid_data_len) {
+    (void)valid_data;
+    (void)valid_data_len;
     auto size = dataset->GetRows();
     auto data = dataset->GetTensor();
     index_->BuildWithRawDataForUT(size, data);
@@ -111,6 +132,12 @@ ScalarIndexCreator::index_type() {
 
 index::IndexStatsPtr
 ScalarIndexCreator::Upload() {
-    return index_->Upload();
+    auto version = index::GetValueFromConfig<int32_t>(
+                       config_, index::SCALAR_INDEX_ENGINE_VERSION)
+                       .value_or(1);
+    if (version >= 3) {
+        return index_->UploadV3(config_);
+    }
+    return index_->Upload(config_);
 }
 }  // namespace milvus::indexbuilder

@@ -79,10 +79,10 @@ func TestParsePartitionKeys(t *testing.T) {
 		},
 		{
 			name:                 "binary_expr_and with partition key in range",
-			expr:                 "partition_key_field in [7, 8] && partition_key_field > 9",
-			expected:             2,
-			validPartitionKeys:   []int64{7, 8},
-			invalidPartitionKeys: []int64{9},
+			expr:                 "partition_key_field in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] && partition_key_field > 11",
+			expected:             0,
+			validPartitionKeys:   []int64{},
+			invalidPartitionKeys: []int64{},
 		},
 		{
 			name:                 "binary_expr_and with partition key in range2",
@@ -145,140 +145,6 @@ func TestParsePartitionKeys(t *testing.T) {
 				assert.NotContains(t, tc.invalidPartitionKeys, int64Val)
 			}
 		})
-	}
-}
-
-func TestParseIntRanges(t *testing.T) {
-	prefix := "TestParseRanges"
-	clusterKeyField := "cluster_key_field"
-	collectionName := prefix + funcutil.GenRandomStr()
-
-	fieldName2Type := make(map[string]schemapb.DataType)
-	fieldName2Type["int64_field"] = schemapb.DataType_Int64
-	fieldName2Type["varChar_field"] = schemapb.DataType_VarChar
-	fieldName2Type["fvec_field"] = schemapb.DataType_FloatVector
-	schema := testutil.ConstructCollectionSchemaByDataType(collectionName, fieldName2Type,
-		"int64_field", false, 8)
-	clusterKeyFieldSchema := &schemapb.FieldSchema{
-		Name:            clusterKeyField,
-		DataType:        schemapb.DataType_Int64,
-		IsClusteringKey: true,
-	}
-	schema.Fields = append(schema.Fields, clusterKeyFieldSchema)
-
-	fieldID := common.StartOfUserFieldID
-	for _, field := range schema.Fields {
-		field.FieldID = int64(fieldID)
-		fieldID++
-	}
-	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
-	require.NoError(t, err)
-	// test query plan
-	{
-		expr := "cluster_key_field > 50"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
-		assert.NoError(t, err)
-		planExpr, err := ParseExprFromPlan(queryPlan)
-		assert.NoError(t, err)
-		parsedRanges, matchALL := ParseRanges(planExpr, ClusteringKey)
-		assert.False(t, matchALL)
-		assert.Equal(t, 1, len(parsedRanges))
-		range0 := parsedRanges[0]
-		assert.Equal(t, range0.lower.Val.(*planpb.GenericValue_Int64Val).Int64Val, int64(50))
-		assert.Nil(t, range0.upper)
-		assert.Equal(t, range0.includeLower, false)
-		assert.Equal(t, range0.includeUpper, false)
-	}
-
-	// test binary query plan
-	{
-		expr := "cluster_key_field > 50 and cluster_key_field <= 100"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
-		assert.NoError(t, err)
-		planExpr, err := ParseExprFromPlan(queryPlan)
-		assert.NoError(t, err)
-		parsedRanges, matchALL := ParseRanges(planExpr, ClusteringKey)
-		assert.False(t, matchALL)
-		assert.Equal(t, 1, len(parsedRanges))
-		range0 := parsedRanges[0]
-		assert.Equal(t, range0.lower.Val.(*planpb.GenericValue_Int64Val).Int64Val, int64(50))
-		assert.Equal(t, false, range0.includeLower)
-		assert.Equal(t, true, range0.includeUpper)
-	}
-
-	// test binary query plan
-	{
-		expr := "cluster_key_field >= 50 and cluster_key_field < 100"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
-		assert.NoError(t, err)
-		planExpr, err := ParseExprFromPlan(queryPlan)
-		assert.NoError(t, err)
-		parsedRanges, matchALL := ParseRanges(planExpr, ClusteringKey)
-		assert.False(t, matchALL)
-		assert.Equal(t, 1, len(parsedRanges))
-		range0 := parsedRanges[0]
-		assert.Equal(t, range0.lower.Val.(*planpb.GenericValue_Int64Val).Int64Val, int64(50))
-		assert.Equal(t, true, range0.includeLower)
-		assert.Equal(t, false, range0.includeUpper)
-	}
-
-	// test binary query plan
-	{
-		expr := "cluster_key_field in [100]"
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
-		assert.NoError(t, err)
-		planExpr, err := ParseExprFromPlan(queryPlan)
-		assert.NoError(t, err)
-		parsedRanges, matchALL := ParseRanges(planExpr, ClusteringKey)
-		assert.False(t, matchALL)
-		assert.Equal(t, 1, len(parsedRanges))
-		range0 := parsedRanges[0]
-		assert.Equal(t, range0.lower.Val.(*planpb.GenericValue_Int64Val).Int64Val, int64(100))
-		assert.Equal(t, true, range0.includeLower)
-		assert.Equal(t, true, range0.includeUpper)
-	}
-}
-
-func TestParseStrRanges(t *testing.T) {
-	prefix := "TestParseRanges"
-	clusterKeyField := "cluster_key_field"
-	collectionName := prefix + funcutil.GenRandomStr()
-
-	fieldName2Type := make(map[string]schemapb.DataType)
-	fieldName2Type["int64_field"] = schemapb.DataType_Int64
-	fieldName2Type["varChar_field"] = schemapb.DataType_VarChar
-	fieldName2Type["fvec_field"] = schemapb.DataType_FloatVector
-	schema := testutil.ConstructCollectionSchemaByDataType(collectionName, fieldName2Type,
-		"int64_field", false, 8)
-	clusterKeyFieldSchema := &schemapb.FieldSchema{
-		Name:            clusterKeyField,
-		DataType:        schemapb.DataType_VarChar,
-		IsClusteringKey: true,
-	}
-	schema.Fields = append(schema.Fields, clusterKeyFieldSchema)
-
-	fieldID := common.StartOfUserFieldID
-	for _, field := range schema.Fields {
-		field.FieldID = int64(fieldID)
-		fieldID++
-	}
-	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
-	require.NoError(t, err)
-	// test query plan
-	{
-		expr := "cluster_key_field >= \"aaa\""
-		queryPlan, err := planparserv2.CreateRetrievePlan(schemaHelper, expr, nil)
-		assert.NoError(t, err)
-		planExpr, err := ParseExprFromPlan(queryPlan)
-		assert.NoError(t, err)
-		parsedRanges, matchALL := ParseRanges(planExpr, ClusteringKey)
-		assert.False(t, matchALL)
-		assert.Equal(t, 1, len(parsedRanges))
-		range0 := parsedRanges[0]
-		assert.Equal(t, range0.lower.Val.(*planpb.GenericValue_StringVal).StringVal, "aaa")
-		assert.Nil(t, range0.upper)
-		assert.Equal(t, range0.includeLower, true)
-		assert.Equal(t, range0.includeUpper, false)
 	}
 }
 
@@ -383,17 +249,17 @@ func TestValidatePartitionKeyIsolation(t *testing.T) {
 		},
 		{
 			name:                "partition key isolation term",
-			expr:                "key_field in [10]",
+			expr:                "key_field in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]",
 			expectedErrorString: "partition key isolation does not support IN",
 		},
 		{
 			name:                "partition key isolation term multiple",
-			expr:                "key_field in [10, 20]",
+			expr:                "key_field in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]",
 			expectedErrorString: "partition key isolation does not support IN",
 		},
 		{
 			name:                "partition key isolation NOT term",
-			expr:                "key_field not in [10]",
+			expr:                "key_field not in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]",
 			expectedErrorString: "partition key isolation does not support IN",
 		},
 		{
@@ -424,12 +290,12 @@ func TestValidatePartitionKeyIsolation(t *testing.T) {
 		{
 			name:                "partition key isolation NOT equal",
 			expr:                "not(key_field == 10)",
-			expectedErrorString: "partition key isolation does not support NOT",
+			expectedErrorString: "partition key isolation does not support NotEqual",
 		},
 		{
 			name:                "partition key isolation equal AND with same field term",
 			expr:                "key_field == 10 && key_field in [10]",
-			expectedErrorString: "partition key isolation does not support IN",
+			expectedErrorString: "",
 		},
 		{
 			name:                "partition key isolation equal OR with same field equal",

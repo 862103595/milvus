@@ -20,9 +20,11 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path"
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
@@ -33,14 +35,19 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache/pkoracle"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/function"
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
+	"github.com/milvus-io/milvus/internal/util/function/models"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -57,18 +64,27 @@ func NewSyncTask(ctx context.Context,
 	deleteData *storage.DeleteData,
 	bm25Stats map[int64]*storage.BM25Stats,
 	storageVersion int64,
+	useLoonFFI bool,
 	storageConfig *indexpb.StorageConfig,
 ) (syncmgr.Task, error) {
 	metaCache := metaCaches[vchannel]
 	if _, ok := metaCache.GetSegmentByID(segmentID); !ok {
-		metaCache.AddSegment(&datapb.SegmentInfo{
+		segment := &datapb.SegmentInfo{
 			ID:             segmentID,
 			State:          commonpb.SegmentState_Importing,
 			CollectionID:   collectionID,
 			PartitionID:    partitionID,
 			InsertChannel:  vchannel,
 			StorageVersion: storageVersion,
-		}, func(info *datapb.SegmentInfo) pkoracle.PkStat {
+		}
+		// init first manifest path
+		if useLoonFFI {
+			k := metautil.JoinIDPath(collectionID, partitionID, segmentID)
+			basePath := path.Join(storageConfig.GetRootPath(), common.SegmentInsertLogPath, k)
+			// ManifestEarliest for first write
+			segment.ManifestPath = packed.MarshalManifestPath(basePath, packed.ManifestEarliest)
+		}
+		metaCache.AddSegment(segment, func(info *datapb.SegmentInfo) pkoracle.PkStat {
 			bfs := pkoracle.NewBloomFilterSet()
 			return bfs
 		}, metacache.NewBM25StatsFactory)
@@ -86,7 +102,6 @@ func NewSyncTask(ctx context.Context,
 		WithPartitionID(partitionID).
 		WithChannelName(vchannel).
 		WithSegmentID(segmentID).
-		WithTimeRange(ts, ts).
 		WithLevel(segmentLevel).
 		WithDataSource(metrics.BulkinsertDataSourceLabel).
 		WithBatchRows(int64(insertData.GetRowNum()))
@@ -94,12 +109,18 @@ func NewSyncTask(ctx context.Context,
 		syncPack.WithBM25Stats(bm25Stats)
 	}
 
+	writeRetryAttempts := paramtable.Get().DataNodeCfg.ImportMaxWriteRetryAttempts.GetAsUint()
+	retryOpts := []retry.Option{
+		retry.Attempts(writeRetryAttempts), // default retry always
+		retry.MaxSleepTime(10 * time.Second),
+	}
 	task := syncmgr.NewSyncTask().
 		WithAllocator(allocator).
 		WithMetaCache(metaCache).
 		WithSchema(metaCache.GetSchema(0)). // TODO specify import schema if needed
 		WithSyncPack(syncPack).
-		WithStorageConfig(storageConfig)
+		WithStorageConfig(storageConfig).
+		WithWriteRetryOptions(retryOpts...)
 	return task, nil
 }
 
@@ -122,6 +143,7 @@ func NewImportSegmentInfo(syncTask syncmgr.Task, metaCaches map[string]metacache
 		Statslogs:    lo.Values(statsBinlog),
 		Bm25Logs:     lo.Values(bm25Log),
 		Deltalogs:    deltaLogs,
+		ManifestPath: segment.ManifestPath(),
 	}, nil
 }
 
@@ -357,6 +379,19 @@ func AppendNullableDefaultFieldsData(schema *schemapb.CollectionSchema, data *st
 				appender := &nullDefaultAppender[*schemapb.ScalarField]{}
 				err = appender.AppendNull(fieldData, rowNum)
 			}
+		case schemapb.DataType_FloatVector,
+			schemapb.DataType_Float16Vector,
+			schemapb.DataType_BFloat16Vector,
+			schemapb.DataType_BinaryVector,
+			schemapb.DataType_SparseFloatVector,
+			schemapb.DataType_Int8Vector:
+			if nullable {
+				for i := 0; i < rowNum; i++ {
+					if err = fieldData.AppendRow(nil); err != nil {
+						return err
+					}
+				}
+			}
 		default:
 			return fmt.Errorf("Unexpected data type: %d, cannot be filled with default value", dataType)
 		}
@@ -407,6 +442,7 @@ func FillDynamicData(schema *schemapb.CollectionSchema, data *storage.InsertData
 }
 
 func RunEmbeddingFunction(task *ImportTask, data *storage.InsertData) error {
+	log.Info("start to run embedding function")
 	if err := RunDenseEmbedding(task, data); err != nil {
 		return err
 	}
@@ -414,32 +450,51 @@ func RunEmbeddingFunction(task *ImportTask, data *storage.InsertData) error {
 	if err := RunBm25Function(task, data); err != nil {
 		return err
 	}
+
+	if err := RunMinHashFunction(task, data); err != nil {
+		return err
+	}
 	return nil
 }
 
 func RunDenseEmbedding(task *ImportTask, data *storage.InsertData) error {
+	log.Info("start to run dense embedding")
 	schema := task.GetSchema()
 	allowNonBM25Outputs := common.GetCollectionAllowInsertNonBM25FunctionOutputs(schema.Properties)
-	fieldIDs := lo.Keys(data.Data)
+	log.Info("allowNonBM25Outputs", zap.Any("allowNonBM25Outputs", allowNonBM25Outputs))
+	fieldIDs := lo.Keys(lo.PickBy(data.Data, func(_ int64, fd storage.FieldData) bool {
+		return fd.RowNum() > 0
+	}))
 	needProcessFunctions, err := typeutil.GetNeedProcessFunctions(fieldIDs, schema.Functions, allowNonBM25Outputs, false)
 	if err != nil {
-		return err
+		return errors.Wrap(merr.ErrInvalidInsertData, err.Error())
 	}
-	if embedding.HasNonBM25Functions(schema.Functions, []int64{}) {
-		exec, err := embedding.NewFunctionExecutor(schema, needProcessFunctions)
+	log.Info("needProcessFunctions", zap.Any("needProcessFunctions", needProcessFunctions))
+	if embedding.HasNonBM25AndMinHashFunctions(schema.Functions, []int64{}) {
+		log.Info("has non bm25/minhash functions")
+		extraInfo := &models.ModelExtraInfo{
+			ClusterID: task.req.ClusterID,
+			DBName:    task.req.Schema.DbName,
+		}
+		exec, err := embedding.NewFunctionExecutor(schema, needProcessFunctions, extraInfo)
 		if err != nil {
 			return err
 		}
-		if err := exec.ProcessBulkInsert(data); err != nil {
+		if err := exec.ProcessBulkInsert(context.Background(), data); err != nil {
 			return err
 		}
+		log.Info("end to run dense embedding")
 	}
 	return nil
 }
 
 func RunBm25Function(task *ImportTask, data *storage.InsertData) error {
+	log.Info("start to run bm25 function")
 	fns := task.GetSchema().GetFunctions()
 	for _, fn := range fns {
+		if fn.GetType() != schemapb.FunctionType_BM25 {
+			continue
+		}
 		runner, err := function.NewFunctionRunner(task.GetSchema(), fn)
 		if err != nil {
 			return err
@@ -449,8 +504,6 @@ func RunBm25Function(task *ImportTask, data *storage.InsertData) error {
 			continue
 		}
 
-		defer runner.Close()
-
 		inputFieldIDs := lo.Map(runner.GetInputFields(), func(field *schemapb.FieldSchema, _ int) int64 { return field.GetFieldID() })
 		inputDatas := make([]any, 0, len(inputFieldIDs))
 		for _, inputFieldID := range inputFieldIDs {
@@ -458,6 +511,7 @@ func RunBm25Function(task *ImportTask, data *storage.InsertData) error {
 		}
 
 		outputFieldData, err := runner.BatchRun(inputDatas...)
+		runner.Close()
 		if err != nil {
 			return err
 		}
@@ -484,6 +538,68 @@ func RunBm25Function(task *ImportTask, data *storage.InsertData) error {
 			default:
 				return fmt.Errorf("unsupported output data type for embedding function: %s", outputField.GetDataType().String())
 			}
+		}
+	}
+	return nil
+}
+
+func RunMinHashFunction(task *ImportTask, data *storage.InsertData) error {
+	fns := task.GetSchema().GetFunctions()
+	for _, fn := range fns {
+		if fn.GetType() != schemapb.FunctionType_MinHash {
+			continue
+		}
+		runner, err := function.NewFunctionRunner(task.GetSchema(), fn)
+		if err != nil {
+			return err
+		}
+
+		if runner == nil {
+			continue
+		}
+
+		inputFieldIDs := lo.Map(runner.GetInputFields(), func(field *schemapb.FieldSchema, _ int) int64 { return field.GetFieldID() })
+		inputDatas := make([]any, 0, len(inputFieldIDs))
+		for _, inputFieldID := range inputFieldIDs {
+			inputDatas = append(inputDatas, data.Data[inputFieldID].GetDataRows())
+		}
+
+		output, err := runner.BatchRun(inputDatas...)
+		runner.Close()
+		if err != nil {
+			return err
+		}
+
+		// Sanity check: ensure BatchRun returned at least one output
+		if len(output) == 0 {
+			return errors.New("MinHash embedding failed: runner.BatchRun returned empty output")
+		}
+
+		// MinHash function has only one output field
+		fieldData, ok := output[0].(*schemapb.FieldData)
+		if !ok {
+			return errors.New("MinHash embedding failed: MinHash runner output not FieldData")
+		}
+
+		vectorField := fieldData.GetVectors()
+		if vectorField == nil {
+			return errors.New("MinHash embedding failed: output is not a vector field")
+		}
+
+		binaryVector := vectorField.GetBinaryVector()
+		if binaryVector == nil {
+			return errors.New("MinHash embedding failed: output is not a binary vector")
+		}
+
+		outputFields := runner.GetOutputFields()
+		if len(outputFields) == 0 {
+			return errors.New("MinHash embedding failed: runner has no output fields")
+		}
+
+		outputFieldId := outputFields[0].GetFieldID()
+		data.Data[outputFieldId] = &storage.BinaryVectorFieldData{
+			Data: binaryVector,
+			Dim:  int(vectorField.GetDim()),
 		}
 	}
 	return nil

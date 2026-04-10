@@ -499,3 +499,262 @@ func (s *FillExpressionValueSuite) TestBinaryExpression() {
 		}
 	})
 }
+
+func (s *FillExpressionValueSuite) TestBinaryRangeWithMixedNumericTypesForJSON() {
+	// Test that mixed int64/float types are normalized to float for JSON fields.
+	// This prevents assertion failures in C++ expression execution.
+	// Related issue: https://github.com/milvus-io/milvus/issues/46588
+	schemaH := newTestSchemaHelper(s.T())
+
+	s.Run("lower int64 upper float should normalize to float", func() {
+		// A is a dynamic field (JSON type)
+		exprStr := `{min} < A < {max}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"min": generateTemplateValue(schemapb.DataType_Int64, int64(499)),
+			"max": generateTemplateValue(schemapb.DataType_Double, float64(512.0)),
+		}
+
+		expr, err := ParseExpr(schemaH, exprStr, templateValues)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify both bounds are normalized to float type
+		bre := expr.GetBinaryRangeExpr()
+		s.NotNil(bre, "expected BinaryRangeExpr")
+		s.Equal(float64(499), bre.GetLowerValue().GetFloatVal())
+		s.Equal(float64(512.0), bre.GetUpperValue().GetFloatVal())
+	})
+
+	s.Run("lower float upper int64 should normalize to float", func() {
+		exprStr := `{min} < A < {max}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"min": generateTemplateValue(schemapb.DataType_Double, float64(10.5)),
+			"max": generateTemplateValue(schemapb.DataType_Int64, int64(100)),
+		}
+
+		expr, err := ParseExpr(schemaH, exprStr, templateValues)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify both bounds are normalized to float type
+		bre := expr.GetBinaryRangeExpr()
+		s.NotNil(bre, "expected BinaryRangeExpr")
+		s.Equal(float64(10.5), bre.GetLowerValue().GetFloatVal())
+		s.Equal(float64(100), bre.GetUpperValue().GetFloatVal())
+	})
+
+	s.Run("both int64 should remain int64", func() {
+		exprStr := `{min} < A < {max}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"min": generateTemplateValue(schemapb.DataType_Int64, int64(10)),
+			"max": generateTemplateValue(schemapb.DataType_Int64, int64(100)),
+		}
+
+		expr, err := ParseExpr(schemaH, exprStr, templateValues)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify both bounds remain int64 type
+		bre := expr.GetBinaryRangeExpr()
+		s.NotNil(bre, "expected BinaryRangeExpr")
+		s.Equal(int64(10), bre.GetLowerValue().GetInt64Val())
+		s.Equal(int64(100), bre.GetUpperValue().GetInt64Val())
+	})
+
+	s.Run("both float should remain float", func() {
+		exprStr := `{min} < A < {max}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"min": generateTemplateValue(schemapb.DataType_Double, float64(10.5)),
+			"max": generateTemplateValue(schemapb.DataType_Double, float64(100.5)),
+		}
+
+		expr, err := ParseExpr(schemaH, exprStr, templateValues)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify both bounds remain float type
+		bre := expr.GetBinaryRangeExpr()
+		s.NotNil(bre, "expected BinaryRangeExpr")
+		s.Equal(float64(10.5), bre.GetLowerValue().GetFloatVal())
+		s.Equal(float64(100.5), bre.GetUpperValue().GetFloatVal())
+	})
+}
+
+func (s *FillExpressionValueSuite) TestBinaryArithOpEvalRangeDivisionByZero() {
+	schemaH := newTestSchemaHelper(s.T())
+
+	s.Run("division by integer zero should fail", func() {
+		exprStr := `Int64Field / {divisor} == {value}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"divisor": generateTemplateValue(schemapb.DataType_Int64, int64(0)),
+			"value":   generateTemplateValue(schemapb.DataType_Int64, int64(5)),
+		}
+		s.assertInvalidExpr(schemaH, exprStr, templateValues)
+	})
+
+	s.Run("division by float zero should fail", func() {
+		exprStr := `FloatField / {divisor} == {value}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"divisor": generateTemplateValue(schemapb.DataType_Double, float64(0.0)),
+			"value":   generateTemplateValue(schemapb.DataType_Double, float64(5.0)),
+		}
+		s.assertInvalidExpr(schemaH, exprStr, templateValues)
+	})
+
+	s.Run("modulo by integer zero should fail", func() {
+		exprStr := `Int64Field % {divisor} == {value}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"divisor": generateTemplateValue(schemapb.DataType_Int64, int64(0)),
+			"value":   generateTemplateValue(schemapb.DataType_Int64, int64(1)),
+		}
+		s.assertInvalidExpr(schemaH, exprStr, templateValues)
+	})
+
+	s.Run("division by non-zero should succeed", func() {
+		exprStr := `Int64Field / {divisor} == {value}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"divisor": generateTemplateValue(schemapb.DataType_Int64, int64(2)),
+			"value":   generateTemplateValue(schemapb.DataType_Int64, int64(5)),
+		}
+		s.assertValidExpr(schemaH, exprStr, templateValues)
+	})
+
+	s.Run("modulo by non-zero should succeed", func() {
+		exprStr := `Int64Field % {divisor} == {value}`
+		templateValues := map[string]*schemapb.TemplateValue{
+			"divisor": generateTemplateValue(schemapb.DataType_Int64, int64(3)),
+			"value":   generateTemplateValue(schemapb.DataType_Int64, int64(1)),
+		}
+		s.assertValidExpr(schemaH, exprStr, templateValues)
+	})
+}
+
+func (s *FillExpressionValueSuite) TestTermExprWithMixedNumericTypesForJSON() {
+	// Test that mixed int64/float types in 'in' expression are normalized to float for JSON fields.
+	// This prevents assertion failures in C++ expression execution.
+	// Related to the BinaryRange fix for issue: https://github.com/milvus-io/milvus/issues/46588
+	schemaH := newTestSchemaHelper(s.T())
+
+	s.Run("mixed int and float should normalize all to float", func() {
+		// A is a dynamic field (JSON type)
+		// Directly parse expression with mixed int and float values
+		exprStr := `A in [1, 2.5, 3, 4.5]`
+
+		expr, err := ParseExpr(schemaH, exprStr, nil)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify all values are normalized to float type
+		te := expr.GetTermExpr()
+		s.NotNil(te, "expected TermExpr")
+		s.Len(te.GetValues(), 4)
+		// All integers should be converted to floats
+		s.Equal(float64(1), te.GetValues()[0].GetFloatVal())
+		s.Equal(float64(2.5), te.GetValues()[1].GetFloatVal())
+		s.Equal(float64(3), te.GetValues()[2].GetFloatVal())
+		s.Equal(float64(4.5), te.GetValues()[3].GetFloatVal())
+	})
+
+	s.Run("all integers should remain int64", func() {
+		exprStr := `A in [1, 2, 3, 4]`
+
+		expr, err := ParseExpr(schemaH, exprStr, nil)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify all values remain int64 type
+		te := expr.GetTermExpr()
+		s.NotNil(te, "expected TermExpr")
+		s.Len(te.GetValues(), 4)
+		s.Equal(int64(1), te.GetValues()[0].GetInt64Val())
+		s.Equal(int64(2), te.GetValues()[1].GetInt64Val())
+		s.Equal(int64(3), te.GetValues()[2].GetInt64Val())
+		s.Equal(int64(4), te.GetValues()[3].GetInt64Val())
+	})
+
+	s.Run("all floats should remain float", func() {
+		exprStr := `A in [1.5, 2.5, 3.5, 4.5]`
+
+		expr, err := ParseExpr(schemaH, exprStr, nil)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify all values remain float type
+		te := expr.GetTermExpr()
+		s.NotNil(te, "expected TermExpr")
+		s.Len(te.GetValues(), 4)
+		s.Equal(float64(1.5), te.GetValues()[0].GetFloatVal())
+		s.Equal(float64(2.5), te.GetValues()[1].GetFloatVal())
+		s.Equal(float64(3.5), te.GetValues()[2].GetFloatVal())
+		s.Equal(float64(4.5), te.GetValues()[3].GetFloatVal())
+	})
+
+	s.Run("single float with integers should normalize all to float", func() {
+		exprStr := `A in [1, 2, 3.0, 4]`
+
+		expr, err := ParseExpr(schemaH, exprStr, nil)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify all values are normalized to float type
+		te := expr.GetTermExpr()
+		s.NotNil(te, "expected TermExpr")
+		s.Len(te.GetValues(), 4)
+		s.Equal(float64(1), te.GetValues()[0].GetFloatVal())
+		s.Equal(float64(2), te.GetValues()[1].GetFloatVal())
+		s.Equal(float64(3.0), te.GetValues()[2].GetFloatVal())
+		s.Equal(float64(4), te.GetValues()[3].GetFloatVal())
+	})
+
+	s.Run("JSONField with mixed int and float should normalize all to float", func() {
+		exprStr := `JSONField["x"] in [10, 20.5, 30]`
+
+		expr, err := ParseExpr(schemaH, exprStr, nil)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify all values are normalized to float type
+		te := expr.GetTermExpr()
+		s.NotNil(te, "expected TermExpr")
+		s.Len(te.GetValues(), 3)
+		s.Equal(float64(10), te.GetValues()[0].GetFloatVal())
+		s.Equal(float64(20.5), te.GetValues()[1].GetFloatVal())
+		s.Equal(float64(30), te.GetValues()[2].GetFloatVal())
+	})
+
+	s.Run("non-JSON field should not be affected by mixed type normalization", func() {
+		// Int64Field is not a JSON field, so mixed types would be an error or handled differently
+		// Use >= 10 values to stay above the integer IN threshold and keep TermExpr form
+		exprStr := `Int64Field in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]`
+
+		expr, err := ParseExpr(schemaH, exprStr, nil)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// Verify values remain as integers for non-JSON field
+		te := expr.GetTermExpr()
+		s.NotNil(te, "expected TermExpr")
+		s.Len(te.GetValues(), 10)
+		for i := 0; i < 10; i++ {
+			s.Equal(int64(i+1), te.GetValues()[i].GetInt64Val())
+		}
+	})
+
+	s.Run("not in with mixed int and float should normalize all to float", func() {
+		exprStr := `A not in [1, 2.5, 3]`
+
+		expr, err := ParseExpr(schemaH, exprStr, nil)
+		s.NoError(err)
+		s.NotNil(expr)
+
+		// The not in expression wraps a TermExpr in a UnaryExpr
+		ue := expr.GetUnaryExpr()
+		s.NotNil(ue, "expected UnaryExpr")
+		te := ue.GetChild().GetTermExpr()
+		s.NotNil(te, "expected TermExpr")
+		s.Len(te.GetValues(), 3)
+		s.Equal(float64(1), te.GetValues()[0].GetFloatVal())
+		s.Equal(float64(2.5), te.GetValues()[1].GetFloatVal())
+		s.Equal(float64(3), te.GetValues()[2].GetFloatVal())
+	})
+}

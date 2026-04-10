@@ -32,12 +32,11 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/mocks"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
-	interalratelimitutil "github.com/milvus-io/milvus/internal/util/ratelimitutil"
+	rlinternal "github.com/milvus-io/milvus/internal/util/ratelimitutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
@@ -62,7 +61,7 @@ func TestQuotaCenter(t *testing.T) {
 	pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, nil).Maybe()
 
 	dc := mocks.NewMixCoord(t)
-	dc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	dc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(&metricsinfo.DataCoordTopology{}, nil).Maybe()
 
 	collectionIDToPartitionIDs := map[int64][]int64{
 		1: {},
@@ -92,7 +91,7 @@ func TestQuotaCenter(t *testing.T) {
 		paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaCenterCollectInterval.Key, "1")
 		defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaCenterCollectInterval.Key)
 		// mock query coord stuck for  at most 10s
-		dc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, gmr *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+		dc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, gmr *milvuspb.GetMetricsRequest) (*metricsinfo.QueryCoordTopology, error) {
 			counter := 0
 			for {
 				select {
@@ -134,32 +133,14 @@ func TestQuotaCenter(t *testing.T) {
 			},
 		}, nil).Maybe()
 
-		dc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{Status: merr.Success()}, nil)
+		dc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(&metricsinfo.QueryCoordTopology{}, nil)
+		dc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(nil, errors.New("mock error"))
 		quotaCenter := NewQuotaCenter(pcm, dc, core.tsoAllocator, meta)
 		err = quotaCenter.collectMetrics()
-		assert.Error(t, err) // for empty response
-
-		quotaCenter = NewQuotaCenter(pcm, dc, core.tsoAllocator, meta)
-		err = quotaCenter.collectMetrics()
 		assert.Error(t, err)
 
-		dc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status: merr.Status(errors.New("mock error")),
-		}, nil)
-
-		quotaCenter = NewQuotaCenter(pcm, dc, core.tsoAllocator, meta)
-		err = quotaCenter.collectMetrics()
-		assert.Error(t, err)
-
-		dc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(nil, errors.New("mock error"))
-		dc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(nil, errors.New("mock err"))
-		quotaCenter = NewQuotaCenter(pcm, dc, core.tsoAllocator, meta)
-		err = quotaCenter.collectMetrics()
-		assert.Error(t, err)
-
-		dc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status: merr.Status(err),
-		}, nil)
+		dc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(nil, errors.New("mock error"))
+		dc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(nil, errors.New("mock err"))
 		quotaCenter = NewQuotaCenter(pcm, dc, core.tsoAllocator, meta)
 		err = quotaCenter.collectMetrics()
 		assert.Error(t, err)
@@ -170,18 +151,8 @@ func TestQuotaCenter(t *testing.T) {
 		pcm2 := proxyutil.NewMockProxyClientManager(t)
 		meta := mockrootcoord.NewIMetaTable(t)
 
-		emptyQueryCoordTopology := &metricsinfo.QueryCoordTopology{}
-		queryBytes, _ := json.Marshal(emptyQueryCoordTopology)
-		dc2.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Success(),
-			Response: string(queryBytes),
-		}, nil).Once()
-		emptyDataCoordTopology := &metricsinfo.DataCoordTopology{}
-		dataBytes, _ := json.Marshal(emptyDataCoordTopology)
-		dc2.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Success(),
-			Response: string(dataBytes),
-		}, nil).Once()
+		dc2.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(&metricsinfo.QueryCoordTopology{}, nil).Once()
+		dc2.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(&metricsinfo.DataCoordTopology{}, nil).Once()
 		pcm2.EXPECT().GetProxyMetrics(mock.Anything).Return([]*milvuspb.GetMetricsResponse{}, nil).Once()
 
 		meta.EXPECT().ListDatabases(mock.Anything, mock.Anything).Return(nil, errors.New("mock error")).Once()
@@ -195,7 +166,7 @@ func TestQuotaCenter(t *testing.T) {
 		pcm2 := proxyutil.NewMockProxyClientManager(t)
 		meta := mockrootcoord.NewIMetaTable(t)
 
-		emptyQueryCoordTopology := &metricsinfo.QueryCoordTopology{
+		queryCoordTopology := &metricsinfo.QueryCoordTopology{
 			Cluster: metricsinfo.QueryClusterTopology{
 				ConnectedNodes: []metricsinfo.QueryNodeInfos{
 					{
@@ -213,17 +184,8 @@ func TestQuotaCenter(t *testing.T) {
 				},
 			},
 		}
-		queryBytes, _ := json.Marshal(emptyQueryCoordTopology)
-		dc2.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Success(),
-			Response: string(queryBytes),
-		}, nil).Once()
-		emptyDataCoordTopology := &metricsinfo.DataCoordTopology{}
-		dataBytes, _ := json.Marshal(emptyDataCoordTopology)
-		dc2.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Success(),
-			Response: string(dataBytes),
-		}, nil).Once()
+		dc2.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(queryCoordTopology, nil).Once()
+		dc2.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(&metricsinfo.DataCoordTopology{}, nil).Once()
 		pcm2.EXPECT().GetProxyMetrics(mock.Anything).Return([]*milvuspb.GetMetricsResponse{}, nil).Once()
 		meta.EXPECT().ListDatabases(mock.Anything, mock.Anything).Return([]*model.Database{
 			{
@@ -243,13 +205,8 @@ func TestQuotaCenter(t *testing.T) {
 		pcm2 := proxyutil.NewMockProxyClientManager(t)
 		meta := mockrootcoord.NewIMetaTable(t)
 
-		emptyQueryCoordTopology := &metricsinfo.QueryCoordTopology{}
-		queryBytes, _ := json.Marshal(emptyQueryCoordTopology)
-		dc2.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Success(),
-			Response: string(queryBytes),
-		}, nil).Once()
-		emptyDataCoordTopology := &metricsinfo.DataCoordTopology{
+		dc2.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(&metricsinfo.QueryCoordTopology{}, nil).Once()
+		dataCoordTopology := &metricsinfo.DataCoordTopology{
 			Cluster: metricsinfo.DataClusterTopology{
 				ConnectedDataNodes: []metricsinfo.DataNodeInfos{
 					{
@@ -262,11 +219,7 @@ func TestQuotaCenter(t *testing.T) {
 				},
 			},
 		}
-		dataBytes, _ := json.Marshal(emptyDataCoordTopology)
-		dc2.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Success(),
-			Response: string(dataBytes),
-		}, nil).Once()
+		dc2.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(dataCoordTopology, nil).Once()
 		pcm2.EXPECT().GetProxyMetrics(mock.Anything).Return([]*milvuspb.GetMetricsResponse{}, nil).Once()
 		meta.EXPECT().ListDatabases(mock.Anything, mock.Anything).Return([]*model.Database{
 			{
@@ -337,12 +290,12 @@ func TestQuotaCenter(t *testing.T) {
 		err := quotaCenter.resetAllCurrentRates()
 		assert.NoError(t, err)
 
-		err = quotaCenter.forceDenyWriting(commonpb.ErrorCode_ForceDeny, false, nil, []int64{4}, nil)
+		err = quotaCenter.forceDenyWriting(commonpb.ErrorCode_ForceDeny, false, nil, []int64{4}, nil, "test")
 		assert.NoError(t, err)
 
 		err = quotaCenter.forceDenyWriting(commonpb.ErrorCode_ForceDeny, false, nil, []int64{1, 2, 3}, map[int64][]int64{
 			1: {1000},
-		})
+		}, "test")
 		assert.NoError(t, err)
 
 		for collectionID := range collectionIDToPartitionIDs {
@@ -354,7 +307,6 @@ func TestQuotaCenter(t *testing.T) {
 
 			for _, rt := range []internalpb.RateType{
 				internalpb.RateType_DMLInsert,
-				internalpb.RateType_DMLUpsert,
 				internalpb.RateType_DMLDelete,
 				internalpb.RateType_DMLBulkLoad,
 			} {
@@ -364,7 +316,7 @@ func TestQuotaCenter(t *testing.T) {
 			}
 		}
 
-		err = quotaCenter.forceDenyWriting(commonpb.ErrorCode_ForceDeny, false, []int64{0}, nil, nil)
+		err = quotaCenter.forceDenyWriting(commonpb.ErrorCode_ForceDeny, false, []int64{0}, nil, nil, "test")
 		assert.NoError(t, err)
 		dbLimiters := quotaCenter.rateLimiter.GetDatabaseLimiters(0)
 		assert.NotNil(t, dbLimiters)
@@ -372,7 +324,6 @@ func TestQuotaCenter(t *testing.T) {
 		assert.NotNil(t, limiters)
 		for _, rt := range []internalpb.RateType{
 			internalpb.RateType_DMLInsert,
-			internalpb.RateType_DMLUpsert,
 			internalpb.RateType_DMLDelete,
 			internalpb.RateType_DMLBulkLoad,
 		} {
@@ -403,14 +354,14 @@ func TestQuotaCenter(t *testing.T) {
 		err := quotaCenter.resetAllCurrentRates()
 		assert.NoError(t, err)
 
-		updateLimit := func(node *interalratelimitutil.RateLimiterNode, rateType internalpb.RateType, limit int64) {
+		updateLimit := func(node *rlinternal.RateLimiterNode, rateType internalpb.RateType, limit int64) {
 			limiter, ok := node.GetLimiters().Get(rateType)
 			if !ok {
 				return
 			}
 			limiter.SetLimit(Limit(limit))
 		}
-		assertLimit := func(node *interalratelimitutil.RateLimiterNode, rateType internalpb.RateType, expectValue int64) {
+		assertLimit := func(node *rlinternal.RateLimiterNode, rateType internalpb.RateType, expectValue int64) {
 			limiter, ok := node.GetLimiters().Get(rateType)
 			if !ok {
 				assert.FailNow(t, "limiter not found")
@@ -428,7 +379,7 @@ func TestQuotaCenter(t *testing.T) {
 		updateLimit(quotaCenter.rateLimiter.GetCollectionLimiters(0, 2), internalpb.RateType_DMLInsert, 10)
 		updateLimit(quotaCenter.rateLimiter.GetCollectionLimiters(0, 2), internalpb.RateType_DMLDelete, 9)
 
-		err = quotaCenter.forceDenyWriting(commonpb.ErrorCode_DiskQuotaExhausted, true, []int64{0}, []int64{1}, nil)
+		err = quotaCenter.forceDenyWriting(commonpb.ErrorCode_DiskQuotaExhausted, true, []int64{0}, []int64{1}, nil, "test")
 		assert.NoError(t, err)
 
 		assertLimit(quotaCenter.rateLimiter.GetRootLimiters(), internalpb.RateType_DMLInsert, 0)
@@ -539,8 +490,6 @@ func TestQuotaCenter(t *testing.T) {
 		paramtable.Get().Save(Params.QuotaConfig.MaxTimeTickDelay.Key, "10.0")
 		paramtable.Get().Save(Params.QuotaConfig.DMLMaxInsertRatePerCollection.Key, "100.0")
 		paramtable.Get().Save(Params.QuotaConfig.DMLMinInsertRatePerCollection.Key, "0.0")
-		paramtable.Get().Save(Params.QuotaConfig.DMLMaxUpsertRatePerCollection.Key, "100.0")
-		paramtable.Get().Save(Params.QuotaConfig.DMLMinUpsertRatePerCollection.Key, "0.0")
 		paramtable.Get().Save(Params.QuotaConfig.DMLMaxDeleteRatePerCollection.Key, "100.0")
 		paramtable.Get().Save(Params.QuotaConfig.DMLMinDeleteRatePerCollection.Key, "0.0")
 		forceBak := Params.QuotaConfig.ForceDenyWriting.GetValue()
@@ -687,8 +636,6 @@ func TestQuotaCenter(t *testing.T) {
 		limiters := quotaCenter.rateLimiter.GetRootLimiters().GetLimiters()
 		a, _ := limiters.Get(internalpb.RateType_DMLInsert)
 		assert.Equal(t, Limit(0), a.Limit())
-		b, _ := limiters.Get(internalpb.RateType_DMLUpsert)
-		assert.Equal(t, Limit(0), b.Limit())
 		c, _ := limiters.Get(internalpb.RateType_DMLDelete)
 		assert.Equal(t, Limit(0), c.Limit())
 
@@ -718,8 +665,6 @@ func TestQuotaCenter(t *testing.T) {
 		limiters = rln.GetLimiters()
 		a, _ = limiters.Get(internalpb.RateType_DMLInsert)
 		assert.NotEqual(t, Limit(0), a.Limit())
-		b, _ = limiters.Get(internalpb.RateType_DMLUpsert)
-		assert.NotEqual(t, Limit(0), b.Limit())
 		c, _ = limiters.Get(internalpb.RateType_DMLDelete)
 		assert.NotEqual(t, Limit(0), c.Limit())
 
@@ -727,8 +672,6 @@ func TestQuotaCenter(t *testing.T) {
 		limiters = rln.GetLimiters()
 		a, _ = limiters.Get(internalpb.RateType_DMLInsert)
 		assert.Equal(t, Limit(0), a.Limit())
-		b, _ = limiters.Get(internalpb.RateType_DMLUpsert)
-		assert.Equal(t, Limit(0), b.Limit())
 		c, _ = limiters.Get(internalpb.RateType_DMLDelete)
 		assert.Equal(t, Limit(0), c.Limit())
 
@@ -752,11 +695,12 @@ func TestQuotaCenter(t *testing.T) {
 		for db, collections := range quotaCenter.writableCollections {
 			for collection := range collections {
 				states := quotaCenter.rateLimiter.GetCollectionLimiters(db, collection).GetQuotaStates()
-				code, _ := states.Get(milvuspb.QuotaState_DenyToWrite)
+				stateInfo, ok := states.Get(milvuspb.QuotaState_DenyToWrite)
 				if db == 0 {
-					assert.Equal(t, commonpb.ErrorCode_MemoryQuotaExhausted, code)
+					assert.True(t, ok)
+					assert.Equal(t, commonpb.ErrorCode_MemoryQuotaExhausted, stateInfo.ErrorCode)
 				} else {
-					assert.Equal(t, commonpb.ErrorCode_Success, code)
+					assert.False(t, ok)
 				}
 			}
 		}
@@ -891,15 +835,11 @@ func TestQuotaCenter(t *testing.T) {
 					if lo.Contains(notEquals, collection) {
 						a, _ := limiters.Get(internalpb.RateType_DMLInsert)
 						assert.NotEqual(t, Limit(0), a.Limit())
-						b, _ := limiters.Get(internalpb.RateType_DMLUpsert)
-						assert.NotEqual(t, Limit(0), b.Limit())
 						c, _ := limiters.Get(internalpb.RateType_DMLDelete)
 						assert.NotEqual(t, Limit(0), c.Limit())
 					} else {
 						a, _ := limiters.Get(internalpb.RateType_DMLInsert)
 						assert.Equal(t, Limit(0), a.Limit())
-						b, _ := limiters.Get(internalpb.RateType_DMLUpsert)
-						assert.Equal(t, Limit(0), b.Limit())
 						c, _ := limiters.Get(internalpb.RateType_DMLDelete)
 						assert.NotEqual(t, Limit(0), c.Limit())
 					}
@@ -911,8 +851,6 @@ func TestQuotaCenter(t *testing.T) {
 			root := quotaCenter.rateLimiter.GetRootLimiters().GetLimiters()
 			a, _ := root.Get(internalpb.RateType_DMLInsert)
 			assert.Equal(t, Limit(0), a.Limit())
-			b, _ := root.Get(internalpb.RateType_DMLUpsert)
-			assert.Equal(t, Limit(0), b.Limit())
 			c, _ := root.Get(internalpb.RateType_DMLDelete)
 			assert.NotEqual(t, Limit(0), c.Limit())
 		}
@@ -987,8 +925,8 @@ func TestQuotaCenter(t *testing.T) {
 		collectionID := int64(1)
 		limitNode := quotaCenter.rateLimiter.GetCollectionLimiters(0, collectionID)
 		limitNode.GetLimiters().Insert(internalpb.RateType_DMLInsert, ratelimitutil.NewLimiter(100, 100))
-		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToWrite, commonpb.ErrorCode_MemoryQuotaExhausted)
-		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToRead, commonpb.ErrorCode_ForceDeny)
+		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToWrite, &rlinternal.QuotaStateInfo{ErrorCode: commonpb.ErrorCode_MemoryQuotaExhausted})
+		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToRead, &rlinternal.QuotaStateInfo{ErrorCode: commonpb.ErrorCode_ForceDeny})
 		err = quotaCenter.sendRatesToProxy()
 		assert.NoError(t, err)
 	})
@@ -1007,8 +945,8 @@ func TestQuotaCenter(t *testing.T) {
 		quotaCenter.resetAllCurrentRates()
 		collectionID := int64(1)
 		limitNode := quotaCenter.rateLimiter.GetCollectionLimiters(0, collectionID)
-		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToWrite, commonpb.ErrorCode_MemoryQuotaExhausted)
-		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToRead, commonpb.ErrorCode_ForceDeny)
+		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToWrite, &rlinternal.QuotaStateInfo{ErrorCode: commonpb.ErrorCode_MemoryQuotaExhausted})
+		limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToRead, &rlinternal.QuotaStateInfo{ErrorCode: commonpb.ErrorCode_ForceDeny})
 		quotaCenter.recordMetrics()
 	})
 
@@ -1091,7 +1029,6 @@ func TestQuotaCenter(t *testing.T) {
 		}
 
 		assert.Equal(t, getRate(limiters, internalpb.RateType_DMLInsert), Params.QuotaConfig.DMLMaxInsertRatePerCollection.GetAsFloat())
-		assert.Equal(t, getRate(limiters, internalpb.RateType_DMLUpsert), Params.QuotaConfig.DMLMaxUpsertRatePerCollection.GetAsFloat())
 		assert.Equal(t, getRate(limiters, internalpb.RateType_DMLDelete), Params.QuotaConfig.DMLMaxDeleteRatePerCollection.GetAsFloat())
 		assert.Equal(t, getRate(limiters, internalpb.RateType_DMLBulkLoad), Params.QuotaConfig.DMLMaxBulkLoadRatePerCollection.GetAsFloat())
 		assert.Equal(t, getRate(limiters, internalpb.RateType_DQLSearch), Params.QuotaConfig.DQLMaxSearchRatePerCollection.GetAsFloat())
@@ -1125,10 +1062,6 @@ func TestQuotaCenter(t *testing.T) {
 					Key:   common.CollectionSearchRateMaxKey,
 					Value: "5",
 				},
-				{
-					Key:   common.CollectionUpsertRateMaxKey,
-					Value: "6",
-				},
 			},
 		}, nil)
 		quotaCenter.resetAllCurrentRates()
@@ -1138,7 +1071,6 @@ func TestQuotaCenter(t *testing.T) {
 		assert.Equal(t, getRate(limiters, internalpb.RateType_DMLBulkLoad), float64(3*1024*1024))
 		assert.Equal(t, getRate(limiters, internalpb.RateType_DQLQuery), float64(4))
 		assert.Equal(t, getRate(limiters, internalpb.RateType_DQLSearch), float64(5))
-		assert.Equal(t, getRate(limiters, internalpb.RateType_DMLUpsert), float64(6*1024*1024))
 	})
 }
 
@@ -1167,24 +1099,16 @@ func (s *QuotaCenterSuite) SetupTest() {
 	s.meta = mockrootcoord.NewIMetaTable(s.T())
 }
 
-func (s *QuotaCenterSuite) getEmptyQCMetricsRsp() string {
-	metrics := &metricsinfo.QueryCoordTopology{
+func (s *QuotaCenterSuite) getEmptyQCTopology() *metricsinfo.QueryCoordTopology {
+	return &metricsinfo.QueryCoordTopology{
 		Cluster: metricsinfo.QueryClusterTopology{},
 	}
-
-	resp, err := metricsinfo.MarshalTopology(metrics)
-	s.Require().NoError(err)
-	return resp
 }
 
-func (s *QuotaCenterSuite) getEmptyDCMetricsRsp() string {
-	metrics := &metricsinfo.DataCoordTopology{
+func (s *QuotaCenterSuite) getEmptyDCTopology() *metricsinfo.DataCoordTopology {
+	return &metricsinfo.DataCoordTopology{
 		Cluster: metricsinfo.DataClusterTopology{},
 	}
-
-	resp, err := metricsinfo.MarshalTopology(metrics)
-	s.Require().NoError(err)
-	return resp
 }
 
 func (s *QuotaCenterSuite) TestSyncMetricsSuccess() {
@@ -1203,12 +1127,9 @@ func (s *QuotaCenterSuite) TestSyncMetricsSuccess() {
 
 	s.Run("querycoord_cluster", func() {
 		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, nil).Once()
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyDCMetricsRsp(),
-		}, nil).Once()
+		qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyDCTopology(), nil).Once()
 
-		metrics := &metricsinfo.QueryCoordTopology{
+		qcTopology := &metricsinfo.QueryCoordTopology{
 			Cluster: metricsinfo.QueryClusterTopology{
 				ConnectedNodes: []metricsinfo.QueryNodeInfos{
 					{BaseComponentInfos: metricsinfo.BaseComponentInfos{ID: 1}, QuotaMetrics: &metricsinfo.QueryNodeQuotaMetrics{Effect: metricsinfo.NodeEffect{NodeID: 1, CollectionIDs: []int64{100, 200}}}},
@@ -1217,20 +1138,14 @@ func (s *QuotaCenterSuite) TestSyncMetricsSuccess() {
 			},
 		}
 
-		resp, err := metricsinfo.MarshalTopology(metrics)
-		s.Require().NoError(err)
-
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: resp,
-		}, nil).Once()
+		qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(qcTopology, nil).Once()
 		meta.EXPECT().GetCollectionByIDWithMaxTs(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, i int64) (*model.Collection, error) {
 			return &model.Collection{CollectionID: i, DBID: 1}, nil
 		}).Times(3)
 
 		quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
 
-		err = quotaCenter.collectMetrics()
+		err := quotaCenter.collectMetrics()
 		s.Require().NoError(err)
 
 		s.ElementsMatch([]int64{100, 200, 300}, lo.Keys(quotaCenter.readableCollections[1]))
@@ -1240,12 +1155,9 @@ func (s *QuotaCenterSuite) TestSyncMetricsSuccess() {
 
 	s.Run("datacoord_cluster", func() {
 		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, nil).Once()
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyQCMetricsRsp(),
-		}, nil).Once()
+		qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyQCTopology(), nil).Once()
 
-		metrics := &metricsinfo.DataCoordTopology{
+		dcTopology := &metricsinfo.DataCoordTopology{
 			Cluster: metricsinfo.DataClusterTopology{
 				ConnectedDataNodes: []metricsinfo.DataNodeInfos{
 					{BaseComponentInfos: metricsinfo.BaseComponentInfos{ID: 1}, QuotaMetrics: &metricsinfo.DataNodeQuotaMetrics{Effect: metricsinfo.NodeEffect{NodeID: 1, CollectionIDs: []int64{100, 200}}}},
@@ -1254,20 +1166,14 @@ func (s *QuotaCenterSuite) TestSyncMetricsSuccess() {
 			},
 		}
 
-		resp, err := metricsinfo.MarshalTopology(metrics)
-		s.Require().NoError(err)
-
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: resp,
-		}, nil).Once()
+		qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(dcTopology, nil).Once()
 		meta.EXPECT().GetCollectionByIDWithMaxTs(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, i int64) (*model.Collection, error) {
 			return &model.Collection{CollectionID: i, DBID: 1}, nil
 		}).Times(3)
 
 		quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
 
-		err = quotaCenter.collectMetrics()
+		err := quotaCenter.collectMetrics()
 		s.Require().NoError(err)
 
 		s.ElementsMatch([]int64{100, 200, 300}, lo.Keys(quotaCenter.writableCollections[1]))
@@ -1291,29 +1197,8 @@ func (s *QuotaCenterSuite) TestSyncMetricsFailure() {
 
 	s.Run("querycoord_failure", func() {
 		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, nil).Once()
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyDCMetricsRsp(),
-		}, nil).Once()
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(nil, errors.New("mock")).Once()
-
-		quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
-
-		err := quotaCenter.collectMetrics()
-		s.Error(err)
-	})
-
-	s.Run("querycoord_bad_response", func() {
-		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, nil).Once()
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyDCMetricsRsp(),
-		}, nil).Once()
-
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: "abc",
-		}, nil).Once()
+		qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyDCTopology(), nil).Once()
+		qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(nil, errors.New("mock")).Once()
 
 		quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
 
@@ -1323,29 +1208,9 @@ func (s *QuotaCenterSuite) TestSyncMetricsFailure() {
 
 	s.Run("datacoord_failure", func() {
 		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, nil).Once()
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyQCMetricsRsp(),
-		}, nil).Once()
+		qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyQCTopology(), nil).Once()
 
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(nil, errors.New("mocked")).Once()
-
-		quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
-		err := quotaCenter.collectMetrics()
-		s.Error(err)
-	})
-
-	s.Run("datacoord_bad_response", func() {
-		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, nil).Once()
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyQCMetricsRsp(),
-		}, nil).Once()
-
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: "abc",
-		}, nil).Once()
+		qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(nil, errors.New("mocked")).Once()
 
 		quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
 		err := quotaCenter.collectMetrics()
@@ -1353,14 +1218,8 @@ func (s *QuotaCenterSuite) TestSyncMetricsFailure() {
 	})
 
 	s.Run("proxy_manager_return_failure", func() {
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyQCMetricsRsp(),
-		}, nil).Once()
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyDCMetricsRsp(),
-		}, nil).Once()
+		qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyQCTopology(), nil).Once()
+		qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyDCTopology(), nil).Once()
 
 		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return(nil, errors.New("mocked")).Once()
 
@@ -1370,14 +1229,8 @@ func (s *QuotaCenterSuite) TestSyncMetricsFailure() {
 	})
 
 	s.Run("proxy_manager_bad_response", func() {
-		qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyQCMetricsRsp(),
-		}, nil).Once()
-		qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-			Status:   merr.Status(nil),
-			Response: s.getEmptyDCMetricsRsp(),
-		}, nil).Once()
+		qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyQCTopology(), nil).Once()
+		qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(s.getEmptyDCTopology(), nil).Once()
 
 		pcm.EXPECT().GetProxyMetrics(mock.Anything).Return([]*milvuspb.GetMetricsResponse{
 			{
@@ -1443,13 +1296,8 @@ func (s *QuotaCenterSuite) TestNodeOffline() {
 			},
 		},
 	}
-	resp, err := metricsinfo.MarshalTopology(qcMetrics)
-	s.Require().NoError(err)
 
-	qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-		Status:   merr.Status(nil),
-		Response: resp,
-	}, nil).Once()
+	qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(qcMetrics, nil).Once()
 
 	// dc first time
 	dcMetrics := &metricsinfo.DataCoordTopology{
@@ -1473,15 +1321,10 @@ func (s *QuotaCenterSuite) TestNodeOffline() {
 		},
 	}
 
-	resp, err = metricsinfo.MarshalTopology(dcMetrics)
-	s.Require().NoError(err)
-	qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-		Status:   merr.Status(nil),
-		Response: resp,
-	}, nil).Once()
+	qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(dcMetrics, nil).Once()
 
 	quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
-	err = quotaCenter.collectMetrics()
+	err := quotaCenter.collectMetrics()
 	s.Require().NoError(err)
 
 	quotaCenter.getTimeTickDelayFactor(tsoutil.ComposeTSByTime(time.Now(), 0))
@@ -1502,13 +1345,8 @@ func (s *QuotaCenterSuite) TestNodeOffline() {
 			},
 		},
 	}
-	resp, err = metricsinfo.MarshalTopology(qcMetrics)
-	s.Require().NoError(err)
 
-	qc.EXPECT().GetQcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-		Status:   merr.Status(nil),
-		Response: resp,
-	}, nil).Once()
+	qc.EXPECT().GetQueryCoordTopology(mock.Anything, mock.Anything).Return(qcMetrics, nil).Once()
 
 	// dc second time
 	dcMetrics = &metricsinfo.DataCoordTopology{
@@ -1525,12 +1363,7 @@ func (s *QuotaCenterSuite) TestNodeOffline() {
 		},
 	}
 
-	resp, err = metricsinfo.MarshalTopology(dcMetrics)
-	s.Require().NoError(err)
-	qc.EXPECT().GetDcMetrics(mock.Anything, mock.Anything).Return(&milvuspb.GetMetricsResponse{
-		Status:   merr.Status(nil),
-		Response: resp,
-	}, nil).Once()
+	qc.EXPECT().GetDataCoordTopology(mock.Anything, mock.Anything).Return(dcMetrics, nil).Once()
 
 	err = quotaCenter.collectMetrics()
 	s.Require().NoError(err)
@@ -1552,7 +1385,7 @@ func TestUpdateLimiter(t *testing.T) {
 	})
 
 	t.Run("normal op", func(t *testing.T) {
-		node := interalratelimitutil.NewRateLimiterNode(internalpb.RateScope_Collection)
+		node := rlinternal.NewRateLimiterNode(internalpb.RateScope_Collection)
 		node.GetLimiters().Insert(internalpb.RateType_DQLSearch, ratelimitutil.NewLimiter(5, 5))
 		newLimit := ratelimitutil.NewLimiter(10, 10)
 		updateLimiter(node, newLimit, &LimiterRange{
@@ -1579,7 +1412,7 @@ func TestGetRateType(t *testing.T) {
 
 	t.Run("ddl cluster scope", func(t *testing.T) {
 		a := getRateTypes(internalpb.RateScope_Cluster, allOps)
-		assert.Equal(t, 12, a.Len())
+		assert.Equal(t, 11, a.Len())
 	})
 }
 
@@ -1748,7 +1581,7 @@ func TestCheckDiskQuota(t *testing.T) {
 			}).Maybe()
 		quotaCenter := newQuotaCenterForTesting(t, ctx, meta)
 
-		checkRate := func(rateNode *interalratelimitutil.RateLimiterNode, expectValue float64) {
+		checkRate := func(rateNode *rlinternal.RateLimiterNode, expectValue float64) {
 			insertRate, ok := rateNode.GetLimiters().Get(internalpb.RateType_DMLInsert)
 			assert.True(t, ok)
 			assert.EqualValues(t, expectValue, insertRate.Limit())
@@ -1802,14 +1635,14 @@ func TestTORequestLimiter(t *testing.T) {
 
 	quotaCenter := NewQuotaCenter(pcm, qc, core.tsoAllocator, meta)
 	pcm.EXPECT().GetProxyCount().Return(2)
-	limitNode := interalratelimitutil.NewRateLimiterNode(internalpb.RateScope_Cluster)
+	limitNode := rlinternal.NewRateLimiterNode(internalpb.RateScope_Cluster)
 	a := ratelimitutil.NewLimiter(500, 500)
 	a.SetLimit(200)
 	b := ratelimitutil.NewLimiter(100, 100)
 	limitNode.GetLimiters().Insert(internalpb.RateType_DMLInsert, a)
 	limitNode.GetLimiters().Insert(internalpb.RateType_DMLDelete, b)
 	limitNode.GetLimiters().Insert(internalpb.RateType_DMLBulkLoad, GetInfLimiter(internalpb.RateType_DMLBulkLoad))
-	limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToRead, commonpb.ErrorCode_ForceDeny)
+	limitNode.GetQuotaStates().Insert(milvuspb.QuotaState_DenyToRead, &rlinternal.QuotaStateInfo{ErrorCode: commonpb.ErrorCode_ForceDeny})
 
 	quotaCenter.rateAllocateStrategy = Average
 	proxyLimit := quotaCenter.toRequestLimiter(limitNode)

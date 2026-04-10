@@ -35,6 +35,8 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	mocktso "github.com/milvus-io/milvus/internal/tso/mocks"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
+	"github.com/milvus-io/milvus/internal/util/hookutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	pb "github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
@@ -797,13 +799,14 @@ func TestMetaTable_AlterCollection(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
+			mock.Anything,
 		).Return(errors.New("error"))
 		meta := &MetaTable{
 			catalog:     catalog,
 			collID2Meta: map[typeutil.UniqueID]*model.Collection{},
 		}
 		ctx := context.Background()
-		err := meta.AlterCollection(ctx, nil, nil, 0, false)
+		err := meta.AlterCollection(ctx, nil, nil, 0, false, false)
 		assert.Error(t, err)
 	})
 
@@ -839,6 +842,7 @@ func TestMetaTable_AlterCollection(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
+			mock.Anything,
 		).Return(nil)
 		meta := &MetaTable{
 			catalog:     catalog,
@@ -848,7 +852,7 @@ func TestMetaTable_AlterCollection(t *testing.T) {
 
 		oldColl := &model.Collection{CollectionID: 1}
 		newColl := &model.Collection{CollectionID: 1}
-		err := meta.AlterCollection(ctx, oldColl, newColl, 0, false)
+		err := meta.AlterCollection(ctx, oldColl, newColl, 0, false, false)
 		assert.NoError(t, err)
 		assert.Equal(t, meta.collID2Meta[1], newColl)
 	})
@@ -1190,6 +1194,9 @@ func TestMetaTable_RemoveCollection(t *testing.T) {
 			mock.Anything, // model.Collection
 			mock.AnythingOfType("uint64"),
 		).Return(nil)
+		catalog.On("DeleteGrantByCollectionName",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		).Return(nil)
 		meta := &MetaTable{
 			catalog: catalog,
 			names:   newNameDb(),
@@ -1205,6 +1212,97 @@ func TestMetaTable_RemoveCollection(t *testing.T) {
 		meta.names.insert("", "alias2", 100)
 		ctx := context.Background()
 		err := meta.RemoveCollection(ctx, 100, 9999)
+		assert.NoError(t, err)
+	})
+}
+
+func TestMetaTable_RemoveCollection_GrantDeleteBestEffort(t *testing.T) {
+	// When DeleteGrantByCollectionName fails, RemoveCollection should still succeed (best-effort)
+	catalog := mocks.NewRootCoordCatalog(t)
+	catalog.On("DropCollection",
+		mock.Anything,
+		mock.Anything,
+		mock.AnythingOfType("uint64"),
+	).Return(nil)
+	catalog.On("DeleteGrantByCollectionName",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+	).Return(errors.New("grant delete failed"))
+
+	meta := &MetaTable{
+		catalog:            catalog,
+		names:              newNameDb(),
+		aliases:            newNameDb(),
+		fileResourceRefCnt: make(map[int64]int),
+		collID2Meta: map[typeutil.UniqueID]*model.Collection{
+			100: {Name: "collection", State: pb.CollectionState_CollectionDropping},
+		},
+	}
+	channel.ResetStaticPChannelStatsManager()
+	channel.RecoverPChannelStatsManager([]string{})
+	meta.names.insert("", "collection", 100)
+	ctx := context.Background()
+	err := meta.RemoveCollection(ctx, 100, 9999)
+	assert.NoError(t, err)
+}
+
+func TestMetaTable_DropCollection_GrantCleanup(t *testing.T) {
+	t.Run("grant cleanup on drop", func(t *testing.T) {
+		catalog := mocks.NewRootCoordCatalog(t)
+		catalog.On("AlterCollection",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		).Return(nil)
+		catalog.On("DeleteGrantByCollectionName",
+			mock.Anything, mock.Anything, "testdb", "collection",
+		).Return(nil)
+
+		meta := &MetaTable{
+			catalog: catalog,
+			names:   newNameDb(),
+			aliases: newNameDb(),
+			collID2Meta: map[typeutil.UniqueID]*model.Collection{
+				100: {Name: "collection", DBID: 1, State: pb.CollectionState_CollectionCreated},
+			},
+			dbName2Meta: map[string]*model.Database{
+				"testdb": {ID: 1, Name: "testdb"},
+			},
+			fileResourceRefCnt: make(map[int64]int),
+		}
+		channel.ResetStaticPChannelStatsManager()
+		channel.RecoverPChannelStatsManager([]string{})
+		meta.names.insert("testdb", "collection", 100)
+		ctx := context.Background()
+		err := meta.DropCollection(ctx, 100, 9999)
+		assert.NoError(t, err)
+		catalog.AssertCalled(t, "DeleteGrantByCollectionName", mock.Anything, mock.Anything, "testdb", "collection")
+	})
+
+	t.Run("grant cleanup best-effort on drop", func(t *testing.T) {
+		// When DeleteGrantByCollectionName fails, DropCollection should still succeed
+		catalog := mocks.NewRootCoordCatalog(t)
+		catalog.On("AlterCollection",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		).Return(nil)
+		catalog.On("DeleteGrantByCollectionName",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		).Return(errors.New("grant delete failed"))
+
+		meta := &MetaTable{
+			catalog: catalog,
+			names:   newNameDb(),
+			aliases: newNameDb(),
+			collID2Meta: map[typeutil.UniqueID]*model.Collection{
+				100: {Name: "collection", DBID: 1, State: pb.CollectionState_CollectionCreated},
+			},
+			dbName2Meta: map[string]*model.Database{
+				"default": {ID: 1, Name: "default"},
+			},
+			fileResourceRefCnt: make(map[int64]int),
+		}
+		channel.ResetStaticPChannelStatsManager()
+		channel.RecoverPChannelStatsManager([]string{})
+		meta.names.insert("default", "collection", 100)
+		ctx := context.Background()
+		err := meta.DropCollection(ctx, 100, 9999)
 		assert.NoError(t, err)
 	})
 }
@@ -1378,6 +1476,11 @@ func TestMetaTable_reload(t *testing.T) {
 					[]*model.Alias{},
 					nil)
 			},
+			func(catalog *mocks.RootCoordCatalog) {
+				catalog.On("ListFileResource",
+					mock.Anything,
+				).Return(nil, uint64(0), nil)
+			},
 		)
 		channel.ResetStaticPChannelStatsManager()
 		err := meta.reload()
@@ -1411,6 +1514,9 @@ func TestMetaTable_reload(t *testing.T) {
 		).Return(
 			[]*model.Alias{{Name: "alias", CollectionID: 100}},
 			nil)
+		catalog.On("ListFileResource",
+			mock.Anything,
+		).Return(nil, uint64(0), nil)
 
 		meta := &MetaTable{catalog: catalog}
 		channel.ResetStaticPChannelStatsManager()
@@ -1444,6 +1550,11 @@ func TestMetaTable_reload(t *testing.T) {
 				).Return(
 					[]*model.Alias{{Name: "alias", CollectionID: 100}},
 					nil)
+			},
+			func(catalog *mocks.RootCoordCatalog) {
+				catalog.On("ListFileResource",
+					mock.Anything,
+				).Return(nil, uint64(0), nil)
 			},
 		)
 
@@ -1682,6 +1793,7 @@ func TestMetaTable_RenameCollection(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
+			mock.Anything,
 		).Return(errors.New("fail"))
 
 		meta := &MetaTable{
@@ -1735,6 +1847,7 @@ func TestMetaTable_RenameCollection(t *testing.T) {
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
+			mock.Anything,
 		).Return(nil)
 		catalog.On("GetCollectionByName",
 			mock.Anything,
@@ -1773,6 +1886,7 @@ func TestMetaTable_RenameCollection(t *testing.T) {
 	t.Run("rename collection ok", func(t *testing.T) {
 		catalog := mocks.NewRootCoordCatalog(t)
 		catalog.On("AlterCollection",
+			mock.Anything,
 			mock.Anything,
 			mock.Anything,
 			mock.Anything,
@@ -1927,6 +2041,139 @@ func TestMetaTable_CreateDatabase(t *testing.T) {
 		assert.True(t, meta.aliases.exist("exist"))
 		assert.True(t, meta.names.empty("exist"))
 		assert.True(t, meta.aliases.empty("exist"))
+	})
+}
+
+func TestCreateDefaultDb(t *testing.T) {
+	hookutil.InitTestCipher()
+
+	// Save original config and restore after test
+	originalDefaultKey := paramtable.GetCipherParams().DefaultRootKey.GetValue()
+	defer func() {
+		paramtable.GetCipherParams().Save("cipherPlugin.kms.defaultKey", originalDefaultKey)
+	}()
+
+	t.Run("default db without encryption when defaultKey is empty", func(t *testing.T) {
+		paramtable.GetCipherParams().Save("cipherPlugin.kms.defaultKey", "")
+
+		catalog := mocks.NewRootCoordCatalog(t)
+		catalog.On("CreateDatabase",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil)
+
+		tsoAllocator := mocktso.NewAllocator(t)
+		tsoAllocator.On("GenerateTSO", mock.Anything).Return(uint64(100), nil)
+
+		meta := &MetaTable{
+			ctx:          context.Background(),
+			dbName2Meta:  make(map[string]*model.Database),
+			names:        newNameDb(),
+			aliases:      newNameDb(),
+			catalog:      catalog,
+			tsoAllocator: tsoAllocator,
+		}
+
+		err := meta.createDefaultDb()
+		assert.NoError(t, err)
+
+		// Verify default database was created
+		db, ok := meta.dbName2Meta[util.DefaultDBName]
+		assert.True(t, ok)
+		assert.Equal(t, util.DefaultDBName, db.Name)
+
+		// Verify no encryption properties
+		hasEncryption := hookutil.IsDBEncrypted(db.Properties)
+		assert.False(t, hasEncryption, "default DB should not be encrypted when defaultKey is empty")
+	})
+
+	t.Run("default db with encryption when defaultKey is set", func(t *testing.T) {
+		paramtable.GetCipherParams().Save("cipherPlugin.kms.defaultKey", "default-test-key")
+
+		catalog := mocks.NewRootCoordCatalog(t)
+		catalog.On("CreateDatabase",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil)
+
+		tsoAllocator := mocktso.NewAllocator(t)
+		tsoAllocator.On("GenerateTSO", mock.Anything).Return(uint64(200), nil)
+
+		meta := &MetaTable{
+			ctx:          context.Background(),
+			dbName2Meta:  make(map[string]*model.Database),
+			names:        newNameDb(),
+			aliases:      newNameDb(),
+			catalog:      catalog,
+			tsoAllocator: tsoAllocator,
+		}
+
+		err := meta.createDefaultDb()
+		assert.NoError(t, err)
+
+		// Verify default database was created
+		db, ok := meta.dbName2Meta[util.DefaultDBName]
+		assert.True(t, ok)
+		assert.Equal(t, util.DefaultDBName, db.Name)
+
+		// Verify encryption properties are present
+		hasEzID := false
+		hasRootKey := false
+		for _, prop := range db.Properties {
+			if prop.Key == common.EncryptionEzIDKey {
+				hasEzID = true
+				assert.Equal(t, prop.GetValue(), "199")
+			}
+			if prop.Key == common.EncryptionRootKeyKey && prop.Value == "default-test-key" {
+				hasRootKey = true
+			}
+		}
+		assert.True(t, hasRootKey, "default DB should have root key when encrypted")
+		assert.True(t, hasEzID, "default DB should have ezID when encrypted")
+	})
+
+	t.Run("TSO allocation failure", func(t *testing.T) {
+		tsoAllocator := mocktso.NewAllocator(t)
+		tsoAllocator.On("GenerateTSO", mock.Anything).Return(uint64(0), errors.New("TSO allocation failed"))
+
+		meta := &MetaTable{
+			ctx:          context.Background(),
+			dbName2Meta:  make(map[string]*model.Database),
+			tsoAllocator: tsoAllocator,
+		}
+
+		err := meta.createDefaultDb()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "TSO allocation failed")
+	})
+
+	t.Run("catalog CreateDatabase failure", func(t *testing.T) {
+		paramtable.GetCipherParams().Save("cipherPlugin.kms.defaultKey", "")
+
+		catalog := mocks.NewRootCoordCatalog(t)
+		catalog.On("CreateDatabase",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(errors.New("catalog error"))
+
+		tsoAllocator := mocktso.NewAllocator(t)
+		tsoAllocator.On("GenerateTSO", mock.Anything).Return(uint64(300), nil)
+
+		meta := &MetaTable{
+			ctx:          context.Background(),
+			dbName2Meta:  make(map[string]*model.Database),
+			names:        newNameDb(),
+			aliases:      newNameDb(),
+			catalog:      catalog,
+			tsoAllocator: tsoAllocator,
+		}
+
+		err := meta.createDefaultDb()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "catalog error")
 	})
 }
 
@@ -2282,4 +2529,95 @@ func TestMetaTable_PrivilegeGroup(t *testing.T) {
 	assert.Error(t, err)
 	_, err = mt.ListPrivilegeGroups(context.TODO())
 	assert.NoError(t, err)
+}
+
+func TestMetaTable_TruncateCollection(t *testing.T) {
+	channel.ResetStaticPChannelStatsManager()
+
+	kv, _ := kvfactory.GetEtcdAndPath()
+	path := funcutil.RandomString(10) + "/meta"
+	catalogKV := etcdkv.NewEtcdKV(kv, path)
+	ss, err := rootcoord.NewSuffixSnapshot(catalogKV, rootcoord.SnapshotsSep, path, rootcoord.SnapshotPrefix)
+	require.NoError(t, err)
+	catalog := rootcoord.NewCatalog(catalogKV, ss)
+
+	allocator := mocktso.NewAllocator(t)
+	allocator.EXPECT().GenerateTSO(mock.Anything).Return(1000, nil)
+
+	meta, err := NewMetaTable(context.Background(), catalog, allocator)
+	require.NoError(t, err)
+
+	err = meta.AddCollection(context.Background(), &model.Collection{
+		CollectionID:         1,
+		PhysicalChannelNames: []string{"pchannel1"},
+		VirtualChannelNames:  []string{"vchannel1"},
+		State:                pb.CollectionState_CollectionCreated,
+		DBID:                 util.DefaultDBID,
+		Properties:           common.NewKeyValuePairs(map[string]string{}),
+		ShardInfos: map[string]*model.ShardInfo{
+			"vchannel1": {
+				VChannelName:         "vchannel1",
+				PChannelName:         "pchannel1",
+				LastTruncateTimeTick: 0,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// begin truncate collection
+	err = meta.BeginTruncateCollection(context.Background(), 1)
+	require.NoError(t, err)
+	coll, err := meta.GetCollectionByID(context.Background(), util.DefaultDBName, 1, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	m := common.CloneKeyValuePairs(coll.Properties).ToMap()
+	require.Equal(t, "1", m[common.CollectionOnTruncatingKey])
+	require.Equal(t, uint64(0), coll.ShardInfos["vchannel1"].LastTruncateTimeTick)
+
+	// reload the meta
+	channel.ResetStaticPChannelStatsManager()
+	meta, err = NewMetaTable(context.Background(), catalog, allocator)
+	require.NoError(t, err)
+	coll, err = meta.GetCollectionByID(context.Background(), util.DefaultDBName, 1, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	m = common.CloneKeyValuePairs(coll.Properties).ToMap()
+	require.Equal(t, "1", m[common.CollectionOnTruncatingKey])
+	require.Equal(t, uint64(0), coll.ShardInfos["vchannel1"].LastTruncateTimeTick)
+
+	// remove the temp property
+	b := message.NewTruncateCollectionMessageBuilderV2().
+		WithHeader(&message.TruncateCollectionMessageHeader{
+			CollectionId: 1,
+		}).
+		WithBody(&message.TruncateCollectionMessageBody{}).
+		WithBroadcast(coll.VirtualChannelNames, message.OptBuildBroadcastAckSyncUp()).
+		MustBuildBroadcast()
+
+	meta.TruncateCollection(context.Background(), message.BroadcastResultTruncateCollectionMessageV2{
+		Message: message.MustAsBroadcastTruncateCollectionMessageV2(b),
+		Results: map[string]*message.AppendResult{
+			"vchannel1": {
+				TimeTick: 1000,
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	coll, err = meta.GetCollectionByID(context.Background(), util.DefaultDBName, 1, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	m = common.CloneKeyValuePairs(coll.Properties).ToMap()
+	_, ok := m[common.CollectionOnTruncatingKey]
+	require.False(t, ok)
+	require.Equal(t, uint64(1000), coll.ShardInfos["vchannel1"].LastTruncateTimeTick)
+
+	// reload the meta again
+	channel.ResetStaticPChannelStatsManager()
+	meta, err = NewMetaTable(context.Background(), catalog, allocator)
+	require.NoError(t, err)
+	coll, err = meta.GetCollectionByID(context.Background(), util.DefaultDBName, 1, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	m = common.CloneKeyValuePairs(coll.Properties).ToMap()
+	_, ok = m[common.CollectionOnTruncatingKey]
+	require.False(t, ok)
+	require.Equal(t, 1, len(coll.ShardInfos))
+	require.Equal(t, uint64(1000), coll.ShardInfos["vchannel1"].LastTruncateTimeTick)
 }

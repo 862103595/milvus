@@ -28,11 +28,14 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
+	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	memkv "github.com/milvus-io/milvus/internal/kv/mem"
 	"github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/kv"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
@@ -98,6 +101,15 @@ func newMemoryMeta(t *testing.T) (*meta, error) {
 	return newMeta(context.TODO(), catalog, nil, broker)
 }
 
+func newMetaWithEtcd(t *testing.T, rootPath string) (*meta, error) {
+	etcdCli, _ := kvfactory.GetEtcdAndPath()
+	catalogKV := etcdkv.NewEtcdKV(etcdCli, rootPath)
+	catalog := datacoord.NewCatalog(catalogKV, "", rootPath)
+	broker := broker.NewMockBroker(t)
+	broker.EXPECT().ShowCollectionIDs(mock.Anything).Return(nil, nil)
+	return newMeta(context.TODO(), catalog, nil, broker)
+}
+
 func newMockAllocator(t *testing.T) *allocator.MockAllocator {
 	counter := atomic.NewInt64(0)
 	mockAllocator := allocator.NewMockAllocator(t)
@@ -152,6 +164,10 @@ type mockMixCoord struct {
 
 func (m *mockMixCoord) GetGcStatus(context.Context) (*datapb.GetGcStatusResponse, error) {
 	return &datapb.GetGcStatusResponse{}, nil
+}
+
+func (m *mockMixCoord) BatchUpdateManifest(context.Context, *datapb.BatchUpdateManifestRequest) (*commonpb.Status, error) {
+	return merr.Success(), nil
 }
 
 func (m *mockMixCoord) DescribeDatabase(ctx context.Context, in *rootcoordpb.DescribeDatabaseRequest) (*rootcoordpb.DescribeDatabaseResponse, error) {
@@ -215,6 +231,34 @@ func (m *mockMixCoord) FlushAll(ctx context.Context, req *datapb.FlushAllRequest
 	panic("implement me")
 }
 
+func (m *mockMixCoord) ComputePhraseMatchSlop(ctx context.Context, req *querypb.ComputePhraseMatchSlopRequest) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	panic("implement me")
+}
+
+func (m *mockMixCoord) CreateExternalCollection(ctx context.Context, req *msgpb.CreateCollectionRequest) (*datapb.CreateExternalCollectionResponse, error) {
+	return &datapb.CreateExternalCollectionResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
+func (m *mockMixCoord) RefreshExternalCollection(ctx context.Context, req *datapb.RefreshExternalCollectionRequest) (*datapb.RefreshExternalCollectionResponse, error) {
+	return &datapb.RefreshExternalCollectionResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
+func (m *mockMixCoord) GetRefreshExternalCollectionProgress(ctx context.Context, req *datapb.GetRefreshExternalCollectionProgressRequest) (*datapb.GetRefreshExternalCollectionProgressResponse, error) {
+	return &datapb.GetRefreshExternalCollectionProgressResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
+func (m *mockMixCoord) ListRefreshExternalCollectionJobs(ctx context.Context, req *datapb.ListRefreshExternalCollectionJobsRequest) (*datapb.ListRefreshExternalCollectionJobsResponse, error) {
+	return &datapb.ListRefreshExternalCollectionJobsResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
 func newMockMixCoord() *mockMixCoord {
 	return &mockMixCoord{state: commonpb.StateCode_Healthy}
 }
@@ -243,6 +287,14 @@ func (m *mockMixCoord) GetComponentStates(ctx context.Context, req *milvuspb.Get
 		SubcomponentStates: []*milvuspb.ComponentInfo{},
 		Status:             merr.Success(),
 	}, nil
+}
+
+func (h *mockMixCoord) SyncQcFileResource(ctx context.Context, resources []*internalpb.FileResourceInfo, verion uint64) error {
+	return nil
+}
+
+func (m *mockMixCoord) SyncDcFileResource(ctx context.Context, resources []*internalpb.FileResourceInfo, version uint64) error {
+	return nil
 }
 
 func (m *mockMixCoord) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
@@ -320,6 +372,22 @@ func (m *mockMixCoord) AlterCollection(ctx context.Context, request *milvuspb.Al
 }
 
 func (m *mockMixCoord) AlterCollectionField(ctx context.Context, request *milvuspb.AlterCollectionFieldRequest) (*commonpb.Status, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockMixCoord) AlterCollectionSchema(ctx context.Context, request *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockMixCoord) AddCollectionFunction(ctx context.Context, request *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockMixCoord) AlterCollectionFunction(ctx context.Context, request *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockMixCoord) DropCollectionFunction(ctx context.Context, request *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error) {
 	panic("not implemented") // TODO: Implement
 }
 
@@ -474,11 +542,23 @@ func (m *mockMixCoord) GetQcMetrics(ctx context.Context, req *milvuspb.GetMetric
 	panic("not implemented") // TODO: Implement
 }
 
+func (m *mockMixCoord) GetDataCoordTopology(ctx context.Context, req *milvuspb.GetMetricsRequest) (*metricsinfo.DataCoordTopology, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockMixCoord) GetQueryCoordTopology(ctx context.Context, req *milvuspb.GetMetricsRequest) (*metricsinfo.QueryCoordTopology, error) {
+	panic("not implemented") // TODO: Implement
+}
+
 func (m *mockMixCoord) BackupRBAC(ctx context.Context, req *milvuspb.BackupRBACMetaRequest) (*milvuspb.BackupRBACMetaResponse, error) {
 	panic("not implemented") // TODO: Implement
 }
 
 func (m *mockMixCoord) RestoreRBAC(ctx context.Context, req *milvuspb.RestoreRBACMetaRequest) (*commonpb.Status, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (m *mockMixCoord) BackupEzk(ctx context.Context, req *internalpb.BackupEzkRequest) (*internalpb.BackupEzkResponse, error) {
 	panic("not implemented") // TODO: Implement
 }
 
@@ -926,7 +1006,64 @@ func (s *mockMixCoord) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzer
 	panic("implement me")
 }
 
-func (s *mockMixCoord) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*commonpb.Status, error) {
+func (s *mockMixCoord) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) TruncateCollection(ctx context.Context, req *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) DropSegmentsByTime(ctx context.Context, collectionID int64, flushTsList map[string]uint64) error {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) ManualUpdateCurrentTarget(ctx context.Context, collectionID int64) error {
+	panic("implement me")
+}
+
+// Snapshot related methods
+func (s *mockMixCoord) CreateSnapshot(ctx context.Context, req *datapb.CreateSnapshotRequest) (*commonpb.Status, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) DropSnapshot(ctx context.Context, req *datapb.DropSnapshotRequest) (*commonpb.Status, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) ListSnapshots(ctx context.Context, req *datapb.ListSnapshotsRequest) (*datapb.ListSnapshotsResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) DescribeSnapshot(ctx context.Context, req *datapb.DescribeSnapshotRequest) (*datapb.DescribeSnapshotResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) RestoreSnapshot(ctx context.Context, req *datapb.RestoreSnapshotRequest) (*datapb.RestoreSnapshotResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) GetRestoreSnapshotState(ctx context.Context, req *datapb.GetRestoreSnapshotStateRequest) (*datapb.GetRestoreSnapshotStateResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) ListRestoreSnapshotJobs(ctx context.Context, req *datapb.ListRestoreSnapshotJobsRequest) (*datapb.ListRestoreSnapshotJobsResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) ClientHeartbeat(ctx context.Context, req *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) DeleteClientCommand(ctx context.Context, req *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) GetClientTelemetry(ctx context.Context, req *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error) {
+	panic("implement me")
+}
+
+func (s *mockMixCoord) PushClientCommand(ctx context.Context, req *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error) {
 	panic("implement me")
 }
 
@@ -973,6 +1110,19 @@ func (h *mockHandler) GetCurrentSegmentsView(ctx context.Context, channel RWChan
 }
 
 func (h *mockHandler) ListLoadedSegments(ctx context.Context) ([]int64, error) {
+	return nil, nil
+}
+
+func (h *mockHandler) GenSnapshot(ctx context.Context, collectionID UniqueID) (*SnapshotData, error) {
+	return &SnapshotData{
+		SnapshotInfo: &datapb.SnapshotInfo{
+			Name:         "test_snapshot",
+			CollectionId: collectionID,
+		},
+	}, nil
+}
+
+func (h *mockHandler) GetDeltaLogFromCompactTo(ctx context.Context, segmentID UniqueID) ([]*datapb.FieldBinlog, error) {
 	return nil, nil
 }
 

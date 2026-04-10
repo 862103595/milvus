@@ -21,9 +21,11 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/client/v2/entity"
 )
 
@@ -213,6 +215,97 @@ func (s *ScalarSuite) TestBasic() {
 			s.Equal(entity.FieldTypeVarChar, column.Type())
 		}
 	})
+
+	s.Run("column_mol", func() {
+		name := fmt.Sprintf("field_%d", rand.Intn(1000))
+		data := []string{"CCO", "c1ccccc1"}
+		column := NewColumnMolSmiles(name, data)
+		s.Equal(entity.FieldTypeMol, column.Type())
+		s.Equal(name, column.Name())
+		s.Equal(data, column.Data())
+
+		fd := column.FieldData()
+		s.Equal(name, fd.GetFieldName())
+		s.Equal(data, fd.GetScalars().GetMolSmilesData().GetData())
+
+		result, err := FieldDataColumn(fd, 0, -1)
+		s.NoError(err)
+		parsed, ok := result.(*ColumnMolSmiles)
+		if s.True(ok) {
+			s.Equal(name, parsed.Name())
+			s.Equal(data, parsed.Data())
+			s.Equal(entity.FieldTypeMol, parsed.Type())
+		}
+
+		fd = &schemapb.FieldData{
+			Type:      schemapb.DataType_Mol,
+			FieldName: name,
+			Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
+				Data: &schemapb.ScalarField_MolData{MolData: &schemapb.MolArray{Data: [][]byte{[]byte("CCO"), []byte("c1ccccc1")}}},
+			}},
+		}
+		result, err = FieldDataColumn(fd, 0, -1)
+		s.NoError(err)
+		parsed, ok = result.(*ColumnMolSmiles)
+		if s.True(ok) {
+			s.Equal(data, parsed.Data())
+		}
+	})
+
+	s.Run("column_timestamptz", func() {
+		name := fmt.Sprintf("field_%d", rand.Intn(1000))
+		now := time.Now().UTC()
+		data := []time.Time{now, now.Add(time.Hour), now.Add(2 * time.Hour)}
+		column := NewColumnTimestamptz(name, data)
+		s.Equal(entity.FieldTypeTimestamptz, column.Type())
+		s.Equal(name, column.Name())
+		// verify data is converted to RFC3339Nano format
+		expectedStrings := []string{
+			data[0].Format(time.RFC3339Nano),
+			data[1].Format(time.RFC3339Nano),
+			data[2].Format(time.RFC3339Nano),
+		}
+		s.Equal(expectedStrings, column.Data())
+
+		fd := column.FieldData()
+		s.Equal(name, fd.GetFieldName())
+		s.Equal(expectedStrings, fd.GetScalars().GetStringData().GetData())
+
+		result, err := FieldDataColumn(fd, 0, -1)
+		s.NoError(err)
+		parsed, ok := result.(*ColumnTimestampTzIsoString)
+		if s.True(ok) {
+			s.Equal(name, parsed.Name())
+			s.Equal(expectedStrings, parsed.Data())
+			s.Equal(entity.FieldTypeTimestamptz, parsed.Type())
+		}
+	})
+
+	s.Run("column_timestamptz_iso_string", func() {
+		name := fmt.Sprintf("field_%d", rand.Intn(1000))
+		data := []string{
+			"2024-01-01T00:00:00Z",
+			"2024-06-15T12:30:45.123456789Z",
+			"2024-12-31T23:59:59.999999999+08:00",
+		}
+		column := NewColumnTimestamptzIsoString(name, data)
+		s.Equal(entity.FieldTypeTimestamptz, column.Type())
+		s.Equal(name, column.Name())
+		s.Equal(data, column.Data())
+
+		fd := column.FieldData()
+		s.Equal(name, fd.GetFieldName())
+		s.Equal(data, fd.GetScalars().GetStringData().GetData())
+
+		result, err := FieldDataColumn(fd, 0, -1)
+		s.NoError(err)
+		parsed, ok := result.(*ColumnTimestampTzIsoString)
+		if s.True(ok) {
+			s.Equal(name, parsed.Name())
+			s.Equal(data, parsed.Data())
+			s.Equal(entity.FieldTypeTimestamptz, parsed.Type())
+		}
+	})
 }
 
 func (s *ScalarSuite) TestSlice() {
@@ -347,6 +440,42 @@ func (s *ScalarSuite) TestSlice() {
 		l := rand.Intn(n)
 		sliced := column.Slice(0, l)
 		slicedColumn, ok := sliced.(*ColumnVarChar)
+		if s.True(ok) {
+			s.Equal(column.Type(), slicedColumn.Type())
+			s.Equal(data[:l], slicedColumn.Data())
+		}
+	})
+
+	s.Run("column_timestamptz", func() {
+		name := fmt.Sprintf("field_%d", rand.Intn(1000))
+		now := time.Now().UTC()
+		timeData := make([]time.Time, 0, n)
+		for i := 0; i < n; i++ {
+			timeData = append(timeData, now.Add(time.Duration(i)*time.Hour))
+		}
+		column := NewColumnTimestamptz(name, timeData)
+		data := column.Data()
+
+		l := rand.Intn(n)
+		sliced := column.Slice(0, l)
+		slicedColumn, ok := sliced.(*ColumnTimestamptz)
+		if s.True(ok) {
+			s.Equal(column.Type(), slicedColumn.Type())
+			s.Equal(data[:l], slicedColumn.Data())
+		}
+	})
+
+	s.Run("column_timestamptz_iso_string", func() {
+		name := fmt.Sprintf("field_%d", rand.Intn(1000))
+		data := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			data = append(data, fmt.Sprintf("2024-01-%02dT00:00:00Z", (i%28)+1))
+		}
+		column := NewColumnTimestamptzIsoString(name, data)
+
+		l := rand.Intn(n)
+		sliced := column.Slice(0, l)
+		slicedColumn, ok := sliced.(*ColumnTimestampTzIsoString)
 		if s.True(ok) {
 			s.Equal(column.Type(), slicedColumn.Type())
 			s.Equal(data[:l], slicedColumn.Data())

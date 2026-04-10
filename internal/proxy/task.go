@@ -37,11 +37,11 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -64,6 +64,7 @@ const (
 	StrictCastKey        = "strict_cast"
 	RankGroupScorer      = "rank_group_scorer"
 	AnnsFieldKey         = "anns_field"
+	AnalyzerKey          = "analyzer_name"
 	TopKKey              = "topk"
 	NQKey                = "nq"
 	MetricTypeKey        = common.MetricTypeKey
@@ -79,10 +80,14 @@ const (
 	SearchIterBatchSizeKey = "search_iter_batch_size"
 	SearchIterLastBoundKey = "search_iter_last_bound"
 	SearchIterIdKey        = "search_iter_id"
+	QueryGroupByFieldsKey  = "group_by_fields"
+	OrderByFieldsKey       = "order_by_fields"
+	PipelineTraceKey       = "pipeline_trace"
 
 	InsertTaskName                = "InsertTask"
 	CreateCollectionTaskName      = "CreateCollectionTask"
 	DropCollectionTaskName        = "DropCollectionTask"
+	TruncateCollectionTaskName    = "TruncateCollectionTask"
 	HasCollectionTaskName         = "HasCollectionTask"
 	DescribeCollectionTaskName    = "DescribeCollectionTask"
 	ShowCollectionTaskName        = "ShowCollectionTask"
@@ -104,6 +109,9 @@ const (
 	ListAliasesTaskName           = "ListAliasesTask"
 	AlterCollectionTaskName       = "AlterCollectionTask"
 	AlterCollectionFieldTaskName  = "AlterCollectionFieldTask"
+	AddCollectionFunctionTask     = "AddCollectionFunctionTask"
+	AlterCollectionFunctionTask   = "AlterCollectionFunctionTask"
+	DropCollectionFunctionTask    = "DropCollectionFunctionTask"
 	UpsertTaskName                = "UpsertTask"
 	CreateResourceGroupTaskName   = "CreateResourceGroupTask"
 	UpdateResourceGroupsTaskName  = "UpdateResourceGroupsTask"
@@ -113,6 +121,7 @@ const (
 	ListResourceGroupsTaskName    = "ListResourceGroupsTask"
 	DescribeResourceGroupTaskName = "DescribeResourceGroupTask"
 	RunAnalyzerTaskName           = "RunAnalyzer"
+	HighlightTaskName             = "Highlight"
 
 	CreateDatabaseTaskName   = "CreateCollectionTask"
 	DropDatabaseTaskName     = "DropDatabaseTaskName"
@@ -319,6 +328,10 @@ func (t *createCollectionTask) validateClusteringKey(ctx context.Context) error 
 	idx := -1
 	for i, field := range t.schema.Fields {
 		if field.GetIsClusteringKey() {
+			if !typeutil.IsClusteringKeyType(field.GetDataType()) {
+				return merr.WrapErrCollectionIllegalSchema(t.CollectionName,
+					fmt.Sprintf("clustering key field %s has unsupported data type %s", field.Name, field.GetDataType().String()))
+			}
 			if typeutil.IsVectorType(field.GetDataType()) &&
 				!paramtable.Get().CommonCfg.EnableVectorClusteringKey.GetAsBool() {
 				return merr.WrapErrCollectionVectorClusteringKeyNotAllowed(t.CollectionName)
@@ -348,6 +361,57 @@ func (t *createCollectionTask) validateClusteringKey(ctx context.Context) error 
 	return nil
 }
 
+func validateCollectionTTL(props []*commonpb.KeyValuePair) (bool, error) {
+	for _, pair := range props {
+		if pair.Key == common.CollectionTTLConfigKey {
+			val, err := strconv.Atoi(pair.Value)
+			if err != nil {
+				return true, merr.WrapErrParameterInvalidMsg("collection TTL is not a valid positive integer")
+			}
+			if val < -1 || val > common.MaxTTLSeconds {
+				return true, merr.WrapErrParameterInvalidMsg("collection TTL is out of range, expect [-1, 3155760000], got %d", val)
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func validateTTLField(props []*commonpb.KeyValuePair, fields []*schemapb.FieldSchema) (bool, error) {
+	for _, pair := range props {
+		if pair.Key == common.CollectionTTLFieldKey {
+			fieldName := pair.Value
+			for _, field := range fields {
+				if field.Name == fieldName {
+					if field.DataType != schemapb.DataType_Timestamptz {
+						return true, merr.WrapErrParameterInvalidMsg("ttl field must be timestamptz, field name = %s", fieldName)
+					}
+					return true, nil
+				}
+			}
+			return true, merr.WrapErrParameterInvalidMsg("ttl field name %s not found in schema", fieldName)
+		}
+	}
+	return false, nil
+}
+
+func (t *createCollectionTask) validateTTL() error {
+	hasCollectionTTL, err := validateCollectionTTL(t.GetProperties())
+	if err != nil {
+		return err
+	}
+
+	hasTTLField, err := validateTTLField(t.GetProperties(), t.schema.Fields)
+	if err != nil {
+		return err
+	}
+
+	if hasCollectionTTL && hasTTLField {
+		return merr.WrapErrParameterInvalidMsg("collection TTL and ttl field cannot be set at the same time")
+	}
+	return nil
+}
+
 func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 	t.Base.MsgType = commonpb.MsgType_CreateCollection
 	t.Base.SourceID = paramtable.GetNodeID()
@@ -358,9 +422,25 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 	t.schema.AutoID = false
+	t.schema.DbName = t.GetDbName()
 
-	if err := validateFunction(t.schema); err != nil {
+	isExternalCollection := typeutil.IsExternalCollection(t.schema)
+	if err := typeutil.ValidateExternalCollectionSchema(t.schema); err != nil {
 		return err
+	}
+
+	disableCheck, err := common.IsDisableFuncRuntimeCheck(t.GetProperties()...)
+	if err != nil {
+		return err
+	}
+	if err := validateFunction(t.schema, "", disableCheck); err != nil {
+		return err
+	}
+
+	// External collections must be single-shard: the refresh mechanism assigns all
+	// segments to VChannelNames[0], so multiple shards would leave segments orphaned.
+	if isExternalCollection && t.ShardsNum > 1 {
+		return fmt.Errorf("external collection does not support multiple shards, got ShardsNum=%d", t.ShardsNum)
 	}
 
 	if t.ShardsNum > Params.ProxyCfg.MaxShardNum.GetAsInt32() {
@@ -384,6 +464,13 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 	// validate collection name
 	if err := validateCollectionName(t.schema.Name); err != nil {
 		return err
+	}
+
+	// For external collections, inject virtual PK field if no PK exists
+	if isExternalCollection {
+		if err := injectVirtualPKForExternalCollection(t.schema); err != nil {
+			return err
+		}
 	}
 
 	// validate primary key definition
@@ -416,10 +503,35 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
+	// validate query mode
+	if err := common.ValidateQueryMode(t.GetProperties()...); err != nil {
+		return err
+	}
+
 	// Validate timezone
 	tz, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, t.GetProperties())
-	if exist && !funcutil.IsTimezoneValid(tz) {
+	if exist && !timestamptz.IsTimezoneValid(tz) {
 		return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", tz)
+	}
+
+	// Validate collection ttl
+	_, err = common.GetCollectionTTL(t.GetProperties())
+	if err != nil {
+		return merr.WrapErrParameterInvalidMsg("collection ttl property value not valid, parse error: %s", err.Error())
+	}
+
+	// Validate warmup policy for all warmup keys
+	if hasWarmupProp(t.GetProperties()...) {
+		for _, prop := range t.GetProperties() {
+			if common.IsFieldWarmupKey(prop.GetKey()) {
+				return merr.WrapErrParameterInvalidMsg("warmup key '%s' is only allowed at field level, use warmup.scalarField/warmup.scalarIndex/warmup.vectorField/warmup.vectorIndex at collection level", prop.GetKey())
+			}
+			if common.IsCollectionWarmupKey(prop.GetKey()) {
+				if err := common.ValidateWarmupPolicy(prop.GetValue()); err != nil {
+					return merr.WrapErrParameterInvalidMsg("invalid warmup value for key %s: %s", prop.GetKey(), err.Error())
+				}
+			}
+		}
 	}
 
 	// validate clustering key
@@ -456,6 +568,10 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 	}
 
 	if err := validateLoadFieldsList(t.schema); err != nil {
+		return err
+	}
+
+	if err := t.validateTTL(); err != nil {
 		return err
 	}
 
@@ -532,6 +648,7 @@ func (t *addCollectionFieldTask) PreExecute(ctx context.Context) error {
 	if t.oldSchema == nil {
 		return merr.WrapErrParameterInvalidMsg("empty old schema in add field task")
 	}
+
 	t.fieldSchema = &schemapb.FieldSchema{}
 	err := proto.Unmarshal(t.GetSchema(), t.fieldSchema)
 	if err != nil {
@@ -547,13 +664,17 @@ func (t *addCollectionFieldTask) PreExecute(ctx context.Context) error {
 		return merr.WrapErrParameterInvalidMsg(msg)
 	}
 
+	if typeutil.IsVectorType(t.fieldSchema.DataType) {
+		vectorFields := len(typeutil.GetVectorFieldSchemas(t.oldSchema))
+		if vectorFields >= Params.ProxyCfg.MaxVectorFieldNum.GetAsInt() {
+			return fmt.Errorf("maximum vector field's number should be limited to %d", Params.ProxyCfg.MaxVectorFieldNum.GetAsInt())
+		}
+	}
+
 	if _, ok := schemapb.DataType_name[int32(t.fieldSchema.DataType)]; !ok || t.fieldSchema.GetDataType() == schemapb.DataType_None {
 		return merr.WrapErrParameterInvalid("valid field", fmt.Sprintf("field data type: %s is not supported", t.fieldSchema.GetDataType()))
 	}
 
-	if typeutil.IsVectorType(t.fieldSchema.DataType) {
-		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("not support to add vector field, field name = %s", t.fieldSchema.Name))
-	}
 	if funcutil.SliceContain([]string{common.RowIDFieldName, common.TimeStampFieldName, common.MetaFieldName, common.NamespaceFieldName}, t.fieldSchema.GetName()) {
 		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("not support to add system field, field name = %s", t.fieldSchema.Name))
 	}
@@ -563,6 +684,17 @@ func (t *addCollectionFieldTask) PreExecute(ctx context.Context) error {
 	if !t.fieldSchema.Nullable {
 		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("added field must be nullable, please check it, field name = %s", t.fieldSchema.Name))
 	}
+	if typeutil.IsVectorType(t.fieldSchema.DataType) && t.fieldSchema.Nullable {
+		if t.fieldSchema.DataType == schemapb.DataType_FloatVector ||
+			t.fieldSchema.DataType == schemapb.DataType_Float16Vector ||
+			t.fieldSchema.DataType == schemapb.DataType_BFloat16Vector ||
+			t.fieldSchema.DataType == schemapb.DataType_BinaryVector ||
+			t.fieldSchema.DataType == schemapb.DataType_Int8Vector {
+			if len(t.fieldSchema.TypeParams) == 0 {
+				return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("vector field must have dimension specified, field name = %s", t.fieldSchema.Name))
+			}
+		}
+	}
 	if t.fieldSchema.AutoID {
 		return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("only primary field can speficy AutoID with true, field name = %s", t.fieldSchema.Name))
 	}
@@ -570,6 +702,11 @@ func (t *addCollectionFieldTask) PreExecute(ctx context.Context) error {
 		return merr.WrapErrParameterInvalidMsg("not support to add partition key field, field name  = %s", t.fieldSchema.Name)
 	}
 	if t.fieldSchema.GetIsClusteringKey() {
+		if !typeutil.IsClusteringKeyType(t.fieldSchema.GetDataType()) {
+			return merr.WrapErrParameterInvalidMsg(
+				fmt.Sprintf("clustering key field %s has unsupported data type %s",
+					t.fieldSchema.GetName(), t.fieldSchema.GetDataType().String()))
+		}
 		for _, f := range t.oldSchema.Fields {
 			if f.GetIsClusteringKey() {
 				return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("already has another clutering key field, field name: %s", t.fieldSchema.GetName()))
@@ -652,6 +789,16 @@ func (t *dropCollectionTask) PreExecute(ctx context.Context) error {
 	// No need to check collection name
 	// Validation shall be preformed in `CreateCollection`
 	// also permit drop collection one with bad collection name
+	_, err := globalMetaCache.GetCollectionID(ctx, t.DropCollectionRequest.GetDbName(), t.GetCollectionName())
+	if err != nil {
+		if errors.Is(err, merr.ErrCollectionNotFound) || errors.Is(err, merr.ErrDatabaseNotFound) {
+			// make dropping collection idempotent.
+			log.Ctx(ctx).Warn("drop non-existent collection", zap.String("collection", t.DropCollectionRequest.GetCollectionName()), zap.String("database", t.DropCollectionRequest.GetDbName()))
+			return nil
+		}
+		return err
+	}
+
 	return nil
 }
 
@@ -662,6 +809,71 @@ func (t *dropCollectionTask) Execute(ctx context.Context) error {
 }
 
 func (t *dropCollectionTask) PostExecute(ctx context.Context) error {
+	return nil
+}
+
+type truncateCollectionTask struct {
+	baseTask
+	Condition
+	*milvuspb.TruncateCollectionRequest
+	ctx      context.Context
+	mixCoord types.MixCoordClient
+	result   *milvuspb.TruncateCollectionResponse
+	chMgr    channelsMgr
+}
+
+func (t *truncateCollectionTask) TraceCtx() context.Context {
+	return t.ctx
+}
+
+func (t *truncateCollectionTask) ID() UniqueID {
+	return t.Base.MsgID
+}
+
+func (t *truncateCollectionTask) SetID(uid UniqueID) {
+	t.Base.MsgID = uid
+}
+
+func (t *truncateCollectionTask) Name() string {
+	return TruncateCollectionTaskName
+}
+
+func (t *truncateCollectionTask) Type() commonpb.MsgType {
+	return t.Base.MsgType
+}
+
+func (t *truncateCollectionTask) BeginTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *truncateCollectionTask) EndTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *truncateCollectionTask) SetTs(ts Timestamp) {
+	t.Base.Timestamp = ts
+}
+
+func (t *truncateCollectionTask) OnEnqueue() error {
+	if t.Base == nil {
+		t.Base = commonpbutil.NewMsgBase()
+	}
+	t.Base.MsgType = commonpb.MsgType_TruncateCollection
+	t.Base.SourceID = paramtable.GetNodeID()
+	return nil
+}
+
+func (t *truncateCollectionTask) PreExecute(ctx context.Context) error {
+	return validateCollectionName(t.CollectionName)
+}
+
+func (t *truncateCollectionTask) Execute(ctx context.Context) error {
+	var err error
+	t.result, err = t.mixCoord.TruncateCollection(ctx, t.TruncateCollectionRequest)
+	return merr.CheckRPCCall(t.result, err)
+}
+
+func (t *truncateCollectionTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 
@@ -844,6 +1056,9 @@ func (t *describeCollectionTask) Execute(ctx context.Context) error {
 	t.result.Schema.Description = result.Schema.Description
 	t.result.Schema.AutoID = result.Schema.AutoID
 	t.result.Schema.EnableDynamicField = result.Schema.EnableDynamicField
+	t.result.Schema.ExternalSource = result.Schema.ExternalSource
+	t.result.Schema.ExternalSpec = result.Schema.ExternalSpec
+	t.result.Schema.EnableNamespace = result.Schema.EnableNamespace
 	t.result.CollectionID = result.CollectionID
 	t.result.VirtualChannelNames = result.VirtualChannelNames
 	t.result.PhysicalChannelNames = result.PhysicalChannelNames
@@ -854,6 +1069,7 @@ func (t *describeCollectionTask) Execute(ctx context.Context) error {
 	t.result.Aliases = result.Aliases
 	t.result.Properties = result.Properties
 	t.result.DbName = result.GetDbName()
+	t.result.DbId = result.GetDbId()
 	t.result.NumPartitions = result.NumPartitions
 	t.result.UpdateTimestamp = result.UpdateTimestamp
 	t.result.UpdateTimestampStr = result.UpdateTimestampStr
@@ -874,11 +1090,12 @@ func (t *describeCollectionTask) Execute(ctx context.Context) error {
 			ElementType:      field.ElementType,
 			Nullable:         field.Nullable,
 			IsFunctionOutput: field.IsFunctionOutput,
+			ExternalField:    field.GetExternalField(),
 		}
 	}
 
 	for _, field := range result.Schema.Fields {
-		if field.IsDynamic {
+		if field.IsDynamic || field.Name == common.NamespaceFieldName {
 			continue
 		}
 		if field.FieldID >= common.StartOfUserFieldID {
@@ -1126,9 +1343,27 @@ func hasMmapProp(props ...*commonpb.KeyValuePair) bool {
 	return false
 }
 
-func hasLazyLoadProp(props ...*commonpb.KeyValuePair) bool {
+func hasTTLProp(props ...*commonpb.KeyValuePair) bool {
 	for _, p := range props {
-		if p.GetKey() == common.LazyLoadEnableKey {
+		if p.GetKey() == common.CollectionTTLConfigKey {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTTLFieldProp(props ...*commonpb.KeyValuePair) bool {
+	for _, p := range props {
+		if p.GetKey() == common.CollectionTTLFieldKey {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWarmupProp(props ...*commonpb.KeyValuePair) bool {
+	for _, p := range props {
+		if common.IsWarmupKey(p.GetKey()) {
 			return true
 		}
 	}
@@ -1137,11 +1372,99 @@ func hasLazyLoadProp(props ...*commonpb.KeyValuePair) bool {
 
 func hasPropInDeletekeys(keys []string) string {
 	for _, key := range keys {
-		if key == common.MmapEnabledKey || key == common.LazyLoadEnableKey {
+		if key == common.MmapEnabledKey || common.IsWarmupKey(key) {
 			return key
 		}
 	}
 	return ""
+}
+
+// checkVectorIndexExist checks if the collection has any vector index.
+// Returns the vector field name that has an index, or empty string if none.
+func checkVectorIndexExist(ctx context.Context, dbName, collectionName string, collectionID int64, mixCoord types.MixCoordClient) (string, error) {
+	collSchema, err := globalMetaCache.GetCollectionSchema(ctx, dbName, collectionName)
+	if err != nil {
+		return "", err
+	}
+
+	indexResponse, err := mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
+		CollectionID: collectionID,
+		IndexName:    "",
+	})
+	if err = merr.CheckRPCCall(indexResponse, err); err != nil && !errors.Is(err, merr.ErrIndexNotFound) {
+		return "", merr.WrapErrServiceInternal("describe index failed", err.Error())
+	}
+	for _, index := range indexResponse.IndexInfos {
+		for _, field := range collSchema.Fields {
+			if index.FieldID == field.FieldID && typeutil.IsVectorType(field.DataType) {
+				return field.GetName(), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// detectBoolPropChange detects whether a boolean collection property is being
+// changed via Properties or DeleteKeys. parseFn validates and parses the new
+// value when the key is found in Properties.
+// only one of properties or deleteKeys should be provided
+func detectBoolPropChange(
+	oldValue bool,
+	propKey string,
+	properties []*commonpb.KeyValuePair,
+	deleteKeys []string,
+	parseFn func() (bool, error),
+) (newValue bool, changed bool, err error) {
+	// this is duplicated with the check in alterCollectionTask PreExecute
+	if len(properties) > 0 && len(deleteKeys) > 0 {
+		return false, false, merr.WrapErrParameterInvalidMsg("cannot provide both DeleteKeys and ExtraParams")
+	}
+	newValue = oldValue
+	if _, ok := funcutil.TryGetAttrByKeyFromRepeatedKV(propKey, properties); ok {
+		newValue, err = parseFn()
+		if err != nil {
+			return false, false, err
+		}
+		changed = oldValue != newValue
+	}
+	for _, key := range deleteKeys {
+		if key == propKey {
+			newValue = false
+			changed = oldValue != newValue
+			break
+		}
+	}
+	return newValue, changed, nil
+}
+
+// detectQueryModeChange detects whether the query_mode collection property is
+// being changed via Properties or DeleteKeys. Returns the new query mode string
+// (empty string means no query mode) and whether it changed.
+func detectQueryModeChange(
+	oldQueryMode string,
+	properties []*commonpb.KeyValuePair,
+	deleteKeys []string,
+) (newQueryMode string, changed bool, err error) {
+	// this is duplicated with the check in alterCollectionTask PreExecute
+	if len(properties) > 0 && len(deleteKeys) > 0 {
+		return "", false, merr.WrapErrParameterInvalidMsg("cannot provide both DeleteKeys and ExtraParams")
+	}
+	newQueryMode = oldQueryMode
+	if common.IsQueryModeKeyExists(properties...) {
+		if err := common.ValidateQueryMode(properties...); err != nil {
+			return "", false, err
+		}
+		newQueryMode = common.GetQueryMode(properties...)
+		changed = oldQueryMode != newQueryMode
+	}
+	for _, key := range deleteKeys {
+		if key == common.QueryModeKey {
+			newQueryMode = ""
+			changed = oldQueryMode != newQueryMode
+			break
+		}
+	}
+	return newQueryMode, changed, nil
 }
 
 func validatePartitionKeyIsolation(ctx context.Context, colName string, isPartitionKeyEnabled bool, props ...*commonpb.KeyValuePair) (bool, error) {
@@ -1187,13 +1510,21 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 	t.CollectionID = collectionID
 
 	if len(t.GetProperties()) > 0 {
-		if hasMmapProp(t.Properties...) || hasLazyLoadProp(t.Properties...) {
+		hasMmap := hasMmapProp(t.Properties...)
+		hasWarmup := hasWarmupProp(t.Properties...)
+		if hasMmap || hasWarmup {
 			loaded, err := isCollectionLoaded(ctx, t.mixCoord, t.CollectionID)
 			if err != nil {
 				return err
 			}
 			if loaded {
-				return merr.WrapErrCollectionLoaded(t.CollectionName, "can not alter mmap properties if collection loaded")
+				// keeping the original error msg here for compatibility
+				if hasMmap {
+					return merr.WrapErrCollectionLoaded(t.CollectionName, "can not alter mmap properties if collection loaded")
+				}
+				if hasWarmup {
+					return merr.WrapErrCollectionLoaded(t.CollectionName, "can not alter warmup properties if collection loaded")
+				}
 			}
 		}
 
@@ -1209,8 +1540,40 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 		}
 		// Check the validation of timezone
 		userDefinedTimezone, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, t.Properties)
-		if exist && !funcutil.IsTimezoneValid(userDefinedTimezone) {
+		if exist && !timestamptz.IsTimezoneValid(userDefinedTimezone) {
 			return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", userDefinedTimezone)
+		}
+
+		hasTTL, err := validateCollectionTTL(t.GetProperties())
+		if err != nil {
+			return err
+		}
+		hasTTLField, err := validateTTLField(t.GetProperties(), collSchema.GetFields())
+		if err != nil {
+			return err
+		}
+		if hasTTL && hasTTLField {
+			return merr.WrapErrParameterInvalidMsg("collection TTL and ttl field cannot be set at the same time")
+		}
+		if hasTTL && hasTTLFieldProp(collSchema.GetProperties()...) {
+			return merr.WrapErrParameterInvalidMsg("ttl field is already exists, cannot be set collection TTL")
+		}
+		if hasTTLField && hasTTLProp(collSchema.GetProperties()...) {
+			return merr.WrapErrParameterInvalidMsg("collection TTL is already set, cannot be set ttl field")
+		}
+
+		// Validate warmup policy for all warmup keys
+		if hasWarmupProp(t.Properties...) {
+			for _, prop := range t.Properties {
+				if common.IsFieldWarmupKey(prop.GetKey()) {
+					return merr.WrapErrParameterInvalidMsg("warmup key '%s' is only allowed at field level, use warmup.scalarField/warmup.scalarIndex/warmup.vectorField/warmup.vectorIndex at collection level", prop.GetKey())
+				}
+				if common.IsCollectionWarmupKey(prop.GetKey()) {
+					if err := common.ValidateWarmupPolicy(prop.GetValue()); err != nil {
+						return merr.WrapErrParameterInvalidMsg("invalid warmup value for key %s: %s", prop.GetKey(), err.Error())
+					}
+				}
+			}
 		}
 	} else if len(t.GetDeleteKeys()) > 0 {
 		key := hasPropInDeletekeys(t.DeleteKeys)
@@ -1220,7 +1583,10 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 				return err
 			}
 			if loaded {
-				return merr.WrapErrCollectionLoaded(t.CollectionName, "can not delete mmap properties if collection loaded")
+				if key == common.MmapEnabledKey {
+					return merr.WrapErrCollectionLoaded(t.CollectionName, "can not delete mmap properties if collection loaded")
+				}
+				return merr.WrapErrCollectionLoaded(t.CollectionName, "can not delete %s properties if collection loaded", key)
 			}
 		}
 	}
@@ -1229,77 +1595,53 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// check if the new partition key isolation is valid to use
-	newIsoValue, err := validatePartitionKeyIsolation(ctx, t.CollectionName, isPartitionKeyMode, t.Properties...)
-	if err != nil {
-		return err
-	}
 	collBasicInfo, err := globalMetaCache.GetCollectionInfo(t.ctx, t.GetDbName(), t.CollectionName, t.CollectionID)
 	if err != nil {
 		return err
 	}
-	oldIsoValue := collBasicInfo.partitionKeyIsolation
+	newIsoValue, isoChanged, err := detectBoolPropChange(
+		collBasicInfo.partitionKeyIsolation, common.PartitionKeyIsolationKey,
+		t.Properties, t.GetDeleteKeys(),
+		func() (bool, error) {
+			return validatePartitionKeyIsolation(ctx, t.CollectionName, isPartitionKeyMode, t.Properties...)
+		},
+	)
+	if err != nil {
+		return err
+	}
 
-	log.Ctx(ctx).Info("alter collection pre check with partition key isolation",
+	newQueryMode, queryModeChanged, err := detectQueryModeChange(
+		collBasicInfo.queryMode,
+		t.Properties, t.GetDeleteKeys(),
+	)
+	if err != nil {
+		return err
+	}
+
+	log.Ctx(ctx).Info("alter collection pre check with partition key isolation/query mode",
 		zap.String("collectionName", t.CollectionName),
 		zap.Bool("isPartitionKeyMode", isPartitionKeyMode),
 		zap.Bool("newIsoValue", newIsoValue),
-		zap.Bool("oldIsoValue", oldIsoValue))
+		zap.Bool("oldIsoValue", collBasicInfo.partitionKeyIsolation),
+		zap.String("newQueryMode", newQueryMode),
+		zap.String("oldQueryMode", collBasicInfo.queryMode))
 
-	// if the isolation flag in properties is not set, meta cache will assign partitionKeyIsolation in collection info to false
-	//   - None|false -> false, skip
-	//   - None|false -> true, check if the collection has vector index
-	//   - true -> false, check if the collection has vector index
-	//   - false -> true, check if the collection has vector index
-	//   - true -> true, skip
-	if oldIsoValue != newIsoValue {
-		collSchema, err := globalMetaCache.GetCollectionSchema(ctx, t.GetDbName(), t.CollectionName)
-		if err != nil {
+	// If partition key isolation or query_mode changed, check for existing vector index.
+	// Changing these properties requires dropping the vector index first.
+	if isoChanged || queryModeChanged {
+		if vecField, err := checkVectorIndexExist(ctx, t.GetDbName(), t.CollectionName, t.CollectionID, t.mixCoord); err != nil {
 			return err
-		}
-
-		hasVecIndex := false
-		indexName := ""
-		indexResponse, err := t.mixCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
-			CollectionID: t.CollectionID,
-			IndexName:    "",
-		})
-		if err != nil {
-			return merr.WrapErrServiceInternal("describe index failed", err.Error())
-		}
-		for _, index := range indexResponse.IndexInfos {
-			for _, field := range collSchema.Fields {
-				if index.FieldID == field.FieldID && typeutil.IsVectorType(field.DataType) {
-					hasVecIndex = true
-					indexName = field.GetName()
-				}
+		} else if vecField != "" {
+			if isoChanged {
+				return merr.WrapErrIndexDuplicate(vecField,
+					"can not alter partition key isolation mode if the collection already has a vector index. Please drop the index first")
+			}
+			if queryModeChanged {
+				return merr.WrapErrIndexDuplicate(vecField,
+					"can not alter "+common.QueryModeKey+" if the collection already has a vector index. Please drop the index first")
 			}
 		}
-		if hasVecIndex {
-			return merr.WrapErrIndexDuplicate(indexName,
-				"can not alter partition key isolation mode if the collection already has a vector index. Please drop the index first")
-		}
 	}
-
-	_, ok := common.IsReplicateEnabled(t.Properties)
-	if ok {
-		return merr.WrapErrParameterInvalidMsg("can't set the replicate.id property")
-	}
-	endTS, ok := common.GetReplicateEndTS(t.Properties)
-	if ok && collBasicInfo.replicateID != "" {
-		allocResp, err := t.mixCoord.AllocTimestamp(ctx, &rootcoordpb.AllocTimestampRequest{
-			Count:          1,
-			BlockTimestamp: endTS,
-		})
-		if err = merr.CheckRPCCall(allocResp, err); err != nil {
-			return merr.WrapErrServiceInternal("alloc timestamp failed", err.Error())
-		}
-		if allocResp.GetTimestamp() <= endTS {
-			return merr.WrapErrServiceInternal("alter collection: alloc timestamp failed, timestamp is not greater than endTS",
-				fmt.Sprintf("timestamp = %d, endTS = %d", allocResp.GetTimestamp(), endTS))
-		}
-	}
-
 	return nil
 }
 
@@ -1374,10 +1716,21 @@ var allowedAlterProps = []string{
 	common.MaxLengthKey,
 	common.MmapEnabledKey,
 	common.MaxCapacityKey,
+	common.FieldDescriptionKey,
+	common.WarmupKey,
+	common.WarmupScalarFieldKey,
+	common.WarmupScalarIndexKey,
+	common.WarmupVectorFieldKey,
+	common.WarmupVectorIndexKey,
 }
 
 var allowedDropProps = []string{
 	common.MmapEnabledKey,
+	common.WarmupKey,
+	common.WarmupScalarFieldKey,
+	common.WarmupScalarIndexKey,
+	common.WarmupVectorFieldKey,
+	common.WarmupVectorIndexKey,
 }
 
 func IsKeyAllowAlter(key string) bool {
@@ -1460,6 +1813,18 @@ func (t *alterCollectionFieldTask) PreExecute(ctx context.Context) error {
 				return merr.WrapErrCollectionLoaded(t.CollectionName, "can not alter collection field properties if collection loaded")
 			}
 
+		case common.WarmupKey:
+			loaded, err := isCollectionLoadedFn()
+			if err != nil {
+				return err
+			}
+			if loaded {
+				return merr.WrapErrCollectionLoaded(t.CollectionName, "can not alter warmup if collection loaded")
+			}
+			if err := common.ValidateWarmupPolicy(prop.Value); err != nil {
+				return merr.WrapErrParameterInvalidMsg(err.Error())
+			}
+
 		case common.MaxLengthKey:
 			IsStringType := false
 			fieldName := ""
@@ -1513,7 +1878,7 @@ func (t *alterCollectionFieldTask) PreExecute(ctx context.Context) error {
 			return merr.WrapErrParameterInvalidMsg("%s is not allowed to drop in collection field param", key)
 		}
 
-		if updatedKey == common.MmapEnabledKey {
+		if updatedKey == common.MmapEnabledKey || common.IsFieldWarmupKey(updatedKey) {
 			loaded, err := isCollectionLoadedFn()
 			if err != nil {
 				return err
@@ -1600,11 +1965,12 @@ func (t *createPartitionTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	partitionKeyMode, err := isPartitionKeyMode(ctx, t.GetDbName(), collName)
+	// Check partition key mode
+	collSchema, err := globalMetaCache.GetCollectionSchema(ctx, t.GetDbName(), collName)
 	if err != nil {
 		return err
 	}
-	if partitionKeyMode {
+	if typeutil.HasPartitionKey(collSchema.CollectionSchema) {
 		return errors.New("disable create partition if partition key mode is used")
 	}
 
@@ -1699,11 +2065,12 @@ func (t *dropPartitionTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	partitionKeyMode, err := isPartitionKeyMode(ctx, t.GetDbName(), collName)
+	// Check partition key mode
+	collSchema, err := globalMetaCache.GetCollectionSchema(ctx, t.GetDbName(), collName)
 	if err != nil {
 		return err
 	}
-	if partitionKeyMode {
+	if typeutil.HasPartitionKey(collSchema.CollectionSchema) {
 		return errors.New("disable drop partition if partition key mode is used")
 	}
 
@@ -1717,7 +2084,7 @@ func (t *dropPartitionTask) PreExecute(ctx context.Context) error {
 	}
 	partID, err := globalMetaCache.GetPartitionID(ctx, t.GetDbName(), t.GetCollectionName(), t.GetPartitionName())
 	if err != nil {
-		if errors.Is(merr.ErrPartitionNotFound, err) {
+		if errors.Is(merr.ErrPartitionNotFound, err) || errors.Is(merr.ErrCollectionNotFound, err) || errors.Is(merr.ErrDatabaseNotFound, err) {
 			return nil
 		}
 		return err
@@ -3140,6 +3507,95 @@ func (t *RunAnalyzerTask) Execute(ctx context.Context) error {
 }
 
 func (t *RunAnalyzerTask) PostExecute(ctx context.Context) error {
+	return nil
+}
+
+// git highlight after search
+type HighlightTask struct {
+	baseTask
+	Condition
+	*querypb.GetHighlightRequest
+	ctx            context.Context
+	collectionName string
+	collectionID   typeutil.UniqueID
+	dbName         string
+	lb             shardclient.LBPolicy
+
+	result *querypb.GetHighlightResponse
+}
+
+func (t *HighlightTask) TraceCtx() context.Context {
+	return t.ctx
+}
+
+func (t *HighlightTask) ID() UniqueID {
+	return t.Base.MsgID
+}
+
+func (t *HighlightTask) SetID(uid UniqueID) {
+	t.Base.MsgID = uid
+}
+
+func (t *HighlightTask) Name() string {
+	return HighlightTaskName
+}
+
+func (t *HighlightTask) Type() commonpb.MsgType {
+	return t.Base.MsgType
+}
+
+func (t *HighlightTask) BeginTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *HighlightTask) EndTs() Timestamp {
+	return t.Base.Timestamp
+}
+
+func (t *HighlightTask) SetTs(ts Timestamp) {
+	t.Base.Timestamp = ts
+}
+
+func (t *HighlightTask) OnEnqueue() error {
+	if t.Base == nil {
+		t.Base = commonpbutil.NewMsgBase()
+	}
+	t.Base.MsgType = commonpb.MsgType_Undefined
+	t.Base.SourceID = paramtable.GetNodeID()
+	return nil
+}
+
+func (t *HighlightTask) PreExecute(ctx context.Context) error {
+	return nil
+}
+
+func (t *HighlightTask) getHighlightOnShardleader(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {
+	t.GetHighlightRequest.Channel = channel
+	resp, err := qn.GetHighlight(ctx, t.GetHighlightRequest)
+	if err != nil {
+		return err
+	}
+
+	if err := merr.Error(resp.GetStatus()); err != nil {
+		return err
+	}
+	t.result = resp
+	return nil
+}
+
+func (t *HighlightTask) Execute(ctx context.Context) error {
+	err := t.lb.ExecuteOneChannel(ctx, shardclient.CollectionWorkLoad{
+		Db:             t.dbName,
+		CollectionName: t.collectionName,
+		CollectionID:   t.collectionID,
+		Nq:             int64(len(t.GetTopks()) * len(t.GetTasks())),
+		Exec:           t.getHighlightOnShardleader,
+	})
+
+	return err
+}
+
+func (t *HighlightTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 

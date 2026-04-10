@@ -23,6 +23,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
+	_ "github.com/milvus-io/milvus/internal/util/cgo"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/cgopb"
@@ -129,34 +130,14 @@ func CreateIndex(ctx context.Context, buildIndexInfo *indexcgopb.BuildIndexInfo)
 	return index, nil
 }
 
-func CreateTextIndex(ctx context.Context, buildIndexInfo *indexcgopb.BuildIndexInfo) (map[string]int64, error) {
-	buildIndexInfoBlob, err := proto.Marshal(buildIndexInfo)
-	if err != nil {
-		log.Ctx(ctx).Warn("marshal buildIndexInfo failed",
-			zap.String("clusterID", buildIndexInfo.GetClusterID()),
-			zap.Int64("buildID", buildIndexInfo.GetBuildID()),
-			zap.Error(err))
-		return nil, err
-	}
-	result := C.CreateProtoLayout()
-	defer C.ReleaseProtoLayout(result)
-	status := C.BuildTextIndex(result, (*C.uint8_t)(unsafe.Pointer(&buildIndexInfoBlob[0])), (C.uint64_t)(len(buildIndexInfoBlob)))
-	if err := HandleCStatus(&status, "failed to build text index"); err != nil {
-		return nil, err
-	}
-	var indexStats cgopb.IndexStats
-	if err := segcore.UnmarshalProtoLayout(result, &indexStats); err != nil {
-		return nil, err
-	}
-
-	res := make(map[string]int64)
-	for _, indexInfo := range indexStats.GetSerializedIndexInfos() {
-		res[indexInfo.FileName] = indexInfo.FileSize
-	}
-	return res, nil
+type JSONKeyStatsResult struct {
+	// MemSize is the actual memory size when loaded
+	MemSize int64
+	// Files maps file name to file size on disk
+	Files map[string]int64
 }
 
-func CreateJSONKeyStats(ctx context.Context, buildIndexInfo *indexcgopb.BuildIndexInfo) (map[string]int64, error) {
+func CreateJSONKeyStats(ctx context.Context, buildIndexInfo *indexcgopb.BuildIndexInfo) (*JSONKeyStatsResult, error) {
 	buildIndexInfoBlob, err := proto.Marshal(buildIndexInfo)
 	if err != nil {
 		log.Ctx(ctx).Warn("marshal buildIndexInfo failed",
@@ -177,12 +158,17 @@ func CreateJSONKeyStats(ctx context.Context, buildIndexInfo *indexcgopb.BuildInd
 		return nil, err
 	}
 
-	res := make(map[string]int64)
+	files := make(map[string]int64)
+	var logSize int64
 	for _, indexInfo := range indexStats.GetSerializedIndexInfos() {
-		res[indexInfo.FileName] = indexInfo.FileSize
+		files[indexInfo.FileName] = indexInfo.FileSize
+		logSize += indexInfo.FileSize
 	}
 
-	return res, nil
+	return &JSONKeyStatsResult{
+		MemSize: indexStats.GetMemSize(),
+		Files:   files,
+	}, nil
 }
 
 // TODO: this seems to be used only for test. We should mark the method
@@ -226,36 +212,91 @@ func (index *CgoIndex) Build(dataset *Dataset) error {
 
 func (index *CgoIndex) buildFloatVecIndex(dataset *Dataset) error {
 	vectors := dataset.Data[keyRawArr].([]float32)
+	if validData, ok := dataset.Data[keyValidArr].([]bool); ok && len(validData) > 0 {
+		status := C.BuildFloatVecIndexWithValidData(
+			index.indexPtr,
+			(C.int64_t)(len(vectors)),
+			(*C.float)(&vectors[0]),
+			(*C.bool)(&validData[0]),
+			(C.int64_t)(len(validData)))
+		return HandleCStatus(&status, "failed to build float vector index with valid data")
+	}
 	status := C.BuildFloatVecIndex(index.indexPtr, (C.int64_t)(len(vectors)), (*C.float)(&vectors[0]))
 	return HandleCStatus(&status, "failed to build float vector index")
 }
 
 func (index *CgoIndex) buildFloat16VecIndex(dataset *Dataset) error {
 	vectors := dataset.Data[keyRawArr].([]byte)
+	if validData, ok := dataset.Data[keyValidArr].([]bool); ok && len(validData) > 0 {
+		status := C.BuildFloat16VecIndexWithValidData(
+			index.indexPtr,
+			(C.int64_t)(len(vectors)),
+			(*C.uint8_t)(&vectors[0]),
+			(*C.bool)(&validData[0]),
+			(C.int64_t)(len(validData)))
+		return HandleCStatus(&status, "failed to build float16 vector index with valid data")
+	}
 	status := C.BuildFloat16VecIndex(index.indexPtr, (C.int64_t)(len(vectors)), (*C.uint8_t)(&vectors[0]))
 	return HandleCStatus(&status, "failed to build float16 vector index")
 }
 
 func (index *CgoIndex) buildBFloat16VecIndex(dataset *Dataset) error {
 	vectors := dataset.Data[keyRawArr].([]byte)
+	if validData, ok := dataset.Data[keyValidArr].([]bool); ok && len(validData) > 0 {
+		status := C.BuildBFloat16VecIndexWithValidData(
+			index.indexPtr,
+			(C.int64_t)(len(vectors)),
+			(*C.uint8_t)(&vectors[0]),
+			(*C.bool)(&validData[0]),
+			(C.int64_t)(len(validData)))
+		return HandleCStatus(&status, "failed to build bfloat16 vector index with valid data")
+	}
 	status := C.BuildBFloat16VecIndex(index.indexPtr, (C.int64_t)(len(vectors)), (*C.uint8_t)(&vectors[0]))
 	return HandleCStatus(&status, "failed to build bfloat16 vector index")
 }
 
 func (index *CgoIndex) buildSparseFloatVecIndex(dataset *Dataset) error {
 	vectors := dataset.Data[keyRawArr].([]byte)
+	if validData, ok := dataset.Data[keyValidArr].([]bool); ok && len(validData) > 0 {
+		status := C.BuildSparseFloatVecIndexWithValidData(
+			index.indexPtr,
+			(C.int64_t)(len(validData)),
+			(C.int64_t)(0),
+			(*C.uint8_t)(&vectors[0]),
+			(*C.bool)(&validData[0]),
+			(C.int64_t)(len(validData)))
+		return HandleCStatus(&status, "failed to build sparse float vector index with valid data")
+	}
 	status := C.BuildSparseFloatVecIndex(index.indexPtr, (C.int64_t)(len(vectors)), (C.int64_t)(0), (*C.uint8_t)(&vectors[0]))
 	return HandleCStatus(&status, "failed to build sparse float vector index")
 }
 
 func (index *CgoIndex) buildBinaryVecIndex(dataset *Dataset) error {
 	vectors := dataset.Data[keyRawArr].([]byte)
+	if validData, ok := dataset.Data[keyValidArr].([]bool); ok && len(validData) > 0 {
+		status := C.BuildBinaryVecIndexWithValidData(
+			index.indexPtr,
+			(C.int64_t)(len(vectors)),
+			(*C.uint8_t)(&vectors[0]),
+			(*C.bool)(&validData[0]),
+			(C.int64_t)(len(validData)))
+		return HandleCStatus(&status, "failed to build binary vector index with valid data")
+	}
 	status := C.BuildBinaryVecIndex(index.indexPtr, (C.int64_t)(len(vectors)), (*C.uint8_t)(&vectors[0]))
 	return HandleCStatus(&status, "failed to build binary vector index")
 }
 
 func (index *CgoIndex) buildInt8VecIndex(dataset *Dataset) error {
 	vectors := dataset.Data[keyRawArr].([]int8)
+	if validData, ok := dataset.Data[keyValidArr].([]bool); ok && len(validData) > 0 {
+		status := C.BuildInt8VecIndexWithValidData(
+			index.indexPtr,
+			(C.int64_t)(len(vectors)),
+			(*C.int8_t)(&vectors[0]),
+			(*C.bool)(&validData[0]),
+			(C.int64_t)(len(validData)))
+		return HandleCStatus(&status, "failed to build int8 vector index with valid data")
+	}
 	status := C.BuildInt8VecIndex(index.indexPtr, (C.int64_t)(len(vectors)), (*C.int8_t)(&vectors[0]))
 	return HandleCStatus(&status, "failed to build int8 vector index")
 }

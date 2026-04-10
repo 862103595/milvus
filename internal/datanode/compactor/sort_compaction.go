@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow/go/v17/arrow/array"
@@ -27,7 +28,9 @@ import (
 	"github.com/samber/lo"
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/compaction"
@@ -35,19 +38,27 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/io"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
+	"github.com/milvus-io/milvus/internal/util/analyzer"
+	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexcgopb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type sortCompactionTask struct {
 	binlogIO    io.BinlogIO
+	cm          storage.ChunkManager
 	currentTime time.Time
 
 	plan *datapb.CompactionPlan
@@ -58,10 +69,13 @@ type sortCompactionTask struct {
 	collectionID          int64
 	partitionID           int64
 	segmentID             int64
-	deltaLogs             []string
 	insertLogs            []*datapb.FieldBinlog
 	storageVersion        int64
 	segmentStorageVersion int64
+	manifest              string
+	useLoonFFI            bool
+
+	ttlFieldID int64
 
 	done chan struct{}
 	tr   *timerecord.TimeRecorder
@@ -74,7 +88,7 @@ var _ Compactor = (*sortCompactionTask)(nil)
 
 func NewSortCompactionTask(
 	ctx context.Context,
-	binlogIO io.BinlogIO,
+	cm storage.ChunkManager,
 	plan *datapb.CompactionPlan,
 	compactionParams compaction.Params,
 	sortByFieldIDs []int64,
@@ -83,7 +97,8 @@ func NewSortCompactionTask(
 	return &sortCompactionTask{
 		ctx:              ctx1,
 		cancel:           cancel,
-		binlogIO:         binlogIO,
+		binlogIO:         io.NewBinlogIO(cm),
+		cm:               cm,
 		plan:             plan,
 		tr:               timerecord.NewTimeRecorder("sort compaction"),
 		currentTime:      time.Now(),
@@ -123,15 +138,12 @@ func (t *sortCompactionTask) preCompact() error {
 		return err
 	}
 
-	for _, d := range segment.GetDeltalogs() {
-		for _, l := range d.GetBinlogs() {
-			t.deltaLogs = append(t.deltaLogs, l.GetLogPath())
-		}
-	}
-
 	t.insertLogs = segment.GetFieldBinlogs()
 	t.storageVersion = t.compactionParams.StorageVersion
 	t.segmentStorageVersion = segment.GetStorageVersion()
+	t.manifest = segment.GetManifest()
+	t.useLoonFFI = t.compactionParams.UseLoonFFI
+	t.ttlFieldID = getTTLFieldID(t.plan.GetSchema())
 
 	log.Ctx(t.ctx).Info("preCompaction analyze",
 		zap.Int64("planID", t.GetPlanID()),
@@ -139,6 +151,7 @@ func (t *sortCompactionTask) preCompact() error {
 		zap.Int64("partitionID", t.partitionID),
 		zap.Int64("segmentID", t.segmentID),
 		zap.Int64("storageVersion", t.storageVersion),
+		zap.Bool("useLoonFFI", t.useLoonFFI),
 		zap.Any("compactionParams", t.compactionParams),
 	)
 
@@ -162,6 +175,7 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 	alloc := allocator.NewLocalAllocator(t.plan.GetPreAllocatedLogIDs().GetBegin(), t.plan.GetPreAllocatedLogIDs().GetEnd())
 	targetSegmentID := t.plan.GetPreAllocatedSegmentIDs().GetBegin()
 
+	phaseStart := time.Now()
 	srw, err := storage.NewBinlogRecordWriter(ctx,
 		t.collectionID,
 		t.partitionID,
@@ -175,18 +189,25 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 		}),
 		storage.WithVersion(t.storageVersion),
 		storage.WithStorageConfig(t.compactionParams.StorageConfig),
+		storage.WithUseLoonFFI(t.useLoonFFI),
 	)
 	if err != nil {
 		log.Warn("sort segment wrong, unable to init segment writer",
 			zap.Int64("planID", t.plan.GetPlanID()), zap.Error(err))
 		return nil, err
 	}
+	initWriterCost := time.Since(phaseStart)
 
-	deletePKs, err := compaction.ComposeDeleteFromDeltalogs(ctx, t.binlogIO, t.deltaLogs)
+	phaseStart = time.Now()
+	deletePKs, err := compaction.ComposeDeleteFromDeltalogs(ctx, pkField.DataType, t.plan.SegmentBinlogs[0],
+		storage.WithDownloader(t.binlogIO.Download),
+		storage.WithStorageConfig(t.compactionParams.StorageConfig))
 	if err != nil {
 		log.Warn("load deletePKs failed", zap.Error(err))
 		return nil, err
 	}
+	loadDeltaCost := time.Since(phaseStart)
+	hasTTLField := t.ttlFieldID >= common.StartOfUserFieldID
 
 	entityFilter := compaction.NewEntityFilter(deletePKs, t.plan.GetCollectionTtl(), t.currentTime)
 	var predicate func(r storage.Record, ri, i int) bool
@@ -195,64 +216,152 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 		predicate = func(r storage.Record, ri, i int) bool {
 			pk := r.Column(pkField.FieldID).(*array.Int64).Value(i)
 			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
-			return !entityFilter.Filtered(pk, uint64(ts))
+			expireTs := int64(-1)
+			if hasTTLField {
+				col := r.Column(t.ttlFieldID).(*array.Int64)
+				if col.IsValid(i) {
+					expireTs = col.Value(i)
+				}
+			}
+			return !entityFilter.Filtered(pk, uint64(ts), expireTs)
 		}
 	case schemapb.DataType_VarChar:
 		predicate = func(r storage.Record, ri, i int) bool {
 			pk := r.Column(pkField.FieldID).(*array.String).Value(i)
 			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
-			return !entityFilter.Filtered(pk, uint64(ts))
+			expireTs := int64(-1)
+			if hasTTLField {
+				col := r.Column(t.ttlFieldID).(*array.Int64)
+				if col.IsValid(i) {
+					expireTs = col.Value(i)
+				}
+			}
+			return !entityFilter.Filtered(pk, uint64(ts), expireTs)
 		}
 	default:
 		log.Warn("sort task only support int64 and varchar pk field")
 	}
 
-	rr, err := storage.NewBinlogRecordReader(ctx, t.insertLogs, t.plan.Schema,
-		storage.WithVersion(t.segmentStorageVersion),
-		storage.WithDownloader(t.binlogIO.Download),
-		storage.WithStorageConfig(t.compactionParams.StorageConfig),
-		storage.WithCollectionID(t.collectionID),
-	)
+	phaseStart = time.Now()
+	var rr storage.RecordReader
+	// use manifest reader if manifest presents
+	if t.manifest != "" {
+		rr, err = storage.NewManifestRecordReader(ctx, t.manifest, t.plan.Schema,
+			storage.WithVersion(t.segmentStorageVersion),
+			storage.WithDownloader(t.binlogIO.Download),
+			storage.WithStorageConfig(t.compactionParams.StorageConfig),
+			storage.WithCollectionID(t.collectionID),
+		)
+	} else {
+		rr, err = storage.NewBinlogRecordReader(ctx, t.insertLogs, t.plan.Schema,
+			storage.WithVersion(t.segmentStorageVersion),
+			storage.WithDownloader(t.binlogIO.Download),
+			storage.WithStorageConfig(t.compactionParams.StorageConfig),
+			storage.WithCollectionID(t.collectionID),
+		)
+	}
 	if err != nil {
 		log.Warn("error creating insert binlog reader", zap.Error(err))
 		return nil, err
 	}
 	defer rr.Close()
+	initReaderCost := time.Since(phaseStart)
+
 	rrs := []storage.RecordReader{rr}
-	numValidRows, err := storage.Sort(t.compactionParams.BinLogMaxSize, t.plan.GetSchema(), rrs, srw, predicate, t.sortByFieldIDs)
+	numValidRows, sortTimings, err := storage.Sort(t.compactionParams.BinLogMaxSize, t.plan.GetSchema(), rrs, srw, predicate, t.sortByFieldIDs)
 	if err != nil {
 		log.Warn("sort failed", zap.Error(err))
 		return nil, err
 	}
+	if sortTimings == nil {
+		sortTimings = &storage.SortTimings{}
+	}
+
+	phaseStart = time.Now()
 	if err := srw.Close(); err != nil {
 		return nil, err
 	}
+	flushCost := time.Since(phaseStart)
 
-	binlogs, stats, bm25stats := srw.GetLogs()
+	phaseStart = time.Now()
+	binlogs, stats, bm25stats, manifest, expirQuantiles := srw.GetLogs()
+
+	// For V3 segments, bloom filter and BM25 stats are already written to
+	// basePath/_stats/ and registered in the manifest by writeStatsV3()
+	// during PackedManifestRecordWriter.Close(). stats and bm25stats will
+	// be nil; only the manifest carries stats information.
+	if manifest != "" {
+		stats = nil
+		bm25stats = nil
+	}
+
 	insertLogs := storage.SortFieldBinlogs(binlogs)
 	if err := binlog.CompressFieldBinlogs(insertLogs); err != nil {
 		return nil, err
 	}
 
-	statsLogs := []*datapb.FieldBinlog{stats}
-	if err := binlog.CompressFieldBinlogs(statsLogs); err != nil {
-		return nil, err
+	var statsLogs []*datapb.FieldBinlog
+	if stats != nil {
+		statsLogs = []*datapb.FieldBinlog{stats}
+		if err := binlog.CompressFieldBinlogs(statsLogs); err != nil {
+			return nil, err
+		}
 	}
 
-	bm25StatsLogs := lo.Values(bm25stats)
-	if err := binlog.CompressFieldBinlogs(bm25StatsLogs); err != nil {
-		return nil, err
+	var bm25StatsLogs []*datapb.FieldBinlog
+	if len(bm25stats) > 0 {
+		bm25StatsLogs = lo.Values(bm25stats)
+		if err := binlog.CompressFieldBinlogs(bm25StatsLogs); err != nil {
+			return nil, err
+		}
 	}
+	compressCost := time.Since(phaseStart)
 
 	debug.FreeOSMemory()
+
+	if numValidRows != int(numRows)-entityFilter.GetDeletedCount()-entityFilter.GetExpiredCount() {
+		log.Warn("unexpected row count after sort compaction",
+			zap.Int64("target segmentID", targetSegmentID),
+			zap.Int64("old rows", numRows),
+			zap.Int("valid rows", numValidRows),
+			zap.Int("deleted rows", entityFilter.GetDeletedCount()),
+			zap.Int("expired rows", entityFilter.GetExpiredCount()))
+		return nil, merr.WrapErrServiceInternal("unexpected row count")
+	}
+
 	log.Info("sort segment end",
 		zap.Int64("target segmentID", targetSegmentID),
 		zap.Int64("old rows", numRows),
 		zap.Int("valid rows", numValidRows),
 		zap.Int("deleted rows", entityFilter.GetDeletedCount()),
 		zap.Int("expired rows", entityFilter.GetExpiredCount()),
+		zap.Int("deltaLogCount", len(t.plan.SegmentBinlogs[0].GetDeltalogs())),
+		zap.Int("deletePKCount", len(deletePKs)),
+		zap.Bool("useManifest", t.manifest != ""),
+		zap.Duration("initWriterCost", initWriterCost),
+		zap.Duration("loadDeltaCost", loadDeltaCost),
+		zap.Duration("initReaderCost", initReaderCost),
+		zap.Int("sortBatches", sortTimings.NumBatches),
+		zap.Duration("sortReadCost", sortTimings.ReadCost),
+		zap.Duration("sortSortCost", sortTimings.SortCost),
+		zap.Duration("sortWriteCost", sortTimings.WriteCost),
+		zap.Duration("flushCost", flushCost),
+		zap.Duration("compressCost", compressCost),
 		zap.Duration("total elapse", time.Since(sortStartTime)))
 
+	nodeID := fmt.Sprint(paramtable.GetNodeID())
+	compType := t.plan.GetType().String()
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "init_writer").Observe(float64(initWriterCost.Milliseconds()))
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "load_delta").Observe(float64(loadDeltaCost.Milliseconds()))
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "init_reader").Observe(float64(initReaderCost.Milliseconds()))
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "sort_read").Observe(float64(sortTimings.ReadCost.Milliseconds()))
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "sort_sort").Observe(float64(sortTimings.SortCost.Milliseconds()))
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "sort_write").Observe(float64(sortTimings.WriteCost.Milliseconds()))
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "flush").Observe(float64(flushCost.Milliseconds()))
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "compress").Observe(float64(compressCost.Milliseconds()))
+
+	isNamespaceSorted := t.plan.GetSchema().GetEnableNamespace()
+	isSorted := !isNamespaceSorted
 	res := []*datapb.CompactionSegment{
 		{
 			PlanID:              t.GetPlanID(),
@@ -262,8 +371,11 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 			Field2StatslogPaths: statsLogs,
 			Bm25Logs:            bm25StatsLogs,
 			Channel:             t.GetChannelName(),
-			IsSorted:            true,
+			IsSorted:            isSorted,
+			IsSortedByNamespace: isNamespaceSorted,
 			StorageVersion:      t.storageVersion,
+			Manifest:            manifest,
+			ExpirQuantiles:      expirQuantiles,
 		},
 	}
 	planResult := &datapb.CompactionPlanResult{
@@ -301,6 +413,7 @@ func (t *sortCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 
 	log.Info("compact start")
 
+	stepStart := time.Now()
 	res, err := t.sortSegment(ctx)
 	if err != nil {
 		log.Warn("failed to sort segment",
@@ -310,28 +423,76 @@ func (t *sortCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 			State:  datapb.CompactionTaskState_failed,
 		}, nil
 	}
+	sortSegmentCost := time.Since(stepStart)
 	targetSegemntID := res.GetSegments()[0].GetSegmentID()
 	insertLogs := res.GetSegments()[0].GetInsertLogs()
 	if len(insertLogs) == 0 || res.GetSegments()[0].GetNumOfRows() == 0 {
 		log.Info("compact done, but target segment is zero num rows",
 			zap.Int64("targetSegmentID", targetSegemntID),
+			zap.Duration("sortSegmentCost", sortSegmentCost),
 			zap.Duration("compact cost", time.Since(compactStart)))
 		return res, nil
 	}
-	textStatsLogs, err := t.createTextIndex(ctx,
-		t.collectionID, t.partitionID, targetSegemntID, t.GetPlanID(),
-		res.GetSegments()[0].GetInsertLogs())
-	if err != nil {
-		log.Warn("failed to create text indexes", zap.Int64("targetSegmentID", targetSegemntID),
-			zap.Error(err))
-		return &datapb.CompactionPlanResult{
-			PlanID: t.GetPlanID(),
-			State:  datapb.CompactionTaskState_failed,
-		}, nil
+	stepStart = time.Now()
+	for _, resultSegment := range res.GetSegments() {
+		textStatsLogs, err := t.createTextIndex(ctx,
+			t.collectionID, t.partitionID, targetSegemntID, t.GetPlanID(),
+			resultSegment)
+		if err != nil {
+			log.Warn("failed to create text indexes", zap.Int64("targetSegmentID", targetSegemntID),
+				zap.Error(err))
+			return &datapb.CompactionPlanResult{
+				PlanID: t.GetPlanID(),
+				State:  datapb.CompactionTaskState_failed,
+			}, nil
+		}
+		// For V3 segments, register text index stats in manifest.
+		// C++ Upload() returns relative file names; convert to absolute
+		// by prepending statsBasePath before registering with manifest.
+		if resultSegment.GetManifest() != "" && len(textStatsLogs) > 0 {
+			basePath, _, bErr := packed.UnmarshalManifestPath(resultSegment.GetManifest())
+			if bErr != nil {
+				log.Warn("failed to unmarshal manifest path for text index stats",
+					zap.Int64("targetSegmentID", targetSegemntID), zap.Error(bErr))
+				return &datapb.CompactionPlanResult{
+					PlanID: t.GetPlanID(),
+					State:  datapb.CompactionTaskState_failed,
+				}, nil
+			}
+			for _, stats := range textStatsLogs {
+				prefix := fmt.Sprintf("%s/_stats/text_index.%d", basePath, stats.GetFieldID())
+				for i, f := range stats.GetFiles() {
+					stats.Files[i] = prefix + "/" + f
+				}
+			}
+			statEntries := packed.TextIndexStatEntries(textStatsLogs, t.plan.GetCurrentScalarIndexVersion())
+			newManifest, mErr := packed.AddStatsToManifest(
+				resultSegment.GetManifest(), t.compactionParams.StorageConfig, statEntries)
+			if mErr != nil {
+				log.Warn("failed to add text index stats to manifest",
+					zap.Int64("targetSegmentID", targetSegemntID), zap.Error(mErr))
+				return &datapb.CompactionPlanResult{
+					PlanID: t.GetPlanID(),
+					State:  datapb.CompactionTaskState_failed,
+				}, nil
+			}
+			resultSegment.Manifest = newManifest
+			textStatsLogs = nil
+		}
+		resultSegment.TextStatsLogs = textStatsLogs
 	}
-	res.Segments[0].TextStatsLogs = textStatsLogs
+	createTextIndexCost := time.Since(stepStart)
+
+	totalCost := time.Since(compactStart)
 	log.Info("compact done", zap.Int64("targetSegmentID", targetSegemntID),
-		zap.Duration("compact cost", time.Since(compactStart)))
+		zap.Duration("sortSegmentCost", sortSegmentCost),
+		zap.Duration("createTextIndexCost", createTextIndexCost),
+		zap.Duration("compact cost", totalCost))
+
+	nodeID := fmt.Sprint(paramtable.GetNodeID())
+	compType := t.plan.GetType().String()
+	metrics.DataNodeCompactionStageLatency.WithLabelValues(nodeID, compType, "create_text_index").Observe(float64(createTextIndexCost.Milliseconds()))
+	metrics.DataNodeCompactionLatency.WithLabelValues(nodeID, compType).Observe(float64(totalCost.Milliseconds()))
 	return res, nil
 }
 
@@ -364,12 +525,16 @@ func (t *sortCompactionTask) GetSlotUsage() int64 {
 	return t.plan.GetSlotUsage()
 }
 
+func (t *sortCompactionTask) GetStorageConfig() *indexpb.StorageConfig {
+	return t.compactionParams.StorageConfig
+}
+
 func (t *sortCompactionTask) createTextIndex(ctx context.Context,
 	collectionID int64,
 	partitionID int64,
 	segmentID int64,
 	taskID int64,
-	insertBinlogs []*datapb.FieldBinlog,
+	segment *datapb.CompactionSegment,
 ) (map[int64]*datapb.TextIndexStats, error) {
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", collectionID),
@@ -377,12 +542,12 @@ func (t *sortCompactionTask) createTextIndex(ctx context.Context,
 		zap.Int64("segmentID", segmentID),
 	)
 
-	fieldBinlogs := lo.GroupBy(insertBinlogs, func(binlog *datapb.FieldBinlog) int64 {
+	fieldBinlogs := lo.GroupBy(segment.GetInsertLogs(), func(binlog *datapb.FieldBinlog) int64 {
 		return binlog.GetFieldID()
 	})
 
 	getInsertFiles := func(fieldID int64) ([]string, error) {
-		if t.storageVersion == storage.StorageV2 {
+		if t.storageVersion == storage.StorageV2 || t.storageVersion == storage.StorageV3 {
 			return []string{}, nil
 		}
 		binlogs, ok := fieldBinlogs[fieldID]
@@ -404,57 +569,124 @@ func (t *sortCompactionTask) createTextIndex(ctx context.Context,
 		return nil, err
 	}
 
-	textIndexLogs := make(map[int64]*datapb.TextIndexStats)
+	// Concurrent create text index for all match-enabled fields
+	var (
+		mu            sync.Mutex
+		textIndexLogs = make(map[int64]*datapb.TextIndexStats)
+	)
+
+	eg, egCtx := errgroup.WithContext(ctx)
+
+	var analyzerExtraInfo string
+	if len(t.plan.GetFileResources()) > 0 {
+		err := fileresource.GlobalFileManager.Download(ctx, t.cm, t.plan.GetFileResources()...)
+		if err != nil {
+			return nil, err
+		}
+		defer fileresource.GlobalFileManager.Release(t.plan.GetFileResources()...)
+		analyzerExtraInfo, err = analyzer.BuildExtraResourceInfo(t.compactionParams.StorageConfig.GetRootPath(), t.plan.GetFileResources())
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	for _, field := range t.plan.GetSchema().GetFields() {
+		field := field
 		h := typeutil.CreateFieldSchemaHelper(field)
 		if !h.EnableMatch() {
 			continue
 		}
 		log.Info("field enable match, ready to create text index", zap.Int64("field id", field.GetFieldID()))
-		// create text index and upload the text index files.
-		files, err := getInsertFiles(field.GetFieldID())
-		if err != nil {
-			return nil, err
-		}
 
-		buildIndexParams := &indexcgopb.BuildIndexInfo{
-			BuildID:                   t.GetPlanID(),
-			CollectionID:              collectionID,
-			PartitionID:               partitionID,
-			SegmentID:                 segmentID,
-			IndexVersion:              0, // always zero
-			InsertFiles:               files,
-			FieldSchema:               field,
-			StorageConfig:             newStorageConfig,
-			CurrentScalarIndexVersion: t.plan.GetCurrentScalarIndexVersion(),
-			StorageVersion:            t.storageVersion,
-		}
+		eg.Go(func() error {
+			files, err := getInsertFiles(field.GetFieldID())
+			if err != nil {
+				return err
+			}
 
-		if t.storageVersion == storage.StorageV2 {
-			buildIndexParams.SegmentInsertFiles = util.GetSegmentInsertFiles(
-				insertBinlogs,
-				t.compactionParams.StorageConfig,
-				collectionID,
-				partitionID,
-				segmentID)
-		}
-		uploaded, err := indexcgowrapper.CreateTextIndex(ctx, buildIndexParams)
-		if err != nil {
-			return nil, err
-		}
-		textIndexLogs[field.GetFieldID()] = &datapb.TextIndexStats{
-			FieldID: field.GetFieldID(),
-			Version: 0,
-			BuildID: taskID,
-			Files:   lo.Keys(uploaded),
-		}
-		elapse := t.tr.RecordSpan()
-		log.Info("field enable match, create text index done",
-			zap.Int64("segmentID", segmentID),
-			zap.Int64("field id", field.GetFieldID()),
-			zap.Strings("files", lo.Keys(uploaded)),
-			zap.Duration("elapse", elapse),
-		)
+			// Compute statsBasePath so C++ uploads text index to manifest-compatible location.
+			var statsBasePath string
+			if segment.GetManifest() != "" {
+				basePath, _, err := packed.UnmarshalManifestPath(segment.GetManifest())
+				if err != nil {
+					return fmt.Errorf("failed to unmarshal manifest path for text_index basePath: %w", err)
+				}
+				statsBasePath = fmt.Sprintf("%s/_stats/text_index.%d", basePath, field.GetFieldID())
+			}
+
+			buildIndexParams := &indexcgopb.BuildIndexInfo{
+				BuildID:                   t.GetPlanID(),
+				CollectionID:              collectionID,
+				PartitionID:               partitionID,
+				SegmentID:                 segmentID,
+				IndexVersion:              0, // always zero
+				InsertFiles:               files,
+				FieldSchema:               field,
+				StorageConfig:             newStorageConfig,
+				CurrentScalarIndexVersion: common.ClampScalarIndexVersion(t.plan.GetCurrentScalarIndexVersion()),
+				StorageVersion:            t.storageVersion,
+				Manifest:                  segment.GetManifest(),
+				StatsBasePath:             statsBasePath,
+				IndexParams: []*commonpb.KeyValuePair{
+					{Key: "index_type", Value: "INVERTED"},
+					{Key: "is_text_match", Value: "true"},
+				},
+			}
+
+			if len(analyzerExtraInfo) > 0 {
+				buildIndexParams.AnalyzerExtraInfo = analyzerExtraInfo
+			}
+
+			if t.storageVersion == storage.StorageV2 || t.storageVersion == storage.StorageV3 {
+				buildIndexParams.SegmentInsertFiles = util.GetSegmentInsertFiles(
+					segment.GetInsertLogs(),
+					t.compactionParams.StorageConfig,
+					collectionID,
+					partitionID,
+					segmentID)
+			}
+
+			index, err := indexcgowrapper.CreateIndex(egCtx, buildIndexParams)
+			if err != nil {
+				return err
+			}
+			defer index.Delete()
+
+			indexStats, err := index.UpLoad()
+			if err != nil {
+				return err
+			}
+
+			uploaded := make(map[string]int64)
+			for _, info := range indexStats.GetSerializedIndexInfos() {
+				uploaded[info.FileName] = info.FileSize
+			}
+
+			mu.Lock()
+			totalSize := lo.SumBy(lo.Values(uploaded), func(fileSize int64) int64 { return fileSize })
+			textIndexLogs[field.GetFieldID()] = &datapb.TextIndexStats{
+				FieldID:                   field.GetFieldID(),
+				Version:                   0,
+				BuildID:                   taskID,
+				Files:                     lo.Keys(uploaded),
+				LogSize:                   totalSize,
+				MemorySize:                totalSize,
+				CurrentScalarIndexVersion: common.ClampScalarIndexVersion(t.plan.GetCurrentScalarIndexVersion()),
+			}
+			mu.Unlock()
+
+			log.Info("field enable match, create text index done",
+				zap.Int64("segmentID", segmentID),
+				zap.Int64("field id", field.GetFieldID()),
+				zap.Strings("files", lo.Keys(uploaded)),
+			)
+			return nil
+		})
 	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
 	return textIndexLogs, nil
 }

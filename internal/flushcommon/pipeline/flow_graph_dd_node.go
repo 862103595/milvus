@@ -183,15 +183,15 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 			util.GetRateCollector().Add(metricsinfo.InsertConsumeThroughput, float64(proto.Size(imsg.InsertRequest)))
 
 			metrics.DataNodeConsumeBytesCount.
-				WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).
+				WithLabelValues(paramtable.GetStringNodeID(), metrics.InsertLabel).
 				Add(float64(proto.Size(imsg.InsertRequest)))
 
 			metrics.DataNodeConsumeMsgCount.
-				WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel, fmt.Sprint(ddn.collectionID)).
+				WithLabelValues(paramtable.GetStringNodeID(), metrics.InsertLabel, fmt.Sprint(ddn.collectionID)).
 				Inc()
 
 			metrics.DataNodeConsumeMsgRowsCount.
-				WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).
+				WithLabelValues(paramtable.GetStringNodeID(), metrics.InsertLabel).
 				Add(float64(imsg.GetNumRows()))
 
 			log.Debug("DDNode receive insert messages",
@@ -222,15 +222,15 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 			util.GetRateCollector().Add(metricsinfo.DeleteConsumeThroughput, float64(proto.Size(dmsg.DeleteRequest)))
 
 			metrics.DataNodeConsumeBytesCount.
-				WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).
+				WithLabelValues(paramtable.GetStringNodeID(), metrics.DeleteLabel).
 				Add(float64(proto.Size(dmsg.DeleteRequest)))
 
 			metrics.DataNodeConsumeMsgCount.
-				WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel, fmt.Sprint(ddn.collectionID)).
+				WithLabelValues(paramtable.GetStringNodeID(), metrics.DeleteLabel, fmt.Sprint(ddn.collectionID)).
 				Inc()
 
 			metrics.DataNodeConsumeMsgRowsCount.
-				WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).
+				WithLabelValues(paramtable.GetStringNodeID(), metrics.DeleteLabel).
 				Add(float64(dmsg.GetNumRows()))
 			fgMsg.DeleteMessages = append(fgMsg.DeleteMessages, dmsg)
 		case commonpb.MsgType_CreateSegment:
@@ -274,6 +274,14 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 			} else {
 				logger.Info("handle manual flush message success")
 			}
+		case commonpb.MsgType_FlushAll:
+			flushAllMsg := msg.(*adaptor.FlushAllMessageBody)
+			log.Info("receive flush all message",
+				zap.String("vchannel", ddn.Name()),
+				zap.Int32("msgType", int32(msg.Type())),
+				zap.Uint64("timetick", flushAllMsg.FlushAllMessage.TimeTick()),
+			)
+			ddn.msgHandler.HandleFlushAll(ddn.vChannelName, flushAllMsg.FlushAllMessage)
 		case commonpb.MsgType_AddCollectionField:
 			schemaMsg := msg.(*adaptor.SchemaChangeMessageBody)
 			logger := log.With(
@@ -297,6 +305,36 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 			} else {
 				logger.Info("handle put collection message success")
 			}
+		case commonpb.MsgType_TruncateCollection:
+			truncateCollectionMsg := msg.(*adaptor.TruncateCollectionMessageBody)
+			logger := log.With(
+				zap.String("vchannel", ddn.Name()),
+				zap.Int32("msgType", int32(msg.Type())),
+				zap.Uint64("timetick", truncateCollectionMsg.TruncateCollectionMessage.TimeTick()),
+				zap.Int64s("segmentIDs", truncateCollectionMsg.TruncateCollectionMessage.Header().SegmentIds),
+			)
+			logger.Info("receive truncate collection message")
+			if err := ddn.msgHandler.HandleTruncateCollection(truncateCollectionMsg.TruncateCollectionMessage); err != nil {
+				logger.Warn("handle truncate collection message failed", zap.Error(err))
+			} else {
+				logger.Info("handle truncate collection message success")
+			}
+		case commonpb.MsgType_AlterWAL:
+			alterWALMsg := msg.(*adaptor.AlterWALMessageBody)
+			logger := log.With(
+				zap.String("pchannel", alterWALMsg.AlterWALMessage.VChannel()), // pchannel that received the alter wal message
+				zap.String("vchannel", ddn.vChannelName),                       // vchannel of the current flow graph pipeline
+				zap.Stringer("targetWalName", alterWALMsg.AlterWALMessage.Header().TargetWalName),
+				zap.Uint64("timetick", alterWALMsg.AlterWALMessage.TimeTick()),
+			)
+			logger.Info("receive alter wal message")
+			if err := ddn.msgHandler.HandleAlterWAL(ddn.ctx, alterWALMsg.AlterWALMessage, ddn.vChannelName); err != nil {
+				logger.Warn("handle alter wal message failed", zap.Error(err))
+			} else {
+				logger.Info("handle alter wal message success")
+			}
+			fgMsg.isAlterWal = true
+			fgMsg.alterWalTimeTick = alterWALMsg.AlterWALMessage.TimeTick()
 		}
 	}
 

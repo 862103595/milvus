@@ -21,12 +21,12 @@ import (
 	"context"
 	"runtime/debug"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/internal/storagev2"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -227,7 +227,7 @@ func getStateFromError(err error) indexpb.JobState {
 	return indexpb.JobState_JobStateRetry
 }
 
-func (sched *TaskScheduler) processTask(t Task, q TaskQueue) {
+func (sched *TaskScheduler) processTask(t Task) {
 	wrap := func(fn func(ctx context.Context) error) error {
 		select {
 		case <-t.Ctx().Done():
@@ -253,6 +253,18 @@ func (sched *TaskScheduler) processTask(t Task, q TaskQueue) {
 		}
 	}
 	t.SetState(indexpb.JobState_JobStateFinished, "")
+
+	// Publish filesystem metrics after index task completion
+	// Only publish for index build tasks (not stats or analyze tasks)
+	if indexTask, ok := t.(*indexBuildTask); ok {
+		// Extract storage config from task to get the filesystem key
+		var fsKey string
+		if indexTask.req != nil && indexTask.req.GetStorageConfig() != nil {
+			fsKey = storagev2.GetFilesystemKeyFromStorageConfig(indexTask.req.GetStorageConfig())
+		}
+		// If no storage config or empty key, use default filesystem (empty key)
+		storagev2.PublishCachedFilesystemMetrics(fsKey)
+	}
 }
 
 func (sched *TaskScheduler) indexBuildLoop() {
@@ -264,17 +276,16 @@ func (sched *TaskScheduler) indexBuildLoop() {
 			return
 		case <-sched.TaskQueue.utChan():
 			t := sched.TaskQueue.PopUnissuedTask()
-			for {
-				totalSlot := CalculateNodeSlots()
-				availableSlot := totalSlot - sched.TaskQueue.GetActiveSlot()
-				if availableSlot >= t.GetSlot() || totalSlot == availableSlot {
-					go func(t Task) {
-						sched.processTask(t, sched.TaskQueue)
-					}(t)
-					break
+			go func(t Task) {
+				if t.IsVectorIndex() {
+					GetVecIndexBuildPool().Submit(func() (any, error) {
+						sched.processTask(t)
+						return nil, nil
+					})
+				} else {
+					sched.processTask(t)
 				}
-				time.Sleep(time.Millisecond * 50)
-			}
+			}(t)
 		}
 	}
 }

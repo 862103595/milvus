@@ -2,6 +2,7 @@ package resource
 
 import (
 	"reflect"
+	"sync/atomic"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
@@ -9,12 +10,13 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/client/manager"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/idalloc"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-var r *resourceImpl // singleton resource instance
+var r atomic.Pointer[resourceImpl] // singleton resource instance
 
 // optResourceInit is the option to initialize the resource.
 type optResourceInit func(r *resourceImpl)
@@ -41,6 +43,13 @@ func OptStreamingCatalog(catalog metastore.StreamingCoordCataLog) optResourceIni
 	}
 }
 
+// OptSession provides the session to the resource.
+func OptSession(session sessionutil.SessionInterface) optResourceInit {
+	return func(r *resourceImpl) {
+		r.session = session
+	}
+}
+
 // Init initializes the singleton of resources.
 // Should be call when streaming node startup.
 func Init(opts ...optResourceInit) {
@@ -56,19 +65,19 @@ func Init(opts ...optResourceInit) {
 	assertNotNil(newR.StreamingCatalog())
 	newR.streamingNodeManagerClient = manager.NewManagerClient(newR.etcdClient)
 	assertNotNil(newR.StreamingNodeManagerClient())
-	r = newR
+	r.Store(newR)
 }
 
 // Release release the streamingnode client
 func Release() {
-	if r.streamingNodeManagerClient != nil {
-		r.streamingNodeManagerClient.Close()
+	if res := r.Load(); res != nil && res.streamingNodeManagerClient != nil {
+		res.streamingNodeManagerClient.Close()
 	}
 }
 
 // Resource access the underlying singleton of resources.
 func Resource() *resourceImpl {
-	return r
+	return r.Load()
 }
 
 // resourceImpl is a basic resource dependency for streamingnode server.
@@ -76,6 +85,7 @@ func Resource() *resourceImpl {
 type resourceImpl struct {
 	idAllocator                idalloc.Allocator
 	mixCoordClient             *syncutil.Future[types.MixCoordClient]
+	session                    sessionutil.SessionInterface
 	etcdClient                 *clientv3.Client
 	streamingCatalog           metastore.StreamingCoordCataLog
 	streamingNodeManagerClient manager.ManagerClient
@@ -100,6 +110,10 @@ func (r *resourceImpl) StreamingCatalog() metastore.StreamingCoordCataLog {
 // ETCD returns the etcd client.
 func (r *resourceImpl) ETCD() *clientv3.Client {
 	return r.etcdClient
+}
+
+func (r *resourceImpl) Session() sessionutil.SessionInterface {
+	return r.session
 }
 
 // StreamingNodeClient returns the streaming node client.

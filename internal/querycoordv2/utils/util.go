@@ -26,6 +26,7 @@ import (
 
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -44,6 +45,7 @@ func CheckNodeAvailable(nodeID int64, info *session.NodeInfo) error {
 // 2. All QueryNodes in the distribution are online
 // 3. The last heartbeat response time is within HeartbeatAvailableInterval for all QueryNodes(include leader) in the distribution
 // 4. All segments of the shard in target should be in the distribution
+// 5. The delegator has caught up with streaming data
 func CheckDelegatorDataReady(nodeMgr *session.NodeManager, targetMgr meta.TargetManagerInterface, leader *meta.LeaderView, scope int32) error {
 	log := log.Ctx(context.TODO()).
 		WithRateGroup(fmt.Sprintf("util.CheckDelegatorDataReady-%d", leader.CollectionID), 1, 60).
@@ -55,6 +57,13 @@ func CheckDelegatorDataReady(nodeMgr *session.NodeManager, targetMgr meta.Target
 		err := merr.WrapErrNodeOffline(leader.ID)
 		log.Info("leader is not available", zap.Error(err))
 		return fmt.Errorf("leader not available: %w", err)
+	}
+
+	// Check if delegator is still catching up with streaming data
+	if leader.Status != nil && leader.Status.GetCatchingUpStreamingData() {
+		log.RatedInfo(10, "leader is not available due to still catching up streaming data",
+			zap.String("channel", leader.Channel))
+		return merr.WrapErrChannelNotAvailable(leader.Channel, "still catching up streaming data")
 	}
 
 	segmentDist := targetMgr.GetSealedSegmentsByChannel(context.TODO(), leader.CollectionID, leader.Channel, scope)
@@ -74,6 +83,44 @@ func CheckDelegatorDataReady(nodeMgr *session.NodeManager, targetMgr meta.Target
 				zap.Int64("segmentID", segmentID),
 				zap.Error(err))
 			return err
+		}
+	}
+	return nil
+}
+
+func CheckSegmentDataReady(ctx context.Context, collectionID int64, distManager *meta.DistributionManager, targetMgr meta.TargetManagerInterface, scope int32) error {
+	log := log.Ctx(ctx).
+		WithRateGroup(fmt.Sprintf("util.CheckSegmentDataReady-%d", collectionID), 1, 60).
+		With(zap.Int64("collectionID", collectionID))
+
+	// Check whether segments are fully loaded
+	segmentDist := targetMgr.GetSealedSegmentsByCollection(ctx, collectionID, scope)
+	for segmentID, segmentInfo := range segmentDist {
+		segments := distManager.SegmentDistManager.GetByFilter(meta.WithCollectionID(collectionID), meta.WithSegmentID(segmentID))
+		if len(segments) == 0 {
+			log.RatedInfo(10, "segment is not available", zap.Int64("segmentID", segmentID))
+			return merr.WrapErrSegmentLack(segmentID)
+		}
+
+		for _, segment := range segments {
+			cmp, err := packed.CompareManifestPath(segment.ManifestPath, segmentInfo.GetManifestPath())
+			if err != nil {
+				log.RatedWarn(10, "segment manifest path not comparable",
+					zap.Int64("segmentID", segmentID),
+					zap.String("distManifest", segment.ManifestPath),
+					zap.String("targetManifest", segmentInfo.GetManifestPath()),
+					zap.Error(err))
+				return err
+			}
+			if cmp < 0 {
+				// dist manifest is older than target, segment data is not ready yet
+				log.RatedInfo(10, "segment manifest is outdated",
+					zap.Int64("segmentID", segmentID),
+					zap.String("distManifest", segment.ManifestPath),
+					zap.String("targetManifest", segmentInfo.GetManifestPath()))
+				return merr.WrapErrSegmentNotLoaded(segmentID)
+			}
+			// cmp >= 0: dist manifest is same or newer than target, segment data is ready
 		}
 	}
 	return nil
@@ -221,34 +268,6 @@ func checkCollectionQueryable(ctx context.Context, m *meta.Meta, targetMgr meta.
 	}
 
 	return nil
-}
-
-func filterDupLeaders(ctx context.Context, replicaManager *meta.ReplicaManager, leaders map[int64]*meta.LeaderView) map[int64]*meta.LeaderView {
-	type leaderID struct {
-		ReplicaID int64
-		Shard     string
-	}
-
-	newLeaders := make(map[leaderID]*meta.LeaderView)
-	for _, view := range leaders {
-		replica := replicaManager.GetByCollectionAndNode(ctx, view.CollectionID, view.ID)
-		if replica == nil {
-			continue
-		}
-
-		id := leaderID{replica.GetID(), view.Channel}
-		if old, ok := newLeaders[id]; ok && old.Version > view.Version {
-			continue
-		}
-
-		newLeaders[id] = view
-	}
-
-	result := make(map[int64]*meta.LeaderView)
-	for _, v := range newLeaders {
-		result[v.ID] = v
-	}
-	return result
 }
 
 // GetChannelRWAndRONodesFor260 gets the RW and RO nodes of the channel.

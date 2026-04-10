@@ -14,16 +14,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstddef>
 #include <mutex>
+
+#include <openssl/evp.h>
 #include "common/init_c.h"
 #include "common/Common.h"
 #include "common/Tracer.h"
-#include "storage/ThreadPool.h"
-#include "log/Log.h"
+#include "common/init_c.h"
 #include "exec/expression/ExprCache.h"
+#include "storage/ThreadPool.h"
 
 std::once_flag traceFlag;
 std::once_flag cpuNumFlag;
+std::once_flag fipsFlag;
 
 void
 InitCpuNum(const int value) {
@@ -48,6 +52,11 @@ SetMiddlePriorityThreadCoreCoefficient(const float value) {
 void
 SetLowPriorityThreadCoreCoefficient(const float value) {
     milvus::SetLowPriorityThreadCoreCoefficient(value);
+}
+
+void
+SetThreadPoolMaxThreadsSize(const int value) {
+    milvus::SetThreadPoolMaxThreadsSize(value);
 }
 
 void
@@ -81,6 +90,11 @@ SetDefaultEnableParquetStatsSkipIndex(bool val) {
 }
 
 void
+SetEnableLatestDeleteSnapshotOptimization(bool val) {
+    milvus::SetEnableLatestDeleteSnapshotOptimization(val);
+}
+
+void
 SetLogLevel(const char* level) {
     milvus::SetLogLevel(level);
 }
@@ -94,6 +108,15 @@ void
 SetExprResCacheCapacityBytes(int64_t bytes) {
     milvus::exec::ExprResCacheManager::Instance().SetCapacityBytes(
         static_cast<size_t>(bytes));
+}
+
+void
+LogOpenSSLFIPSStatus() {
+    std::call_once(fipsFlag, []() {
+        LOG_INFO("Milvus FIPS in OpenSSL: {}",
+                 EVP_default_properties_is_fips_enabled(NULL) ? "enabled"
+                                                              : "disabled");
+    });
 }
 
 void

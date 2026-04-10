@@ -56,6 +56,10 @@ func UpdateLowPriorityThreadCoreCoefficient(coefficient float64) {
 	C.SetLowPriorityThreadCoreCoefficient(C.float(coefficient))
 }
 
+func UpdateThreadPoolMaxThreadsSize(size int) {
+	C.SetThreadPoolMaxThreadsSize(C.int(size))
+}
+
 func UpdateDefaultExprEvalBatchSize(size int) {
 	C.SetDefaultExprEvalBatchSize(C.int64_t(size))
 }
@@ -86,4 +90,8 @@ func UpdateDefaultConfigParamTypeCheck(enable bool) {
 
 func UpdateDefaultEnableParquetStatsSkipIndex(enable bool) {
 	C.SetDefaultEnableParquetStatsSkipIndex(C.bool(enable))
+}
+
+func UpdateEnableLatestDeleteSnapshotOptimization(enable bool) {
+	C.SetEnableLatestDeleteSnapshotOptimization(C.bool(enable))
 }

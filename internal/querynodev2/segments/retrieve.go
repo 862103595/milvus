@@ -18,7 +18,6 @@ package segments
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"go.uber.org/zap"
@@ -47,15 +46,7 @@ type RetrieveSegmentResult struct {
 func retrieveOnSegments(ctx context.Context, mgr *Manager, segments []Segment, segType SegmentType, plan *RetrievePlan, req *querypb.QueryRequest) ([]RetrieveSegmentResult, error) {
 	resultCh := make(chan RetrieveSegmentResult, len(segments))
 
-	anySegIsLazyLoad := func() bool {
-		for _, seg := range segments {
-			if seg.IsLazyLoad() {
-				return true
-			}
-		}
-		return false
-	}()
-	plan.SetIgnoreNonPk(!anySegIsLazyLoad && len(segments) > 1 && req.GetReq().GetLimit() != typeutil.Unlimited && plan.ShouldIgnoreNonPk())
+	plan.SetIgnoreNonPk(shouldEnableIgnoreNonPk(req, len(segments), plan.ShouldIgnoreNonPk()))
 
 	label := metrics.SealedSegmentLabel
 	if segType == commonpb.SegmentState_Growing {
@@ -93,7 +84,7 @@ func retrieveOnSegments(ctx context.Context, mgr *Manager, segments []Segment, s
 			result,
 			s,
 		}
-		metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+		metrics.QueryNodeSQSegmentLatency.WithLabelValues(paramtable.GetStringNodeID(),
 			metrics.QueryLabel, label).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		return nil
 	}
@@ -109,6 +100,17 @@ func retrieveOnSegments(ctx context.Context, mgr *Manager, segments []Segment, s
 		results = append(results, r)
 	}
 	return results, nil
+}
+
+// shouldEnableIgnoreNonPk determines whether to use two-phase retrieval
+// (first fetch PKs only, then fetch full field data for selected rows).
+//
+// Note: ORDER BY queries are excluded at the C++ layer — ShouldIgnoreNonPk()
+// in plan_c.cpp returns false when has_order_by_=true, so planShouldIgnoreNonPk
+// is already false for ORDER BY. No explicit !hasOrderBy check is needed here.
+func shouldEnableIgnoreNonPk(req *querypb.QueryRequest, segmentNum int, planShouldIgnoreNonPk bool) bool {
+	hasGroupBy := len(req.GetReq().GetGroupByFieldIds()) > 0 || len(req.GetReq().GetAggregates()) > 0
+	return !hasGroupBy && segmentNum > 1 && req.GetReq().GetLimit() != typeutil.Unlimited && planShouldIgnoreNonPk
 }
 
 func retrieveOnSegmentsWithStream(ctx context.Context, mgr *Manager, segments []Segment, segType SegmentType, plan *RetrievePlan, svr streamrpc.QueryStreamServer) error {
@@ -156,7 +158,7 @@ func retrieveOnSegmentsWithStream(ctx context.Context, mgr *Manager, segments []
 			}
 
 			errs[i] = nil
-			metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+			metrics.QueryNodeSQSegmentLatency.WithLabelValues(paramtable.GetStringNodeID(),
 				metrics.QueryLabel, label).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		}(segment, i)
 	}
@@ -173,7 +175,6 @@ func Retrieve(ctx context.Context, manager *Manager, plan *RetrievePlan, req *qu
 	var err error
 	var SegType commonpb.SegmentState
 	var retrieveSegments []Segment
-	var segFilters []SegmentFilter = make([]SegmentFilter, 0)
 
 	segIDs := req.GetSegmentIDs()
 	collID := req.Req.GetCollectionID()
@@ -182,18 +183,10 @@ func Retrieve(ctx context.Context, manager *Manager, plan *RetrievePlan, req *qu
 
 	if req.GetScope() == querypb.DataScope_Historical {
 		SegType = SegmentTypeSealed
-		segFilters = append(segFilters, WithType(SegmentTypeSealed))
-		if paramtable.Get().QueryNodeCfg.EnableSparseFilterInQuery.GetAsBool() {
-			segFilters = append(segFilters, WithSparseFilter(queryPlan))
-		}
-		retrieveSegments, err = validate(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs, segFilters...)
+		retrieveSegments, err = validateOnHistorical(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs, queryPlan)
 	} else {
 		SegType = SegmentTypeGrowing
-		segFilters = append(segFilters, WithType(SegmentTypeGrowing))
-		if paramtable.Get().QueryNodeCfg.EnableSparseFilterInQuery.GetAsBool() {
-			segFilters = append(segFilters, WithSparseFilter(queryPlan))
-		}
-		retrieveSegments, err = validate(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs, segFilters...)
+		retrieveSegments, err = validateOnStream(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs, queryPlan)
 	}
 
 	if err != nil {
@@ -205,7 +198,7 @@ func Retrieve(ctx context.Context, manager *Manager, plan *RetrievePlan, req *qu
 }
 
 // retrieveStreaming will retrieve all the validate target segments  and  return by stream
-func RetrieveStream(ctx context.Context, manager *Manager, plan *RetrievePlan, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) ([]Segment, error) {
+func RetrieveStream(ctx context.Context, manager *Manager, plan *RetrievePlan, req *querypb.QueryRequest, queryPlan *planpb.PlanNode, srv streamrpc.QueryStreamServer) ([]Segment, error) {
 	var err error
 	var SegType commonpb.SegmentState
 	var retrieveSegments []Segment
@@ -216,10 +209,10 @@ func RetrieveStream(ctx context.Context, manager *Manager, plan *RetrievePlan, r
 
 	if req.GetScope() == querypb.DataScope_Historical {
 		SegType = SegmentTypeSealed
-		retrieveSegments, err = validateOnHistorical(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs)
+		retrieveSegments, err = validateOnHistorical(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs, queryPlan)
 	} else {
 		SegType = SegmentTypeGrowing
-		retrieveSegments, err = validateOnStream(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs)
+		retrieveSegments, err = validateOnStream(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs, queryPlan)
 	}
 
 	if err != nil {

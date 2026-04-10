@@ -15,15 +15,16 @@
 extern "C" {
 #endif
 
-#include <stdbool.h>
-#include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 
+#include "common/common_type_c.h"
 #include "common/type_c.h"
-#include "futures/future_c.h"
-#include "segcore/plan_c.h"
-#include "segcore/load_index_c.h"
+#include "futures/future_c_types.h"
+#include "segcore/collection_c.h"
 #include "segcore/load_field_data_c.h"
+#include "segcore/load_index_c.h"
+#include "segcore/plan_c.h"
 
 typedef void* CSearchResult;
 typedef CProto CRetrieveResult;
@@ -36,18 +37,20 @@ NewSegment(CCollection collection,
            CSegmentInterface* newSegment,
            bool is_sorted_by_pk);
 
-// Create a new segment with pre-loaded segment information.
-// This function creates a segment and initializes it with serialized load info,
-// which can include precomputed metadata, statistics, or configuration data.
-//
-// @param collection: The collection that this segment belongs to
-// @param seg_type: Type of the segment (growing, sealed, etc.)
-// @param segment_id: Unique identifier for this segment
-// @param newSegment: Output parameter for the created segment interface
-// @param is_sorted_by_pk: Whether the segment data is sorted by primary key
-// @param load_info_blob: Serialized load information blob
-// @param load_info_length: Length of the load_info_blob in bytes
-// @return CStatus indicating success or failure
+/**
+ * @brief Create a new segment with pre-loaded segment information
+ * This function creates a segment and initializes it with serialized load info,
+ * which can include precomputed metadata, statistics, or configuration data
+ *
+ * @param collection: The collection that this segment belongs to
+ * @param seg_type: Type of the segment (growing, sealed, etc.)
+ * @param segment_id: Unique identifier for this segment
+ * @param newSegment: Output parameter for the created segment interface
+ * @param is_sorted_by_pk: Whether the segment data is sorted by primary key
+ * @param load_info_blob: Serialized load information blob
+ * @param load_info_length: Length of the load_info_blob in bytes
+ * @return CStatus indicating success or failure
+ */
 CStatus
 NewSegmentWithLoadInfo(CCollection collection,
                        SegmentType seg_type,
@@ -56,6 +59,72 @@ NewSegmentWithLoadInfo(CCollection collection,
                        bool is_sorted_by_pk,
                        const uint8_t* load_info_blob,
                        const int64_t load_info_length);
+/**
+ * @brief Dispatch a segment manage load task.
+ * This function make segment itself load index & field data according to load info previously set.
+ *
+ * @param c_trace: tracing context param
+ * @param c_segment: segment handle indicate which segment to load
+ * @return CStatus indicating success or failure
+ */
+/**
+ * @brief Opaque handle to a cancellation source for load operations
+ */
+typedef void* CLoadCancellationSource;
+
+/**
+ * @brief Create a new cancellation source for load operations
+ * @return Handle to the cancellation source
+ */
+CLoadCancellationSource
+NewLoadCancellationSource();
+
+/**
+ * @brief Request cancellation through the source
+ * @param source: The cancellation source handle
+ */
+void
+CancelLoadCancellationSource(CLoadCancellationSource source);
+
+/**
+ * @brief Release the cancellation source
+ * @param source: The cancellation source handle to release
+ */
+void
+ReleaseLoadCancellationSource(CLoadCancellationSource source);
+
+/**
+ * @brief Load segment with cancellation support
+ * @param c_trace: tracing context param
+ * @param c_segment: segment handle indicate which segment to load
+ * @param source: cancellation source for cancelling the load operation (can be NULL)
+ * @return CStatus indicating success or failure
+ */
+CStatus
+SegmentLoad(CTraceContext c_trace,
+            CSegmentInterface c_segment,
+            CLoadCancellationSource source);
+
+/**
+ * @brief Reopen an existing segment with updated load information
+ *
+ * This function reopens a segment with new load configuration, typically used
+ * when the segment needs to be reconfigured due to schema changes or updated
+ * load parameters. The segment will be reinitialized with the provided load info
+ * while preserving its identity (segment_id).
+ *
+ * @param c_trace Tracing context for distributed tracing and debugging
+ * @param c_segment The segment handle to be reopened
+ * @param load_info_blob Serialized SegmentLoadInfo protobuf message containing
+ *                       the new load configuration (field data info, index info, etc.)
+ * @param load_info_length Length of the load_info_blob in bytes
+ * @return CStatus indicating success or failure with error details
+ */
+CStatus
+ReopenSegment(CTraceContext c_trace,
+              CSegmentInterface c_segment,
+              const uint8_t* load_info_blob,
+              const int64_t load_info_length);
 
 void
 DeleteSegment(CSegmentInterface c_segment);
@@ -73,7 +142,8 @@ AsyncSearch(CTraceContext c_trace,
             CPlaceholderGroup c_placeholder_group,
             uint64_t timestamp,
             int32_t consistency_level,
-            uint64_t collection_ttl);
+            uint64_t collection_ttl,
+            uint64_t entity_ttl_physical_time_us);
 
 void
 DeleteRetrieveResult(CRetrieveResult* retrieve_result);
@@ -86,7 +156,8 @@ AsyncRetrieve(CTraceContext c_trace,
               int64_t limit_size,
               bool ignore_non_pk,
               int32_t consistency_level,
-              uint64_t collection_ttl);
+              uint64_t collection_ttl,
+              uint64_t entity_ttl_physical_time_us);
 
 CFuture*  // Future<CRetrieveResult>
 AsyncRetrieveByOffsets(CTraceContext c_trace,
@@ -140,15 +211,11 @@ UpdateSealedSegmentIndex(CSegmentInterface c_segment,
                          CLoadIndexInfo c_load_index_info);
 
 CStatus
-LoadTextIndex(CSegmentInterface c_segment,
-              const uint8_t* serialized_load_text_index_info,
-              const uint64_t len);
-
-CStatus
 LoadJsonKeyIndex(CTraceContext c_trace,
                  CSegmentInterface c_segment,
                  const uint8_t* serialied_load_json_key_index_info,
-                 const uint64_t len);
+                 const uint64_t len,
+                 CLoadCancellationSource source);
 
 CStatus
 UpdateFieldRawDataSize(CSegmentInterface c_segment,
@@ -169,10 +236,6 @@ DropSealedSegmentJSONIndex(CSegmentInterface c_segment,
                            int64_t field_id,
                            const char* nested_path);
 
-CStatus
-AddFieldDataInfoForSealed(CSegmentInterface c_segment,
-                          CLoadFieldDataInfo c_load_field_data_info);
-
 //////////////////////////////    interfaces for SegmentInterface    //////////////////////////////
 CStatus
 ExistPk(CSegmentInterface c_segment,
@@ -189,12 +252,6 @@ Delete(CSegmentInterface c_segment,
 
 void
 RemoveFieldFile(CSegmentInterface c_segment, int64_t field_id);
-
-CStatus
-CreateTextIndex(CSegmentInterface c_segment, int64_t field_id);
-
-CStatus
-FinishLoad(CSegmentInterface c_segment);
 
 CStatus
 ExprResCacheEraseSegment(int64_t segment_id);

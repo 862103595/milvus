@@ -16,44 +16,65 @@
 
 #include "index/VectorMemIndex.h"
 
-#include <unistd.h>
+#include <assert.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <initializer_list>
+#include <iosfwd>
+#include <list>
+#include <map>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
+#include "common/BitsetView.h"
 #include "common/Common.h"
+#include "common/Consts.h"
+#include "common/EasyAssert.h"
+#include "common/FieldData.h"
+#include "common/FieldDataInterface.h"
+#include "common/File.h"
+#include "common/OffsetMapping.h"
+#include "common/QueryInfo.h"
+#include "common/QueryResult.h"
+#include "common/RangeSearchHelper.h"
+#include "common/Slice.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
-#include "common/type_c.h"
-#include "fmt/format.h"
-
-#include "index/Index.h"
-#include "index/IndexInfo.h"
+#include "common/Utils.h"
+#include "common/VectorArray.h"
+#include "common/VectorTrait.h"
+#include "common/protobuf_utils.h"
+#include "glog/logging.h"
 #include "index/Meta.h"
 #include "index/Utils.h"
-#include "common/EasyAssert.h"
-#include "config/ConfigKnowhere.h"
-#include "knowhere/index/index_factory.h"
+#include "knowhere/binaryset.h"
+#include "knowhere/comp/index_param.h"
 #include "knowhere/comp/time_recorder.h"
-#include "common/BitsetView.h"
-#include "common/Consts.h"
-#include "common/FieldData.h"
-#include "common/File.h"
-#include "common/Slice.h"
-#include "common/RangeSearchHelper.h"
-#include "common/Utils.h"
+#include "knowhere/dataset.h"
+#include "knowhere/index/index_factory.h"
+#include "knowhere/sparse_utils.h"
 #include "log/Log.h"
+#include "monitor/Monitor.h"
+#include "nlohmann/json.hpp"
+#include "opentelemetry/trace/span.h"
+#include "opentelemetry/trace/tracer.h"
+#include "pb/common.pb.h"
+#include "prometheus/histogram.h"
 #include "storage/DataCodec.h"
+#include "storage/FileWriter.h"
 #include "storage/MemFileManagerImpl.h"
 #include "storage/ThreadPools.h"
-#include "storage/Util.h"
-#include "monitor/Monitor.h"
-
-#include "storage/FileWriter.h"
 
 namespace milvus::index {
 
@@ -146,6 +167,27 @@ VectorMemIndex<T>::Serialize(const Config& config) {
         ThrowInfo(ErrorCode::UnexpectedError,
                   "failed to serialize index: {}",
                   KnowhereStatusString(stat));
+
+    // Serialize valid_data from offset_mapping if enabled
+    if (offset_mapping_.IsEnabled()) {
+        auto total_count = offset_mapping_.GetTotalCount();
+
+        std::shared_ptr<uint8_t[]> count_buf(new uint8_t[sizeof(size_t)]);
+        size_t count = static_cast<size_t>(total_count);
+        std::memcpy(count_buf.get(), &count, sizeof(size_t));
+        ret.Append(VALID_DATA_COUNT_KEY, count_buf, sizeof(size_t));
+
+        size_t byte_size = (count + 7) / 8;
+        std::shared_ptr<uint8_t[]> data(new uint8_t[byte_size]);
+        std::memset(data.get(), 0, byte_size);
+        for (size_t i = 0; i < count; ++i) {
+            if (offset_mapping_.IsValid(i)) {
+                data[i / 8] |= (1 << (i % 8));
+            }
+        }
+        ret.Append(VALID_DATA_KEY, data, byte_size);
+    }
+
     Disassemble(ret);
 
     return ret;
@@ -160,6 +202,25 @@ VectorMemIndex<T>::LoadWithoutAssemble(const BinarySet& binary_set,
         ThrowInfo(ErrorCode::UnexpectedError,
                   "failed to Deserialize index: {}",
                   KnowhereStatusString(stat));
+
+    // Deserialize valid_data bitmap and rebuild offset_mapping
+    if (binary_set.Contains(VALID_DATA_COUNT_KEY) &&
+        binary_set.Contains(VALID_DATA_KEY)) {
+        knowhere::BinaryPtr ptr;
+        ptr = binary_set.GetByName(VALID_DATA_COUNT_KEY);
+        size_t count;
+        std::memcpy(&count, ptr->data.get(), sizeof(size_t));
+
+        ptr = binary_set.GetByName(VALID_DATA_KEY);
+        // Convert bitmap to bool array
+        std::unique_ptr<bool[]> valid_data(new bool[count]);
+        auto bitmap = ptr->data.get();
+        for (size_t i = 0; i < count; ++i) {
+            valid_data[i] = (bitmap[i / 8] >> (i % 8)) & 1;
+        }
+        BuildValidData(valid_data.get(), count);
+    }
+
     SetDim(index_.Dim());
 }
 
@@ -203,8 +264,10 @@ VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
     {
         auto read_file_span =
             milvus::tracer::StartSpan("SegCoreReadIndexFile", &ctx);
+        opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>
+            read_file_nostd_span(read_file_span);
         auto read_scope =
-            milvus::tracer::GetTracer()->WithActiveSpan(read_file_span);
+            opentelemetry::trace::Tracer::WithActiveSpan(read_file_nostd_span);
         LOG_INFO("load with slice meta: {}", !slice_meta_filepath.empty());
 
         auto load_priority =
@@ -287,8 +350,10 @@ VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
     // start engine load index span
     auto span_load_engine =
         milvus::tracer::StartSpan("SegCoreEngineLoadIndex", &ctx);
+    opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>
+        nostd_span_load_engine(span_load_engine);
     auto engine_scope =
-        milvus::tracer::GetTracer()->WithActiveSpan(span_load_engine);
+        opentelemetry::trace::Tracer::WithActiveSpan(nostd_span_load_engine);
     LOG_INFO("load index into Knowhere...");
     LoadWithoutAssemble(binary_set, config);
     span_load_engine->End();
@@ -339,19 +404,48 @@ VectorMemIndex<T>::Build(const Config& config) {
     build_config.update(config);
     build_config.erase(INSERT_FILES_KEY);
     build_config.erase(VEC_OPT_FIELDS);
-    if (!IndexIsSparse(GetIndexType())) {
-        int64_t total_size = 0;
-        int64_t total_num_rows = 0;
-        int64_t dim = 0;
-        for (auto data : field_datas) {
-            total_size += data->Size();
-            total_num_rows += data->get_num_rows();
 
+    bool nullable = false;
+    int64_t total_valid_rows = 0;
+    int64_t total_num_rows = 0;
+    for (const auto& data : field_datas) {
+        auto num_rows = data->get_num_rows();
+        auto valid_rows = data->get_valid_rows();
+        total_valid_rows += valid_rows;
+        total_num_rows += num_rows;
+        if (data->IsNullable()) {
+            nullable = true;
+        }
+    }
+    std::unique_ptr<bool[]> valid_data;
+    if (nullable) {
+        valid_data.reset(new bool[total_num_rows]);
+        int64_t chunk_offset = 0;
+        for (const auto& data : field_datas) {
+            auto rows = data->get_num_rows();
+            // Copy valid data from FieldData (bitmap format to bool array)
+            auto src_bitmap = data->ValidData();
+            for (int64_t i = 0; i < rows; ++i) {
+                valid_data[chunk_offset + i] =
+                    (src_bitmap[i >> 3] >> (i & 7)) & 1;
+            }
+            chunk_offset += rows;
+        }
+    }
+
+    if (!IndexIsSparse(GetIndexType())) {
+        int64_t dim = 0;
+        int64_t total_size = 0;
+        for (const auto& data : field_datas) {
             AssertInfo(dim == 0 || dim == data->get_dim(),
                        "inconsistent dim value between field datas!");
             dim = data->get_dim();
+            if (elem_type_ == DataType::NONE) {
+                total_size += data->DataSize();
+            } else {
+                total_size += data->Size();
+            }
         }
-
         auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[total_size]);
 
         size_t lim_offset = 0;
@@ -361,16 +455,17 @@ VectorMemIndex<T>::Build(const Config& config) {
         // For embedding list index, elem_type_ is not NONE
         if (elem_type_ == DataType::NONE) {
             // TODO: avoid copying
-            for (auto data : field_datas) {
-                std::memcpy(buf.get() + offset, data->Data(), data->Size());
-                offset += data->Size();
+            for (auto& data : field_datas) {
+                auto valid_size = data->DataSize();
+                std::memcpy(buf.get() + offset, data->Data(), valid_size);
+                offset += valid_size;
                 data.reset();
             }
         } else {
             offsets.reserve(total_num_rows + 1);
             offsets.push_back(lim_offset);
             auto bytes_per_vec = vector_bytes_per_element(elem_type_, dim);
-            for (auto data : field_datas) {
+            for (auto& data : field_datas) {
                 auto vec_array_data =
                     dynamic_cast<FieldData<VectorArray>*>(data.get());
                 AssertInfo(vec_array_data != nullptr,
@@ -396,12 +491,12 @@ VectorMemIndex<T>::Build(const Config& config) {
                 data.reset();
             }
 
-            total_num_rows = lim_offset;
+            total_valid_rows = lim_offset;
         }
 
         field_datas.clear();
 
-        auto dataset = GenDataset(total_num_rows, dim, buf.get());
+        auto dataset = GenDataset(total_valid_rows, dim, buf.get());
         if (!scalar_info.empty()) {
             dataset->Set(knowhere::meta::SCALAR_INFO, std::move(scalar_info));
         }
@@ -410,12 +505,13 @@ VectorMemIndex<T>::Build(const Config& config) {
                          const_cast<const size_t*>(offsets.data()));
         }
         BuildWithDataset(dataset, build_config);
+        if (nullable) {
+            BuildValidData(valid_data.get(), total_num_rows);
+        }
     } else {
         // sparse
-        int64_t total_rows = 0;
         int64_t dim = 0;
-        for (auto field_data : field_datas) {
-            total_rows += field_data->Length();
+        for (const auto& field_data : field_datas) {
             dim = std::max(
                 dim,
                 std::dynamic_pointer_cast<FieldData<SparseFloatVector>>(
@@ -423,28 +519,31 @@ VectorMemIndex<T>::Build(const Config& config) {
                     ->Dim());
         }
         std::vector<knowhere::sparse::SparseRow<SparseValueType>> vec(
-            total_rows);
+            total_valid_rows);
         int64_t offset = 0;
-        for (auto field_data : field_datas) {
+        for (const auto& field_data : field_datas) {
             auto ptr = static_cast<
                 const knowhere::sparse::SparseRow<SparseValueType>*>(
                 field_data->Data());
             AssertInfo(ptr, "failed to cast field data to sparse rows");
-            for (size_t i = 0; i < field_data->Length(); ++i) {
+            for (size_t i = 0; i < field_data->get_valid_rows(); ++i) {
                 // this does a deep copy of field_data's data.
                 // TODO: avoid copying by enforcing field data to give up
                 // ownership.
-                AssertInfo(dim >= ptr[i].dim(), "bad dim");
+                dim = std::max(dim, static_cast<int64_t>(ptr[i].dim()));
                 vec[offset + i] = ptr[i];
             }
-            offset += field_data->Length();
+            offset += field_data->get_valid_rows();
         }
-        auto dataset = GenDataset(total_rows, dim, vec.data());
+        auto dataset = GenDataset(total_valid_rows, dim, vec.data());
         dataset->SetIsSparse(true);
         if (!scalar_info.empty()) {
             dataset->Set(knowhere::meta::SCALAR_INFO, std::move(scalar_info));
         }
         BuildWithDataset(dataset, build_config);
+        if (nullable) {
+            BuildValidData(valid_data.get(), total_num_rows);
+        }
     }
 }
 
@@ -572,6 +671,10 @@ VectorMemIndex<T>::GetVector(const DatasetPtr dataset) const {
 template <typename T>
 std::unique_ptr<const knowhere::sparse::SparseRow<SparseValueType>[]>
 VectorMemIndex<T>::GetSparseVector(const DatasetPtr dataset) const {
+    if (dataset->GetRows() == 0) {
+        return nullptr;
+    }
+
     auto res = index_.GetVectorByIds(dataset);
     if (!res.has_value()) {
         ThrowInfo(ErrorCode::UnexpectedError,
@@ -646,6 +749,8 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
     LOG_INFO("load with slice meta: {}", !slice_meta_filepath.empty());
     std::chrono::duration<double> load_duration_sum;
     std::chrono::duration<double> write_disk_duration_sum;
+    std::unique_ptr<storage::DataCodec> valid_data_count_codec;
+    std::unique_ptr<storage::DataCodec> valid_data_codec;
     // load files in two parts:
     // 1. EMB_LIST_META: Written separately to embedding_list_meta_writer_ptr (if embedding list type)
     // 2. All other binaries: Merged and written to file_writer, forming a unified index file for knowhere
@@ -666,7 +771,6 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
         for (auto& item : meta_data[META]) {
             std::string prefix = item[NAME];
             int slice_num = item[SLICE_NUM];
-            auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
             auto HandleBatch = [&](int index) {
                 auto start_load2_mem = std::chrono::system_clock::now();
                 auto batch_data =
@@ -683,6 +787,10 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
                         embedding_list_meta_writer_ptr) {
                         embedding_list_meta_writer_ptr->Write(
                             data->PayloadData(), data->PayloadSize());
+                    } else if (prefix == VALID_DATA_COUNT_KEY) {
+                        valid_data_count_codec = std::move(data);
+                    } else if (prefix == VALID_DATA_KEY) {
+                        valid_data_codec = std::move(data);
                     } else {
                         file_writer.Write(data->PayloadData(),
                                           data->PayloadSize());
@@ -724,6 +832,10 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
                 embedding_list_meta_writer_ptr) {
                 embedding_list_meta_writer_ptr->Write(
                     index_data->PayloadData(), index_data->PayloadSize());
+            } else if (prefix == VALID_DATA_COUNT_KEY) {
+                valid_data_count_codec = std::move(index_data);
+            } else if (prefix == VALID_DATA_KEY) {
+                valid_data_codec = std::move(index_data);
             } else {
                 file_writer.Write(index_data->PayloadData(),
                                   index_data->PayloadSize());
@@ -765,8 +877,21 @@ void VectorMemIndex<T>::LoadFromFile(const Config& config) {
             deserialize_duration)
             .count());
 
-    auto dim = index_.Dim();
     this->SetDim(index_.Dim());
+
+    // Restore valid_data for nullable vector support
+    if (valid_data_count_codec && valid_data_codec) {
+        size_t count;
+        std::memcpy(
+            &count, valid_data_count_codec->PayloadData(), sizeof(size_t));
+
+        std::unique_ptr<bool[]> valid_data(new bool[count]);
+        auto bitmap = valid_data_codec->PayloadData();
+        for (size_t i = 0; i < count; ++i) {
+            valid_data[i] = (bitmap[i / 8] >> (i % 8)) & 1;
+        }
+        BuildValidData(valid_data.get(), count);
+    }
 
     this->mmap_file_raii_ =
         std::make_unique<MmapFileRAII>(local_filepath.value());

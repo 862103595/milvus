@@ -10,8 +10,18 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "IndexConfigGenerator.h"
+
+#include <assert.h>
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <utility>
+
+#include "glog/logging.h"
 #include "knowhere/comp/index_param.h"
 #include "log/Log.h"
+#include "nlohmann/json.hpp"
+#include "segcore/SegcoreConfig.h"
 
 namespace milvus::segcore {
 VecIndexConfig::VecIndexConfig(const int64_t max_index_row_cout,
@@ -87,12 +97,6 @@ VecIndexConfig::VecIndexConfig(const int64_t max_index_row_cout,
 
 int64_t
 VecIndexConfig::GetBuildThreshold() const noexcept {
-    // For sparse, do not impose a threshold and start using index with any
-    // number of rows. Unlike dense vector index, growing sparse vector index
-    // does not require a minimum number of rows to train.
-    if (is_sparse_) {
-        return 0;
-    }
     auto ratio = config_.get_build_ratio();
     assert(ratio >= 0.0 && ratio < 1.0);
     return std::max(int64_t(max_index_row_count_ * ratio),

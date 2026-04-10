@@ -261,6 +261,26 @@ func (s *CollectionSuite) TestDropCollection() {
 	})
 }
 
+func (s *CollectionSuite) TestTruncateCollection() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.Run("success", func() {
+		s.mock.EXPECT().TruncateCollection(mock.Anything, mock.Anything).
+			Return(&milvuspb.TruncateCollectionResponse{Status: merr.Success()}, nil).Once()
+
+		err := s.client.TruncateCollection(ctx, NewTruncateCollectionOption("test_collection"))
+		s.NoError(err)
+	})
+
+	s.Run("failure", func() {
+		s.mock.EXPECT().TruncateCollection(mock.Anything, mock.Anything).Return(nil, merr.WrapErrServiceInternal("mocked")).Once()
+
+		err := s.client.TruncateCollection(ctx, NewTruncateCollectionOption("test_collection"))
+		s.Error(err)
+	})
+}
+
 func (s *CollectionSuite) TestRenameCollection() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -440,6 +460,37 @@ func (s *CollectionSuite) TestAddCollectionField() {
 
 		err := s.client.AddCollectionField(ctx, NewAddCollectionFieldOption(collName, field))
 		s.Error(err)
+	})
+
+	s.Run("vector_field_without_nullable", func() {
+		collName := fmt.Sprintf("coll_%s", s.randString(6))
+		fieldName := fmt.Sprintf("field_%s", s.randString(6))
+		// no mock expected because validation should fail before RPC call
+
+		field := entity.NewField().WithName(fieldName).WithDataType(entity.FieldTypeFloatVector).WithDim(128)
+
+		err := s.client.AddCollectionField(ctx, NewAddCollectionFieldOption(collName, field))
+		s.Error(err)
+		s.Contains(err.Error(), "adding vector field to existing collection requires nullable=true")
+	})
+
+	s.Run("vector_field_with_nullable", func() {
+		collName := fmt.Sprintf("coll_%s", s.randString(6))
+		fieldName := fmt.Sprintf("field_%s", s.randString(6))
+		s.mock.EXPECT().AddCollectionField(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, acfr *milvuspb.AddCollectionFieldRequest) (*commonpb.Status, error) {
+			fieldProto := &schemapb.FieldSchema{}
+			err := proto.Unmarshal(acfr.GetSchema(), fieldProto)
+			s.Require().NoError(err)
+			s.Equal(fieldName, fieldProto.GetName())
+			s.Equal(schemapb.DataType_FloatVector, fieldProto.GetDataType())
+			s.True(fieldProto.GetNullable())
+			return merr.Success(), nil
+		}).Once()
+
+		field := entity.NewField().WithName(fieldName).WithDataType(entity.FieldTypeFloatVector).WithDim(128).WithNullable(true)
+
+		err := s.client.AddCollectionField(ctx, NewAddCollectionFieldOption(collName, field))
+		s.NoError(err)
 	})
 }
 

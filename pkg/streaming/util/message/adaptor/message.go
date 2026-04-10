@@ -119,6 +119,7 @@ func fromMessageToTsMsgV1(msg message.ImmutableMessage) (msgstream.TsMsg, error)
 		MsgID:     MustGetMQWrapperIDFromMessage(msg.LastConfirmedMessageID()).Serialize(),
 		MsgGroup:  "", // Not important any more.
 		Timestamp: msg.TimeTick(),
+		WALName:   commonpb.WALName(msg.WALName()),
 	})
 
 	return recoverMessageFromHeader(tsMsg, msg)
@@ -133,12 +134,20 @@ func fromMessageToTsMsgV2(msg message.ImmutableMessage) (msgstream.TsMsg, error)
 		tsMsg, err = NewFlushMessageBody(msg)
 	case message.MessageTypeManualFlush:
 		tsMsg, err = NewManualFlushMessageBody(msg)
+	case message.MessageTypeFlushAll:
+		tsMsg, err = NewFlushAllMessageBody(msg)
 	case message.MessageTypeCreateSegment:
 		tsMsg, err = NewCreateSegmentMessageBody(msg)
 	case message.MessageTypeSchemaChange:
 		tsMsg, err = NewSchemaChangeMessageBody(msg)
 	case message.MessageTypeAlterCollection:
 		tsMsg, err = NewAlterCollectionMessageBody(msg)
+	case message.MessageTypeTruncateCollection:
+		tsMsg, err = NewTruncateCollectionMessageBody(msg)
+	case message.MessageTypeAlterWAL:
+		tsMsg, err = NewAlterWALMessageBody(msg)
+	case message.MessageTypeCreateIndex:
+		tsMsg, err = NewCreateIndexMessageBody(msg)
 	default:
 		panic("unsupported message type")
 	}
@@ -152,6 +161,7 @@ func fromMessageToTsMsgV2(msg message.ImmutableMessage) (msgstream.TsMsg, error)
 		MsgID:     MustGetMQWrapperIDFromMessage(msg.LastConfirmedMessageID()).Serialize(),
 		MsgGroup:  "", // Not important any more.
 		Timestamp: msg.TimeTick(),
+		WALName:   commonpb.WALName(msg.WALName()),
 	})
 	return tsMsg, nil
 }

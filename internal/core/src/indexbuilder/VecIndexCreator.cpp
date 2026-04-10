@@ -9,14 +9,16 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include <map>
-#include <utility>
-
+#include "common/Consts.h"
 #include "common/EasyAssert.h"
-#include "indexbuilder/VecIndexCreator.h"
-#include "index/Utils.h"
+#include "common/QueryResult.h"
 #include "index/IndexFactory.h"
-#include "pb/index_cgo_msg.pb.h"
+#include "index/IndexInfo.h"
+#include "index/Utils.h"
+#include "index/VectorIndex.h"
+#include "indexbuilder/VecIndexCreator.h"
+#include "nlohmann/json.hpp"
+#include "storage/Types.h"
 
 namespace milvus::indexbuilder {
 
@@ -65,8 +67,15 @@ VecIndexCreator::dim() {
 }
 
 void
-VecIndexCreator::Build(const milvus::DatasetPtr& dataset) {
+VecIndexCreator::Build(const milvus::DatasetPtr& dataset,
+                       const bool* valid_data,
+                       const int64_t valid_data_len) {
     index_->BuildWithDataset(dataset, config_);
+    if (valid_data && valid_data_len > 0) {
+        auto vec_index = dynamic_cast<index::VectorIndex*>(index_.get());
+        AssertInfo(vec_index != nullptr, "failed to cast index to VectorIndex");
+        vec_index->BuildValidData(valid_data, valid_data_len);
+    }
 }
 
 void

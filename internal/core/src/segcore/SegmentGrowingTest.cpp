@@ -9,19 +9,60 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <folly/FBVector.h>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+#include <stddef.h>
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <optional>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
 
+#include "NamedType/named_type_impl.hpp"
+#include "bitset/bitset.h"
+#include "bitset/detail/element_vectorized.h"
+#include "cachinglayer/Utils.h"
+#include "common/Consts.h"
+#include "common/EasyAssert.h"
+#include "common/IndexMeta.h"
+#include "common/QueryResult.h"
+#include "common/Schema.h"
 #include "common/Types.h"
+#include "common/Utils.h"
+#include "common/VectorTrait.h"
+#include "common/protobuf_utils.h"
+#include "expr/ITypeExpr.h"
+#include "filemanager/InputStream.h"
+#include "gtest/gtest.h"
 #include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
+#include "knowhere/object.h"
+#include "knowhere/sparse_utils.h"
+#include "pb/common.pb.h"
+#include "pb/schema.pb.h"
+#include "pb/segcore.pb.h"
+#include "plan/PlanNode.h"
+#include "query/ExecPlanNodeVisitor.h"
+#include "query/Plan.h"
+#include "query/PlanNode.h"
+#include "segcore/ConcurrentVector.h"
+#include "segcore/InsertRecord.h"
+#include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentGrowing.h"
 #include "segcore/SegmentGrowingImpl.h"
-#include "pb/schema.pb.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/storage_test_utils.h"
 
 using namespace milvus::segcore;
 using namespace milvus;
-namespace pb = milvus::proto;
 
 TEST(Growing, DeleteCount) {
     auto schema = std::make_shared<Schema>();
@@ -435,6 +476,340 @@ TEST(Growing, FillNullableData) {
     }
 }
 
+class GrowingNullableTest : public ::testing::TestWithParam<
+                                std::tuple</*data_type*/ DataType,
+                                           /*metric_type*/ knowhere::MetricType,
+                                           /*index_type*/ std::string,
+                                           /*null_percent*/ int,
+                                           /*enable_interim_index*/ bool,
+                                           /*use_iterator*/ bool>> {
+ public:
+    void
+    SetUp() override {
+        std::tie(data_type,
+                 metric_type,
+                 index_type,
+                 null_percent,
+                 enable_interim_index,
+                 use_iterator) = GetParam();
+    }
+
+    DataType data_type;
+    knowhere::MetricType metric_type;
+    std::string index_type;
+    int null_percent;
+    bool enable_interim_index;
+    bool use_iterator;
+};
+
+static std::vector<
+    std::tuple<DataType, knowhere::MetricType, std::string, int, bool, bool>>
+GenerateGrowingNullableTestParams() {
+    std::vector<
+        std::
+            tuple<DataType, knowhere::MetricType, std::string, int, bool, bool>>
+        params;
+
+    // Dense float vectors with IVF_FLAT
+    std::vector<std::tuple<DataType, knowhere::MetricType, std::string>>
+        base_configs = {
+            {DataType::VECTOR_FLOAT,
+             knowhere::metric::L2,
+             knowhere::IndexEnum::INDEX_FAISS_IVFFLAT},
+            {DataType::VECTOR_FLOAT,
+             knowhere::metric::IP,
+             knowhere::IndexEnum::INDEX_FAISS_IVFFLAT},
+            {DataType::VECTOR_FLOAT,
+             knowhere::metric::COSINE,
+             knowhere::IndexEnum::INDEX_FAISS_IVFFLAT},
+            {DataType::VECTOR_SPARSE_U32_F32,
+             knowhere::metric::IP,
+             knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX},
+        };
+
+    std::vector<int> null_percents = {0, 20, 100};
+
+    std::vector<bool> interim_index_configs = {true, false};
+
+    std::vector<bool> iterator_configs = {false, true};
+
+    for (const auto& [dtype, metric, idx_type] : base_configs) {
+        for (int null_pct : null_percents) {
+            for (bool enable_interim : interim_index_configs) {
+                for (bool use_iter : iterator_configs) {
+                    // Skip iterator for sparse vectors (not supported)
+                    if (use_iter && dtype == DataType::VECTOR_SPARSE_U32_F32) {
+                        continue;
+                    }
+                    params.push_back({dtype,
+                                      metric,
+                                      idx_type,
+                                      null_pct,
+                                      enable_interim,
+                                      use_iter});
+                }
+            }
+        }
+    }
+    return params;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    NullableVectorParameters,
+    GrowingNullableTest,
+    ::testing::ValuesIn(GenerateGrowingNullableTestParams()));
+
+TEST_P(GrowingNullableTest, SearchAndQueryNullableVectors) {
+    using namespace milvus::query;
+
+    bool nullable = true;
+
+    auto schema = std::make_shared<Schema>();
+    auto int64_field = schema->AddDebugField("int64", DataType::INT64);
+    int64_t dim = 8;
+    auto vec = schema->AddDebugField(
+        "embeddings", data_type, dim, metric_type, nullable);
+    schema->set_primary_field_id(int64_field);
+
+    std::map<std::string, std::string> index_params;
+    std::map<std::string, std::string> type_params;
+    if (data_type == DataType::VECTOR_SPARSE_U32_F32) {
+        index_params = {{"index_type", index_type},
+                        {"metric_type", metric_type}};
+        type_params = {};
+    } else {
+        index_params = {{"index_type", index_type},
+                        {"metric_type", metric_type},
+                        {"nlist", "128"}};
+        type_params = {{"dim", std::to_string(dim)}};
+    }
+    FieldIndexMeta fieldIndexMeta(
+        vec, std::move(index_params), std::move(type_params));
+    auto config = SegcoreConfig::default_config();
+    config.set_chunk_rows(1024);
+    config.set_enable_interim_segment_index(enable_interim_index);
+    // Explicitly set interim index type to avoid contamination from other tests
+    config.set_dense_vector_intermin_index_type(
+        knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC);
+    std::map<FieldId, FieldIndexMeta> filedMap = {{vec, fieldIndexMeta}};
+    IndexMetaPtr metaPtr =
+        std::make_shared<CollectionIndexMeta>(100000, std::move(filedMap));
+    auto segment_growing = CreateGrowingSegment(schema, metaPtr, 1, config);
+    auto segment = dynamic_cast<SegmentGrowingImpl*>(segment_growing.get());
+
+    int64_t batch_size = 2000;
+    int64_t num_rounds = 10;
+    int64_t topk = 5;
+    // Iterator only supports single query
+    int64_t num_queries = use_iterator ? 1 : 2;
+    Timestamp timestamp = 10000000;
+
+    // Prepare search plan using ScopedSchemaHandle
+    milvus::segcore::ScopedSchemaHandle schema_handle(*schema);
+    std::vector<char> plan_str;
+    if (data_type == DataType::VECTOR_SPARSE_U32_F32) {
+        plan_str = schema_handle.ParseSearch(
+            "",                               // expression (no filter)
+            "embeddings",                     // vector field name
+            topk,                             // topk
+            metric_type,                      // metric_type
+            R"({"drop_ratio_search": 0.1})",  // search_params
+            3);                               // round_decimal
+    } else if (use_iterator) {
+        plan_str = schema_handle.ParseSearchIterator(
+            "",                           // expression (no filter)
+            "embeddings",                 // vector field name
+            topk,                         // topk
+            metric_type,                  // metric_type
+            R"({"nprobe": 10})",          // search_params
+            static_cast<uint32_t>(topk),  // batch_size
+            "",                           // token (empty)
+            std::nullopt,                 // last_bound (none)
+            3);                           // round_decimal
+    } else {
+        plan_str =
+            schema_handle.ParseSearch("",            // expression (no filter)
+                                      "embeddings",  // vector field name
+                                      topk,          // topk
+                                      metric_type,   // metric_type
+                                      R"({"nprobe": 10})",  // search_params
+                                      3);                   // round_decimal
+    }
+    auto plan =
+        CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
+
+    // Create query vectors
+    proto::common::PlaceholderGroup ph_group_raw;
+    if (data_type == DataType::VECTOR_SPARSE_U32_F32) {
+        ph_group_raw = CreateSparseFloatPlaceholderGroup(num_queries, 42);
+    } else {
+        auto query_data = generate_float_vector(num_queries, dim);
+        ph_group_raw =
+            CreatePlaceholderGroupFromBlob(num_queries, dim, query_data.data());
+    }
+
+    auto ph_group =
+        ParsePlaceholderGroup(plan.get(), ph_group_raw.SerializeAsString());
+
+    // Store all inserted data for verification
+    // For nullable vectors, data is stored sparsely (only valid vectors)
+    // We need a mapping from logical offset to physical offset
+    std::vector<float> all_float_vectors;  // Physical storage (only valid)
+    std::vector<knowhere::sparse::SparseRow<float>> all_sparse_vectors;
+    std::vector<bool> all_valid_data;  // Logical storage (all rows)
+    std::vector<int64_t>
+        logical_to_physical;  // Maps logical offset to physical
+
+    // Insert data in multiple rounds and test after each round
+    for (int64_t round = 0; round < num_rounds; round++) {
+        int64_t total_rows = (round + 1) * batch_size;
+        int64_t expected_valid_count =
+            total_rows - (total_rows * null_percent / 100);
+
+        auto dataset = DataGen(schema,
+                               batch_size,
+                               42 + round,
+                               0,
+                               1,
+                               10,
+                               1,
+                               false,
+                               true,
+                               false,
+                               null_percent);
+
+        // Build logical to physical mapping for this batch
+        int64_t base_physical = all_float_vectors.size() / dim;
+        if (data_type == DataType::VECTOR_SPARSE_U32_F32) {
+            base_physical = all_sparse_vectors.size();
+        }
+
+        auto valid_data_from_dataset = dataset.get_col_valid(vec);
+        int64_t physical_idx = base_physical;
+        for (size_t i = 0; i < valid_data_from_dataset.size(); i++) {
+            if (valid_data_from_dataset[i]) {
+                logical_to_physical.push_back(physical_idx);
+                physical_idx++;
+            } else {
+                logical_to_physical.push_back(-1);  // null
+            }
+        }
+
+        // Get original data directly from proto (sparse storage for nullable)
+        // Data is stored sparsely - only valid vectors are in the proto
+        if (data_type == DataType::VECTOR_FLOAT) {
+            auto field_data = dataset.get_col(vec);
+            auto& float_data = field_data->vectors().float_vector().data();
+            all_float_vectors.insert(
+                all_float_vectors.end(), float_data.begin(), float_data.end());
+        } else if (data_type == DataType::VECTOR_SPARSE_U32_F32) {
+            auto field_data = dataset.get_col(vec);
+            auto& sparse_array = field_data->vectors().sparse_float_vector();
+            for (int i = 0; i < sparse_array.contents_size(); i++) {
+                auto& content = sparse_array.contents(i);
+                auto row = CopyAndWrapSparseRow(content.data(), content.size());
+                all_sparse_vectors.push_back(std::move(row));
+            }
+        }
+        all_valid_data.insert(all_valid_data.end(),
+                              valid_data_from_dataset.begin(),
+                              valid_data_from_dataset.end());
+
+        auto offset = segment->PreInsert(batch_size);
+        segment->Insert(offset,
+                        batch_size,
+                        dataset.row_ids_.data(),
+                        dataset.timestamps_.data(),
+                        dataset.raw_);
+
+        auto& insert_record = segment->get_insert_record();
+        ASSERT_TRUE(insert_record.is_valid_data_exist(vec));
+
+        auto valid_data_ptr = insert_record.get_data_base(vec);
+        auto valid_data = valid_data_ptr->get_valid_data();
+
+        // Test search
+        auto sr =
+            segment_growing->Search(plan.get(), ph_group.get(), timestamp);
+
+        ASSERT_EQ(sr->total_nq_, num_queries);
+        ASSERT_EQ(sr->unity_topK_, topk);
+
+        if (expected_valid_count == 0) {
+            auto total_results = sr->get_total_result_count();
+            EXPECT_EQ(total_results, 0)
+                << "Round " << round
+                << ": 100% null should return 0 results, but got "
+                << total_results;
+        } else {
+            // Verify search results don't contain null vectors
+            for (size_t i = 0; i < sr->seg_offsets_.size(); i++) {
+                auto seg_offset = sr->seg_offsets_[i];
+                if (seg_offset < 0) {
+                    continue;
+                }
+                ASSERT_TRUE(valid_data[seg_offset])
+                    << "Round " << round
+                    << ": Search returned null vector at offset " << seg_offset;
+            }
+        }
+
+        auto vec_result = segment->bulk_subscript(
+            nullptr, vec, sr->seg_offsets_.data(), sr->seg_offsets_.size());
+        ASSERT_TRUE(vec_result != nullptr);
+
+        if (data_type == DataType::VECTOR_FLOAT) {
+            auto& float_data = vec_result->vectors().float_vector();
+            size_t valid_idx = 0;
+            for (size_t i = 0; i < sr->seg_offsets_.size(); i++) {
+                auto offset = sr->seg_offsets_[i];
+                if (offset < 0) {
+                    continue;  // Skip invalid offsets
+                }
+                auto physical_idx = logical_to_physical[offset];
+                for (int d = 0; d < dim; d++) {
+                    float expected_val =
+                        all_float_vectors[physical_idx * dim + d];
+                    float actual_val = float_data.data(valid_idx * dim + d);
+                    ASSERT_FLOAT_EQ(expected_val, actual_val)
+                        << "Round " << round << ": Mismatch at logical offset "
+                        << offset << " dim " << d;
+                }
+                valid_idx++;
+            }
+        } else if (data_type == DataType::VECTOR_SPARSE_U32_F32) {
+            auto& sparse_data = vec_result->vectors().sparse_float_vector();
+            size_t valid_idx = 0;
+            for (size_t i = 0; i < sr->seg_offsets_.size(); i++) {
+                auto offset = sr->seg_offsets_[i];
+                if (offset < 0) {
+                    continue;  // Skip invalid offsets
+                }
+                auto physical_idx = logical_to_physical[offset];
+                auto& content = sparse_data.contents(valid_idx);
+                auto retrieved_row =
+                    CopyAndWrapSparseRow(content.data(), content.size());
+                const auto& expected_row = all_sparse_vectors[physical_idx];
+                ASSERT_EQ(retrieved_row.size(), expected_row.size())
+                    << "Round " << round
+                    << ": Sparse vector size mismatch at logical offset "
+                    << offset;
+                for (size_t j = 0; j < retrieved_row.size(); j++) {
+                    ASSERT_EQ(retrieved_row[j].id, expected_row[j].id)
+                        << "Round " << round
+                        << ": Sparse vector id mismatch at logical offset "
+                        << offset << " element " << j;
+                    ASSERT_FLOAT_EQ(retrieved_row[j].val, expected_row[j].val)
+                        << "Round " << round
+                        << ": Sparse vector val mismatch at logical offset "
+                        << offset << " element " << j;
+                }
+                valid_idx++;
+            }
+        }
+    }
+}
+
 TEST_P(GrowingTest, FillVectorArrayData) {
     auto schema = std::make_shared<Schema>();
     auto int64_field = schema->AddDebugField("int64", DataType::INT64);
@@ -452,7 +827,6 @@ TEST_P(GrowingTest, FillVectorArrayData) {
     auto segment = dynamic_cast<SegmentGrowingImpl*>(segment_growing.get());
     int64_t per_batch = 1000;
     int64_t n_batch = 3;
-    int64_t dim = 128;
     for (int64_t i = 0; i < n_batch; i++) {
         auto dataset = DataGen(schema, per_batch);
 
@@ -520,7 +894,6 @@ TEST(GrowingTest, LoadVectorArrayData) {
         std::make_shared<CollectionIndexMeta>(100000, std::move(filedMap));
 
     int64_t dataset_size = 1000;
-    int64_t dim = 128;
     auto dataset = DataGen(schema, dataset_size);
     auto segment_growing =
         CreateGrowingWithFieldDataLoaded(schema, metaPtr, config, dataset);
@@ -593,7 +966,6 @@ TEST(GrowingTest, SearchVectorArray) {
     IndexMetaPtr metaPtr =
         std::make_shared<CollectionIndexMeta>(100000, std::move(fieldMap));
     auto segment = CreateGrowingSegment(schema, metaPtr, 1, config);
-    auto segmentImplPtr = dynamic_cast<SegmentGrowingImpl*>(segment.get());
 
     // Insert data
     int64_t N = 100;
@@ -618,19 +990,15 @@ TEST(GrowingTest, SearchVectorArray) {
     query_vec_offsets.push_back(3);
     query_vec_offsets.push_back(10);  // Second query has 7 vectors
 
-    // Create search plan
-    const char* raw_plan = R"(vector_anns: <
-                                  field_id: 101
-                                  query_info: <
-                                    topk: 5
-                                    round_decimal: 3
-                                    metric_type: "MAX_SIM"
-                                    search_params: "{\"nprobe\": 10}"
-                                  >
-                                  placeholder_tag: "$0"
-      >)";
-
-    auto plan_str = translate_text_plan_to_binary_plan(raw_plan);
+    // Create search plan using ScopedSchemaHandle
+    milvus::segcore::ScopedSchemaHandle schema_handle(*schema);
+    auto plan_str =
+        schema_handle.ParseSearch("",           // expression (no filter)
+                                  "array_vec",  // vector field name
+                                  5,            // topk
+                                  "MAX_SIM",    // metric_type
+                                  R"({"nprobe": 10})",  // search_params
+                                  3);                   // round_decimal
     auto plan =
         CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
 
@@ -645,4 +1013,468 @@ TEST(GrowingTest, SearchVectorArray) {
     auto sr = segment->Search(plan.get(), ph_group.get(), timestamp);
     auto sr_parsed = SearchResultToJson(*sr);
     std::cout << sr_parsed.dump(1) << std::endl;
+}
+
+TEST(Growing, TestMaskWithTTLField) {
+    auto schema = std::make_shared<Schema>();
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64, false);
+    auto ttl_fid =
+        schema->AddDebugField("ttl_field", DataType::TIMESTAMPTZ, false);
+    schema->set_primary_field_id(pk_fid);
+    schema->set_ttl_field_id(ttl_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    int64_t test_data_count = 100;
+
+    uint64_t base_ts = 1000000000ULL << 18;
+    std::vector<Timestamp> ts_data(test_data_count);
+    for (int i = 0; i < test_data_count; i++) {
+        ts_data[i] = base_ts + i;
+    }
+
+    std::vector<idx_t> row_ids(test_data_count);
+    std::iota(row_ids.begin(), row_ids.end(), 0);
+
+    std::vector<int64_t> pk_data(test_data_count);
+    std::iota(pk_data.begin(), pk_data.end(), 0);
+
+    uint64_t base_physical_us = (base_ts >> 18) * 1000;
+    std::vector<int64_t> ttl_data(test_data_count);
+    for (int i = 0; i < test_data_count; i++) {
+        if (i < test_data_count / 2) {
+            ttl_data[i] = static_cast<int64_t>(base_physical_us - 10);
+        } else {
+            ttl_data[i] = static_cast<int64_t>(base_physical_us + 10);
+        }
+    }
+
+    auto insert_record_proto = std::make_unique<InsertRecordProto>();
+    insert_record_proto->set_num_rows(test_data_count);
+
+    {
+        auto field_data = insert_record_proto->add_fields_data();
+        field_data->set_field_id(pk_fid.get());
+        field_data->set_type(proto::schema::DataType::Int64);
+        auto* scalars = field_data->mutable_scalars();
+        auto* data = scalars->mutable_long_data();
+        for (auto v : pk_data) {
+            data->add_data(v);
+        }
+    }
+
+    {
+        auto field_data = insert_record_proto->add_fields_data();
+        field_data->set_field_id(ttl_fid.get());
+        field_data->set_type(proto::schema::DataType::Timestamptz);
+        auto* scalars = field_data->mutable_scalars();
+        auto* data = scalars->mutable_timestamptz_data();
+        for (auto v : ttl_data) {
+            data->add_data(v);
+        }
+    }
+
+    auto offset = segment->PreInsert(test_data_count);
+    segment->Insert(offset,
+                    test_data_count,
+                    row_ids.data(),
+                    ts_data.data(),
+                    insert_record_proto.get());
+
+    // Test TTL field filtering using CompileExpressions pathway
+    Timestamp query_ts = base_ts + test_data_count;
+    int64_t active_count = segment->get_active_count(query_ts);
+
+    // Create an expression list with AlwaysTrueExpr - CompileExpressions will
+    // automatically add TTL field filtering expression
+    auto always_true_expr = std::make_shared<expr::AlwaysTrueExpr>();
+    auto plan = std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID,
+                                                       always_true_expr);
+
+    // Execute query expression - this will trigger CompileExpressions which
+    // automatically adds TTL field filtering expression
+    BitsetType bitset =
+        query::ExecuteQueryExpr(plan, segment.get(), active_count, query_ts);
+
+    // Note: ExecuteQueryExpr already flips the bitset, so bitset[i] = true
+    // means the row matches (not expired), bitset[i] = false means expired
+    BitsetTypeView bitset_view(bitset);
+
+    // Verify results:
+    // After ExecuteQueryExpr, bitset[i] = true means row matches (not expired)
+    // bitset[i] = false means row is filtered out (expired)
+    // - i < test_data_count / 2: expired (TTL < current time), should be expired (bitset_view[i] = false)
+    // - i >= test_data_count / 2: not expired, should NOT be expired (bitset_view[i] = true)
+    int expired_count = 0;
+    for (int i = 0; i < test_data_count; i++) {
+        if (!bitset_view[i]) {
+            expired_count++;
+        }
+    }
+
+    EXPECT_EQ(expired_count, test_data_count / 2);
+    for (int i = 0; i < test_data_count / 2; i++) {
+        EXPECT_FALSE(bitset_view[i]) << "Row " << i << " should be expired";
+    }
+    for (int i = test_data_count / 2; i < test_data_count; i++) {
+        EXPECT_TRUE(bitset_view[i]) << "Row " << i << " should not be expired";
+    }
+}
+
+// Test TTL field filtering with nullable field for Growing segment
+TEST(Growing, TestMaskWithNullableTTLField) {
+    // Create schema with nullable TTL field
+    auto schema = std::make_shared<Schema>();
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64, false);
+    auto ttl_fid = schema->AddDebugField(
+        "ttl_field", DataType::TIMESTAMPTZ, true);  // nullable
+    schema->set_primary_field_id(pk_fid);
+    schema->set_ttl_field_id(ttl_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    int64_t test_data_count = 100;
+
+    // Generate timestamp data
+    uint64_t base_ts = 1000000000ULL << 18;
+    std::vector<Timestamp> ts_data(test_data_count);
+    for (int i = 0; i < test_data_count; i++) {
+        ts_data[i] = base_ts + i;
+    }
+
+    // Generate row IDs
+    std::vector<idx_t> row_ids(test_data_count);
+    std::iota(row_ids.begin(), row_ids.end(), 0);
+
+    // Generate PK data
+    std::vector<int64_t> pk_data(test_data_count);
+    std::iota(pk_data.begin(), pk_data.end(), 0);
+
+    // Generate TTL data with some nulls
+    uint64_t base_physical_us = (base_ts >> 18) * 1000;
+    std::vector<int64_t> ttl_data(test_data_count);
+    std::vector<bool> valid_data(test_data_count);
+    for (int i = 0; i < test_data_count; i++) {
+        if (i % 4 == 0) {
+            // Null value - should not expire
+            ttl_data[i] = 0;
+            valid_data[i] = false;
+        } else if (i % 4 == 1) {
+            // Expired
+            ttl_data[i] = static_cast<int64_t>(base_physical_us - 10);
+            valid_data[i] = true;
+        } else {
+            // Not expired
+            ttl_data[i] = static_cast<int64_t>(base_physical_us + 10);
+            valid_data[i] = true;
+        }
+    }
+
+    // Create insert record proto
+    auto insert_record_proto = std::make_unique<InsertRecordProto>();
+    insert_record_proto->set_num_rows(test_data_count);
+
+    // Add PK field data
+    {
+        auto field_data = insert_record_proto->add_fields_data();
+        field_data->set_field_id(pk_fid.get());
+        field_data->set_type(proto::schema::DataType::Int64);
+        auto* scalars = field_data->mutable_scalars();
+        auto* data = scalars->mutable_long_data();
+        for (auto v : pk_data) {
+            data->add_data(v);
+        }
+    }
+
+    // Add nullable TTL field data
+    {
+        auto field_data = insert_record_proto->add_fields_data();
+        field_data->set_field_id(ttl_fid.get());
+        field_data->set_type(proto::schema::DataType::Timestamptz);
+        auto* scalars = field_data->mutable_scalars();
+        auto* data = scalars->mutable_timestamptz_data();
+        for (auto v : ttl_data) {
+            data->add_data(v);
+        }
+        // Add valid_data for nullable field
+        // Note: valid_data[i] = false means null, valid_data[i] = true means non-null
+        for (size_t i = 0; i < valid_data.size(); ++i) {
+            field_data->add_valid_data(valid_data[i]);
+        }
+        // Verify valid_data was added correctly
+        ASSERT_EQ(field_data->valid_data_size(), test_data_count)
+            << "valid_data size mismatch: expected " << test_data_count
+            << ", got " << field_data->valid_data_size();
+    }
+
+    // Insert data
+    auto offset = segment->PreInsert(test_data_count);
+    segment->Insert(offset,
+                    test_data_count,
+                    row_ids.data(),
+                    ts_data.data(),
+                    insert_record_proto.get());
+
+    // Test TTL field filtering using CompileExpressions pathway
+    Timestamp query_ts = base_ts + test_data_count;
+    int64_t active_count = segment->get_active_count(query_ts);
+
+    // Create an expression list with AlwaysTrueExpr - CompileExpressions will
+    // automatically add TTL field filtering expression
+    auto always_true_expr = std::make_shared<expr::AlwaysTrueExpr>();
+    auto plan = std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID,
+                                                       always_true_expr);
+
+    // Execute query expression - this will trigger CompileExpressions which
+    // automatically adds TTL field filtering expression
+    BitsetType bitset =
+        query::ExecuteQueryExpr(plan, segment.get(), active_count, query_ts);
+
+    // Note: ExecuteQueryExpr already flips the bitset, so bitset[i] = true
+    // means the row matches (not expired), bitset[i] = false means expired
+    BitsetTypeView bitset_view(bitset);
+
+    // Verify results:
+    // After ExecuteQueryExpr, bitset[i] = true means row matches (not expired)
+    // bitset[i] = false means row is filtered out (expired)
+    // - i % 4 == 0: null, should NOT be expired (bitset_view[i] = true)
+    // - i % 4 == 1: expired (TTL < current time), should be expired (bitset_view[i] = false)
+    // - i % 4 == 2 or 3: not expired, should NOT be expired (bitset_view[i] = true)
+    int expired_count = 0;
+    for (int i = 0; i < test_data_count; i++) {
+        if (i % 4 == 0) {
+            // Null value should not be expired (should match)
+            EXPECT_TRUE(bitset_view[i])
+                << "Row " << i << " (null) should not be expired";
+        } else if (i % 4 == 1) {
+            // Should be expired (should be filtered out)
+            EXPECT_FALSE(bitset_view[i]) << "Row " << i << " should be expired";
+            expired_count++;
+        } else {
+            // Should not be expired (should match)
+            EXPECT_TRUE(bitset_view[i])
+                << "Row " << i << " should not be expired";
+        }
+    }
+
+    EXPECT_EQ(expired_count, test_data_count / 4);
+}
+
+// Resource tracking tests for growing segments
+TEST(Growing, EmptySegmentResourceEstimation) {
+    auto schema = std::make_shared<Schema>();
+    auto dim = 128;
+    auto metric_type = knowhere::metric::L2;
+    schema->AddDebugField("vec", DataType::VECTOR_FLOAT, dim, metric_type);
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto* segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    // Empty segment should have zero resource usage
+    auto resource = segment_impl->EstimateSegmentResourceUsage();
+    EXPECT_EQ(resource.memory_bytes, 0);
+    EXPECT_EQ(resource.file_bytes, 0);
+}
+
+TEST(Growing, ResourceEstimationAfterInsert) {
+    auto schema = std::make_shared<Schema>();
+    auto dim = 128;
+    auto metric_type = knowhere::metric::L2;
+    schema->AddDebugField("vec", DataType::VECTOR_FLOAT, dim, metric_type);
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto* segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    // Insert some data
+    const int64_t N = 1000;
+    auto dataset = DataGen(schema, N);
+    segment->PreInsert(N);
+    segment->Insert(0,
+                    N,
+                    dataset.row_ids_.data(),
+                    dataset.timestamps_.data(),
+                    dataset.raw_);
+
+    // After insert, resource usage should be positive
+    auto resource = segment_impl->EstimateSegmentResourceUsage();
+    EXPECT_GT(resource.memory_bytes, 0);
+
+    // Memory should include at least:
+    // - Vector data: N * dim * sizeof(float) = 1000 * 128 * 4 = 512000 bytes
+    // - Timestamps: N * sizeof(Timestamp) = 1000 * 8 = 8000 bytes
+    // - PK field: N * sizeof(int64_t) = 1000 * 8 = 8000 bytes
+    // Plus safety margin of 1.2x
+    int64_t expected_min_size =
+        N * dim * sizeof(float) + N * sizeof(Timestamp) + N * sizeof(int64_t);
+    EXPECT_GE(resource.memory_bytes, expected_min_size);
+}
+
+TEST(Growing, ResourceIncrementsWithMoreInserts) {
+    auto schema = std::make_shared<Schema>();
+    auto dim = 128;
+    auto metric_type = knowhere::metric::L2;
+    schema->AddDebugField("vec", DataType::VECTOR_FLOAT, dim, metric_type);
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto* segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    // First insert
+    const int64_t N1 = 500;
+    auto dataset1 = DataGen(schema, N1, 42, 0);
+    segment->PreInsert(N1);
+    segment->Insert(0,
+                    N1,
+                    dataset1.row_ids_.data(),
+                    dataset1.timestamps_.data(),
+                    dataset1.raw_);
+    auto resource1 = segment_impl->EstimateSegmentResourceUsage();
+
+    // Second insert
+    const int64_t N2 = 500;
+    auto dataset2 = DataGen(schema, N2, 43, N1);
+    segment->PreInsert(N2);
+    segment->Insert(N1,
+                    N2,
+                    dataset2.row_ids_.data(),
+                    dataset2.timestamps_.data(),
+                    dataset2.raw_);
+    auto resource2 = segment_impl->EstimateSegmentResourceUsage();
+
+    // Resource should increase after second insert
+    EXPECT_GT(resource2.memory_bytes, resource1.memory_bytes);
+}
+
+TEST(Growing, ResourceTrackingAfterDelete) {
+    auto schema = std::make_shared<Schema>();
+    auto dim = 64;
+    auto metric_type = knowhere::metric::L2;
+    schema->AddDebugField("vec", DataType::VECTOR_FLOAT, dim, metric_type);
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto* segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    // Insert data first
+    const int64_t N = 100;
+    auto dataset = DataGen(schema, N);
+    segment->PreInsert(N);
+    segment->Insert(0,
+                    N,
+                    dataset.row_ids_.data(),
+                    dataset.timestamps_.data(),
+                    dataset.raw_);
+
+    auto resource_before_delete = segment_impl->EstimateSegmentResourceUsage();
+    EXPECT_GT(resource_before_delete.memory_bytes, 0);
+
+    // Delete some rows
+    auto pks = dataset.get_col<int64_t>(pk_fid);
+    auto del_pks = GenPKs(pks.begin(), pks.begin() + 5);
+    auto del_tss = GenTss(5, N);
+    auto status = segment->Delete(5, del_pks.get(), del_tss.data());
+    EXPECT_TRUE(status.ok());
+
+    // Resource estimation should still work after delete
+    auto resource_after_delete = segment_impl->EstimateSegmentResourceUsage();
+    EXPECT_GT(resource_after_delete.memory_bytes, 0);
+}
+
+TEST(Growing, ConcurrentInsertResourceTracking) {
+    auto schema = std::make_shared<Schema>();
+    auto dim = 32;
+    auto metric_type = knowhere::metric::L2;
+    schema->AddDebugField("vec", DataType::VECTOR_FLOAT, dim, metric_type);
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto* segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    const int num_threads = 4;
+    const int64_t rows_per_thread = 100;
+    std::vector<std::thread> threads;
+
+    // Reserve space for all rows upfront
+    int64_t total_rows = num_threads * rows_per_thread;
+    segment->PreInsert(total_rows);
+
+    // Concurrent inserts from multiple threads
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            auto dataset =
+                DataGen(schema, rows_per_thread, 42 + t, t * rows_per_thread);
+            segment->Insert(t * rows_per_thread,
+                            rows_per_thread,
+                            dataset.row_ids_.data(),
+                            dataset.timestamps_.data(),
+                            dataset.raw_);
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // Verify total row count
+    EXPECT_EQ(segment->get_row_count(), total_rows);
+
+    // Verify resource estimation is consistent and positive
+    auto resource = segment_impl->EstimateSegmentResourceUsage();
+    EXPECT_GT(resource.memory_bytes, 0);
+}
+
+TEST(Growing, MultipleFieldsResourceEstimation) {
+    // Create schema with multiple fields
+    auto schema = std::make_shared<Schema>();
+    auto dim = 64;
+    auto metric_type = knowhere::metric::L2;
+    schema->AddDebugField("vec", DataType::VECTOR_FLOAT, dim, metric_type);
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->AddDebugField("age", DataType::FLOAT);
+    schema->AddDebugField("score", DataType::DOUBLE);
+    schema->set_primary_field_id(pk_fid);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto* segment_impl = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    // Insert data
+    const int64_t N = 500;
+    auto dataset = DataGen(schema, N);
+    segment->PreInsert(N);
+    segment->Insert(0,
+                    N,
+                    dataset.row_ids_.data(),
+                    dataset.timestamps_.data(),
+                    dataset.raw_);
+
+    auto resource = segment_impl->EstimateSegmentResourceUsage();
+
+    // Memory should include all fields:
+    // - Vector: N * dim * sizeof(float) = 500 * 64 * 4 = 128000 bytes
+    // - pk (int64): N * 8 = 4000 bytes
+    // - age (float): N * 4 = 2000 bytes
+    // - score (double): N * 8 = 4000 bytes
+    // - Timestamps: N * 8 = 4000 bytes
+    // Plus safety margin
+    int64_t min_expected = N * dim * sizeof(float) + N * sizeof(int64_t) +
+                           N * sizeof(float) + N * sizeof(double) +
+                           N * sizeof(Timestamp);
+    EXPECT_GE(resource.memory_bytes, min_expected);
 }

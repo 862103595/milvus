@@ -99,6 +99,33 @@ func (s *statsInspectorSuite) SetupTest() {
 			},
 		},
 	})
+	collections.Insert(2, &collectionInfo{
+		ID: 2,
+		Schema: &schemapb.CollectionSchema{
+			ExternalSource: "s3://external",
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:       200,
+					Name:          "pk",
+					DataType:      schemapb.DataType_Int64,
+					ExternalField: "pk_col",
+				},
+				{
+					FieldID:  201,
+					Name:     "var",
+					DataType: schemapb.DataType_VarChar,
+					TypeParams: []*commonpb.KeyValuePair{
+						{
+							Key: "enable_match", Value: "true",
+						},
+						{
+							Key: "enable_analyzer", Value: "true",
+						},
+					},
+				},
+			},
+		},
+	})
 
 	s.mt = &meta{
 		collections: collections,
@@ -222,11 +249,11 @@ func (s *statsInspectorSuite) TestStart() {
 
 func (s *statsInspectorSuite) TestSubmitStatsTask() {
 	// Test submitting a valid stats task
-	err := s.inspector.SubmitStatsTask(10, 10, indexpb.StatsSubJob_Sort, true)
+	err := s.inspector.SubmitStatsTask(10, 10, indexpb.StatsSubJob_Sort, true, nil)
 	s.NoError(err)
 
 	// Test submitting a task for non-existent segment
-	err = s.inspector.SubmitStatsTask(999, 999, indexpb.StatsSubJob_Sort, true)
+	err = s.inspector.SubmitStatsTask(999, 999, indexpb.StatsSubJob_Sort, true, nil)
 	s.Error(err)
 	s.True(errors.Is(err, merr.ErrSegmentNotFound), "Error should be ErrSegmentNotFound")
 
@@ -242,8 +269,31 @@ func (s *statsInspectorSuite) TestSubmitStatsTask() {
 	})
 
 	// Simulate duplicate task error
-	err = s.inspector.SubmitStatsTask(10, 10, indexpb.StatsSubJob_Sort, true)
+	err = s.inspector.SubmitStatsTask(10, 10, indexpb.StatsSubJob_Sort, true, nil)
 	s.NoError(err) // Duplicate tasks are handled as success
+}
+
+func (s *statsInspectorSuite) TestSubmitStatsTaskSkipExternalCollection() {
+	segmentID := UniqueID(200)
+	s.mt.segments.segments[segmentID] = &SegmentInfo{
+		SegmentInfo: &datapb.SegmentInfo{
+			ID:            segmentID,
+			CollectionID:  2,
+			PartitionID:   3,
+			InsertChannel: "by-dev-rootcoord-dml-channel",
+			IsSorted:      true,
+			State:         commonpb.SegmentState_Flushed,
+			NumOfRows:     1000,
+			MaxRowNum:     2000,
+			Level:         2,
+		},
+	}
+
+	err := s.inspector.SubmitStatsTask(segmentID, segmentID, indexpb.StatsSubJob_TextIndexJob, true, nil)
+	s.NoError(err)
+	task := s.mt.statsTaskMeta.GetStatsTaskBySegmentID(segmentID, indexpb.StatsSubJob_TextIndexJob)
+	s.Nil(task)
+	s.alloc.AssertNotCalled(s.T(), "AllocID", mock.Anything)
 }
 
 func (s *statsInspectorSuite) TestGetStatsTask() {

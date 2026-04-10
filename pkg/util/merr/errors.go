@@ -70,8 +70,9 @@ var (
 	ErrCollectionIllegalSchema                 = newMilvusError("illegal collection schema", 105, false)
 	ErrCollectionOnRecovering                  = newMilvusError("collection on recovering", 106, true)
 	ErrCollectionVectorClusteringKeyNotAllowed = newMilvusError("vector clustering key not allowed", 107, false)
-	ErrCollectionReplicateMode                 = newMilvusError("can't operate on the collection under standby mode", 108, false)
-	ErrCollectionSchemaMismatch                = newMilvusError("collection schema mismatch", 109, false)
+	// Deprecated, keep it only for reserving the error code
+	ErrCollectionReplicateMode  = newMilvusError("can't operate on the collection under standby mode", 108, false)
+	ErrCollectionSchemaMismatch = newMilvusError("collection schema mismatch", 109, false)
 	// Partition related
 	ErrPartitionNotFound       = newMilvusError("partition not found", 200, false)
 	ErrPartitionNotLoaded      = newMilvusError("partition not loaded", 201, false)
@@ -106,6 +107,11 @@ var (
 	ErrSegmentLack        = newMilvusError("segment lacks", 602, false)
 	ErrSegmentReduplicate = newMilvusError("segment reduplicates", 603, false)
 	ErrSegmentLoadFailed  = newMilvusError("segment load failed", 604, false)
+	// ErrSegmentRequestResourceFailed indicates the query node cannot load the segment
+	// due to resource exhaustion (Memory, Disk, or GPU). When this error is returned,
+	// the query coordinator will mark the node as resource exhausted and apply a
+	// penalty period during which the node won't receive new loading tasks.
+	ErrSegmentRequestResourceFailed = newMilvusError("segment request resource failed", 605, false)
 
 	// Index related
 	ErrIndexNotFound     = newMilvusError("index not found", 700, false)
@@ -127,9 +133,20 @@ var (
 	ErrNodeStateUnexpected = newMilvusError("node state unexpected", 906, false)
 
 	// IO related
-	ErrIoKeyNotFound = newMilvusError("key not found", 1000, false)
-	ErrIoFailed      = newMilvusError("IO failed", 1001, false)
-	ErrIoUnexpectEOF = newMilvusError("unexpected EOF", 1002, true)
+	ErrIoKeyNotFound     = newMilvusError("key not found", 1000, false)
+	ErrIoFailed          = newMilvusError("IO failed", 1001, false)
+	ErrIoUnexpectEOF     = newMilvusError("unexpected EOF", 1002, true)
+	ErrIoTooManyRequests = newMilvusError("too many requests", 1003, true)
+
+	// Permanent errors - resource doesn't exist or access denied
+	ErrIoPermissionDenied   = newMilvusError("permission denied", 1005, false)
+	ErrIoBucketNotFound     = newMilvusError("bucket not found", 1006, false)
+	ErrIoInvalidCredentials = newMilvusError("invalid credentials", 1007, false)
+
+	// Client validation errors - request is malformed
+	ErrIoInvalidArgument = newMilvusError("invalid argument", 1010, false)
+	ErrIoInvalidRange    = newMilvusError("invalid range", 1011, false)
+	ErrIoEntityTooLarge  = newMilvusError("entity too large", 1012, false)
 
 	// Parameter related
 	ErrParameterInvalid  = newMilvusError("invalid parameter", 1100, false)
@@ -143,7 +160,8 @@ var (
 	ErrMqTopicNotFound = newMilvusError("topic not found", 1300, false)
 	ErrMqTopicNotEmpty = newMilvusError("topic not empty", 1301, false)
 	ErrMqInternal      = newMilvusError("message queue internal error", 1302, false)
-	ErrDenyProduceMsg  = newMilvusError("deny to write the message to mq", 1303, false)
+	// Deprecated, keep it only for reserving the error code
+	ErrDenyProduceMsg = newMilvusError("deny to write the message to mq", 1303, false)
 
 	// Privilege related
 	// this operation is denied because the user not authorized, user need to login in first
@@ -172,7 +190,7 @@ var (
 	ErrCheckPrimaryKey           = newMilvusError("please check the primary key and its' type can only in [int, string]", 1806, false)
 	ErrHTTPRateLimit             = newMilvusError("request is rejected by limiter", 1807, true)
 
-	// replicate related
+	// Deprecated, legacy replicate related errors, keep them only for reserving the error code
 	ErrDenyReplicateMessage = newMilvusError("deny to use the replicate message in the normal instance", 1900, false)
 	ErrInvalidMsgBytes      = newMilvusError("invalid replicate msg bytes", 1901, false)
 	ErrNoAssignSegmentID    = newMilvusError("no assign segment id", 1902, false)
@@ -218,6 +236,9 @@ var (
 	ErrCleanPartitionStatsFail                    = newMilvusError("fail to clean partition Stats", 2316, true)
 
 	ErrDataNodeSlotExhausted = newMilvusError("datanode slot exhausted", 2401, false)
+
+	// Cipher/Encryption related
+	ErrKMSKeyRevoked = newMilvusError("KMS key has been revoked, access denied", 2500, false)
 
 	// General
 	ErrOperationNotSupported = newMilvusError("unsupported operation", 3000, false)

@@ -18,9 +18,7 @@ use crate::error::{Result, TantivyBindingError};
 use crate::index_reader::IndexReaderWrapper;
 use crate::index_reader_c::SetBitsetFn;
 use crate::index_writer::TantivyValue;
-use crate::util::c_ptr_to_str;
-
-const BATCH_SIZE: usize = 4096;
+use crate::util::{c_ptr_to_str, ptr_len_to_str};
 
 #[inline]
 pub(crate) fn schema_builder_add_field(
@@ -184,6 +182,22 @@ impl IndexWriterWrapperImpl {
         self.add_document(document, offset)
     }
 
+    pub fn add_array_keywords_with_len(
+        &mut self,
+        ptrs: &[*const u8],
+        lens: &[usize],
+        offset: u32,
+    ) -> Result<()> {
+        debug_assert_eq!(ptrs.len(), lens.len());
+        let mut document = TantivyDocument::default();
+        for i in 0..ptrs.len() {
+            let data = ptr_len_to_str(ptrs[i], lens[i])?;
+            document.add_field_value(self.field, data);
+        }
+
+        self.add_document(document, offset)
+    }
+
     pub fn add_json(&mut self, data: &str, offset: u32) -> Result<()> {
         let j = serde_json::from_str::<serde_json::Value>(data)?;
         let mut document = TantivyDocument::default();
@@ -203,14 +217,16 @@ impl IndexWriterWrapperImpl {
         self.add_document(document, offset)
     }
 
+    /// Add json key stats - adds documents one by one
+    /// Tantivy's IndexWriter has internal buffering, so external batching is unnecessary
     pub fn add_json_key_stats(
         &mut self,
         keys: &[*const c_char],
         json_offsets: &[*const i64],
         json_offsets_len: &[usize],
     ) -> Result<()> {
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
         let id_field = self.id_field.unwrap();
+
         for i in 0..keys.len() {
             let key = c_ptr_to_str(keys[i])
                 .map_err(|e| TantivyBindingError::InternalError(e.to_string()))?;
@@ -218,22 +234,11 @@ impl IndexWriterWrapperImpl {
             let offsets = unsafe { convert_to_rust_slice!(json_offsets[i], json_offsets_len[i]) };
 
             for offset in offsets {
-                batch.push(UserOperation::Add(doc!(
+                self.index_writer.add_document(doc!(
                     id_field => *offset,
                     self.field => key,
-                )));
-
-                if batch.len() >= BATCH_SIZE {
-                    self.index_writer.run(std::mem::replace(
-                        &mut batch,
-                        Vec::with_capacity(BATCH_SIZE),
-                    ))?;
-                }
+                ))?;
             }
-        }
-
-        if !batch.is_empty() {
-            self.index_writer.run(batch)?;
         }
 
         Ok(())
@@ -254,6 +259,12 @@ impl IndexWriterWrapperImpl {
         // self.manual_merge();
         block_on(self.index_writer.garbage_collect_files())?;
         self.index_writer.wait_merging_threads()?;
+
+        // TODO: remove this log when #45590 is solved
+        let metas = self.index.searchable_segment_metas()?;
+        let segment_ids: Vec<_> = metas.iter().map(|m| m.id().uuid_string()).collect();
+        info!("tantivy index_writer finish, segments: {:?}", segment_ids);
+
         Ok(())
     }
 

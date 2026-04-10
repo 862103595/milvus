@@ -22,9 +22,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"syscall"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/cockroachdb/errors"
 	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
@@ -55,6 +55,7 @@ type ObjectStorage interface {
 	// 2. underlying walking failed or context canceled, WalkWithPrefix will stop and return a error.
 	WalkWithObjects(ctx context.Context, bucketName string, prefix string, recursive bool, walkFunc ChunkObjectWalkFunc) error
 	RemoveObject(ctx context.Context, bucketName, objectName string) error
+	CopyObject(ctx context.Context, bucketName, srcObjectName, dstObjectName string) error
 }
 
 // RemoteChunkManager is responsible for read and write data stored in mminio.
@@ -64,6 +65,8 @@ type RemoteChunkManager struct {
 	//	ctx        context.Context
 	bucketName string
 	rootPath   string
+
+	readRetryAttempts uint
 }
 
 var _ ChunkManager = (*RemoteChunkManager)(nil)
@@ -82,9 +85,10 @@ func NewRemoteChunkManager(ctx context.Context, c *objectstorage.Config) (*Remot
 		return nil, err
 	}
 	mcm := &RemoteChunkManager{
-		client:     client,
-		bucketName: c.BucketName,
-		rootPath:   strings.TrimLeft(c.RootPath, "/"),
+		client:            client,
+		bucketName:        c.BucketName,
+		rootPath:          strings.TrimLeft(c.RootPath, "/"),
+		readRetryAttempts: c.ReadRetryAttempts,
 	}
 	log.Info("remote chunk manager init success.", zap.String("remote", c.CloudProvider), zap.String("bucketname", c.BucketName), zap.String("root", mcm.RootPath()))
 	return mcm, nil
@@ -93,9 +97,10 @@ func NewRemoteChunkManager(ctx context.Context, c *objectstorage.Config) (*Remot
 // NewRemoteChunkManagerForTesting is used for testing.
 func NewRemoteChunkManagerForTesting(c *minio.Client, bucket string, rootPath string) *RemoteChunkManager {
 	mcm := &RemoteChunkManager{
-		client:     &MinioObjectStorage{c},
-		bucketName: bucket,
-		rootPath:   rootPath,
+		client:            &MinioObjectStorage{c},
+		bucketName:        bucket,
+		rootPath:          rootPath,
+		readRetryAttempts: 10,
 	}
 	return mcm
 }
@@ -133,13 +138,21 @@ func (mcm *RemoteChunkManager) Reader(ctx context.Context, filePath string) (Fil
 }
 
 func (mcm *RemoteChunkManager) Size(ctx context.Context, filePath string) (int64, error) {
-	objectInfo, err := mcm.getObjectSize(ctx, mcm.bucketName, filePath)
-	if err != nil {
-		log.Warn("failed to stat object", zap.String("bucket", mcm.bucketName), zap.String("path", filePath), zap.Error(err))
-		return 0, err
-	}
-
-	return objectInfo, nil
+	var objectInfo int64
+	var err error
+	err = retry.Handle(ctx, func() (bool, error) {
+		objectInfo, err = mcm.getObjectSize(ctx, mcm.bucketName, filePath)
+		if err == nil {
+			return false, nil
+		}
+		log.Warn("failed to get object size", zap.String("bucket", mcm.bucketName), zap.String("path", filePath), zap.Error(err))
+		err = mapObjectStorageError(filePath, err)
+		if merr.IsRetryableErr(err) {
+			return true, err
+		}
+		return false, err
+	}, retry.Attempts(mcm.readRetryAttempts))
+	return objectInfo, err
 }
 
 // Write writes the data to minio storage.
@@ -194,7 +207,7 @@ func (mcm *RemoteChunkManager) Read(ctx context.Context, filePath string) ([]byt
 		// Prefetch object data
 		var empty []byte
 		_, err = object.Read(empty)
-		err = checkObjectStorageError(filePath, err)
+		err = mapObjectStorageError(filePath, err)
 		if err != nil {
 			log.Warn("failed to read object", zap.String("path", filePath), zap.Error(err))
 			return err
@@ -205,14 +218,14 @@ func (mcm *RemoteChunkManager) Read(ctx context.Context, filePath string) ([]byt
 			return err
 		}
 		data, err = read(object, size)
-		err = checkObjectStorageError(filePath, err)
+		err = mapObjectStorageError(filePath, err)
 		if err != nil {
 			log.Warn("failed to read object", zap.String("bucket", mcm.bucketName), zap.String("path", filePath), zap.Error(err))
 			return err
 		}
 		metrics.PersistentDataKvSize.WithLabelValues(metrics.DataGetLabel).Observe(float64(size))
 		return nil
-	}, retry.Attempts(3), retry.RetryErr(merr.IsRetryableErr))
+	}, retry.Attempts(mcm.readRetryAttempts), retry.RetryErr(merr.IsRetryableErr))
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +265,7 @@ func (mcm *RemoteChunkManager) ReadAt(ctx context.Context, filePath string, off 
 	defer object.Close()
 
 	data, err := read(object, length)
-	err = checkObjectStorageError(filePath, err)
+	err = mapObjectStorageError(filePath, err)
 	if err != nil {
 		log.Warn("failed to read object", zap.String("bucket", mcm.bucketName), zap.String("path", filePath), zap.Error(err))
 		return nil, err
@@ -308,6 +321,7 @@ func (mcm *RemoteChunkManager) RemoveWithPrefix(ctx context.Context, prefix stri
 }
 
 func (mcm *RemoteChunkManager) WalkWithPrefix(ctx context.Context, prefix string, recursive bool, walkFunc ChunkObjectWalkFunc) (err error) {
+	start := timerecord.NewTimeRecorder("WalkWithPrefix")
 	metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataWalkLabel, metrics.TotalLabel).Inc()
 	logger := log.With(zap.String("prefix", prefix), zap.Bool("recursive", recursive))
 
@@ -317,6 +331,8 @@ func (mcm *RemoteChunkManager) WalkWithPrefix(ctx context.Context, prefix string
 		logger.Warn("failed to walk through objects", zap.Error(err))
 		return err
 	}
+	metrics.PersistentDataRequestLatency.WithLabelValues(metrics.DataWalkLabel).
+		Observe(float64(start.ElapseSpan().Milliseconds()))
 	metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataWalkLabel, metrics.SuccessLabel).Inc()
 	logger.Info("finish walk through objects")
 	return nil
@@ -325,9 +341,12 @@ func (mcm *RemoteChunkManager) WalkWithPrefix(ctx context.Context, prefix string
 func (mcm *RemoteChunkManager) getObject(ctx context.Context, bucketName, objectName string,
 	offset int64, size int64,
 ) (FileReader, error) {
+	start := timerecord.NewTimeRecorder("getObject")
 	reader, err := mcm.client.GetObject(ctx, bucketName, objectName, offset, size)
 	metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.TotalLabel).Inc()
 	if err == nil && reader != nil {
+		metrics.PersistentDataRequestLatency.WithLabelValues(metrics.DataGetLabel).
+			Observe(float64(start.ElapseSpan().Milliseconds()))
 		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.SuccessLabel).Inc()
 	} else {
 		if errors.Is(err, context.Canceled) {
@@ -400,27 +419,139 @@ func (mcm *RemoteChunkManager) removeObject(ctx context.Context, bucketName, obj
 	return err
 }
 
-func checkObjectStorageError(fileName string, err error) error {
+func ToMilvusIoError(fileName string, err error) error {
+	return mapObjectStorageError(fileName, err)
+}
+
+func (mcm *RemoteChunkManager) Copy(ctx context.Context, srcFilePath string, dstFilePath string) error {
+	err := mcm.copyObject(ctx, mcm.bucketName, srcFilePath, dstFilePath)
+	if err != nil {
+		log.Warn("failed to copy object", zap.String("bucket", mcm.bucketName), zap.String("src", srcFilePath), zap.String("dst", dstFilePath), zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+func (mcm *RemoteChunkManager) copyObject(ctx context.Context, bucketName, srcObjectName, dstObjectName string) error {
+	start := timerecord.NewTimeRecorder("copyObject")
+
+	err := mcm.client.CopyObject(ctx, bucketName, srcObjectName, dstObjectName)
+	metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataPutLabel, metrics.TotalLabel).Inc()
+	if err == nil {
+		metrics.PersistentDataRequestLatency.WithLabelValues(metrics.DataPutLabel).
+			Observe(float64(start.ElapseSpan().Milliseconds()))
+		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataPutLabel, metrics.SuccessLabel).Inc()
+	} else {
+		if errors.Is(err, context.Canceled) {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataPutLabel, metrics.CancelLabel).Inc()
+		} else {
+			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataPutLabel, metrics.FailLabel).Inc()
+		}
+	}
+
+	return err
+}
+
+// Performance: Pre-allocate common error code strings to avoid repeated allocations
+const (
+	azureBlobNotFound      = "BlobNotFound"
+	azureServerBusy        = "ServerBusy"
+	azureAuthFailed        = "AuthenticationFailed"
+	azureContainerNotFound = "ContainerNotFound"
+	azureInvalidParam      = "InvalidParameterValue"
+	azureInvalidRange      = "InvalidRange"
+
+	minioNoSuchKey      = "NoSuchKey"
+	minioSlowDown       = "SlowDown"
+	minioTooMany        = "TooManyRequestsException"
+	minioAccessDenied   = "AccessDenied"
+	minioInvalidKeyId   = "InvalidAccessKeyId"
+	minioSigMismatch    = "SignatureDoesNotMatch"
+	minioNoSuchBucket   = "NoSuchBucket"
+	minioInvalidToken   = "InvalidToken"
+	minioExpiredToken   = "ExpiredToken"
+	minioInvalidArg     = "InvalidArgument"
+	minioInvalidRequest = "InvalidRequest"
+	minioInvalidRange   = "InvalidRange"
+	minioEntityTooLarge = "EntityTooLarge"
+	minioMaxMessage     = "MaxMessageLengthExceeded"
+)
+
+func mapObjectStorageError(fileName string, err error) error {
 	if err == nil {
 		return nil
 	}
 
+	// If error is already a Milvus error, return it as-is to avoid double-wrapping
+	if merr.IsMilvusError(err) {
+		return err
+	}
+
+	// Performance: Type switch is efficient - Go compiler optimizes this to a jump table
 	switch err := err.(type) {
 	case *azcore.ResponseError:
-		if err.ErrorCode == string(bloberror.BlobNotFound) {
+		// Performance: Compare against const instead of calling string() repeatedly
+		switch err.ErrorCode {
+		case azureBlobNotFound:
 			return merr.WrapErrIoKeyNotFound(fileName, err.Error())
+		case azureServerBusy:
+			return merr.WrapErrIoTooManyRequests(fileName, err)
+		case azureAuthFailed:
+			return merr.WrapErrIoPermissionDenied(fileName, err)
+		case azureContainerNotFound:
+			return merr.WrapErrIoBucketNotFound(fileName, err)
+		case azureInvalidParam:
+			return merr.WrapErrIoInvalidArgument(fileName, err)
+		case azureInvalidRange:
+			return merr.WrapErrIoInvalidRange(fileName, err)
+		default:
+			return merr.WrapErrIoFailed(fileName, err)
 		}
-		return merr.WrapErrIoFailed(fileName, err)
 	case minio.ErrorResponse:
-		if err.Code == "NoSuchKey" {
+		// Performance: Use switch for better branch prediction than multiple ifs
+		switch err.Code {
+		case minioNoSuchKey:
 			return merr.WrapErrIoKeyNotFound(fileName, err.Error())
+		case minioSlowDown, minioTooMany:
+			return merr.WrapErrIoTooManyRequests(fileName, err)
+		case minioAccessDenied, minioInvalidKeyId, minioSigMismatch:
+			return merr.WrapErrIoPermissionDenied(fileName, err)
+		case minioNoSuchBucket:
+			return merr.WrapErrIoBucketNotFound(fileName, err)
+		case minioInvalidToken, minioExpiredToken:
+			return merr.WrapErrIoInvalidCredentials(fileName, err)
+		case minioInvalidArg, minioInvalidRequest:
+			return merr.WrapErrIoInvalidArgument(fileName, err)
+		case minioInvalidRange:
+			return merr.WrapErrIoInvalidRange(fileName, err)
+		case minioEntityTooLarge, minioMaxMessage:
+			return merr.WrapErrIoEntityTooLarge(fileName, err)
+		default:
+			return merr.WrapErrIoFailed(fileName, err)
 		}
-		return merr.WrapErrIoFailed(fileName, err)
 	case *googleapi.Error:
-		if err.Code == http.StatusNotFound {
+		// Performance: Integer comparison is faster than string comparison
+		switch err.Code {
+		case http.StatusNotFound:
 			return merr.WrapErrIoKeyNotFound(fileName, err.Error())
+		case http.StatusTooManyRequests:
+			return merr.WrapErrIoTooManyRequests(fileName, err)
+		case http.StatusForbidden:
+			return merr.WrapErrIoPermissionDenied(fileName, err)
+		case http.StatusBadRequest:
+			return merr.WrapErrIoInvalidArgument(fileName, err)
+		case http.StatusRequestEntityTooLarge:
+			return merr.WrapErrIoEntityTooLarge(fileName, err)
+		default:
+			return merr.WrapErrIoFailed(fileName, err)
 		}
-		return merr.WrapErrIoFailed(fileName, err)
+	}
+
+	// Performance: Check specific errors before generic fallback
+	// errors.Is() with syscall errors is optimized in Go stdlib
+	if errors.Is(err, syscall.ECONNRESET) {
+		// syscall.ECONNRESET is typically triggered by rate limiting
+		return merr.WrapErrIoTooManyRequests(fileName, err)
 	}
 	if err == io.ErrUnexpectedEOF {
 		return merr.WrapErrIoUnexpectEOF(fileName, err)

@@ -7,8 +7,6 @@ import (
 
 	commonpb "github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 
-	datapb "github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-
 	mock "github.com/stretchr/testify/mock"
 
 	pkoracle "github.com/milvus-io/milvus/internal/querynodev2/pkoracle"
@@ -257,17 +255,17 @@ func (_c *MockLoader_LoadBloomFilterSet_Call) RunAndReturn(run func(context.Cont
 	return _c
 }
 
-// LoadDeltaLogs provides a mock function with given fields: ctx, segment, deltaLogs
-func (_m *MockLoader) LoadDeltaLogs(ctx context.Context, segment Segment, deltaLogs []*datapb.FieldBinlog) error {
-	ret := _m.Called(ctx, segment, deltaLogs)
+// LoadDeltaLogs provides a mock function with given fields: ctx, segment, loadInfo
+func (_m *MockLoader) LoadDeltaLogs(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error {
+	ret := _m.Called(ctx, segment, loadInfo)
 
 	if len(ret) == 0 {
 		panic("no return value specified for LoadDeltaLogs")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, Segment, []*datapb.FieldBinlog) error); ok {
-		r0 = rf(ctx, segment, deltaLogs)
+	if rf, ok := ret.Get(0).(func(context.Context, Segment, *querypb.SegmentLoadInfo) error); ok {
+		r0 = rf(ctx, segment, loadInfo)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -283,14 +281,14 @@ type MockLoader_LoadDeltaLogs_Call struct {
 // LoadDeltaLogs is a helper method to define mock.On call
 //   - ctx context.Context
 //   - segment Segment
-//   - deltaLogs []*datapb.FieldBinlog
-func (_e *MockLoader_Expecter) LoadDeltaLogs(ctx interface{}, segment interface{}, deltaLogs interface{}) *MockLoader_LoadDeltaLogs_Call {
-	return &MockLoader_LoadDeltaLogs_Call{Call: _e.mock.On("LoadDeltaLogs", ctx, segment, deltaLogs)}
+//   - loadInfo *querypb.SegmentLoadInfo
+func (_e *MockLoader_Expecter) LoadDeltaLogs(ctx interface{}, segment interface{}, loadInfo interface{}) *MockLoader_LoadDeltaLogs_Call {
+	return &MockLoader_LoadDeltaLogs_Call{Call: _e.mock.On("LoadDeltaLogs", ctx, segment, loadInfo)}
 }
 
-func (_c *MockLoader_LoadDeltaLogs_Call) Run(run func(ctx context.Context, segment Segment, deltaLogs []*datapb.FieldBinlog)) *MockLoader_LoadDeltaLogs_Call {
+func (_c *MockLoader_LoadDeltaLogs_Call) Run(run func(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo)) *MockLoader_LoadDeltaLogs_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(Segment), args[2].([]*datapb.FieldBinlog))
+		run(args[0].(context.Context), args[1].(Segment), args[2].(*querypb.SegmentLoadInfo))
 	})
 	return _c
 }
@@ -300,7 +298,7 @@ func (_c *MockLoader_LoadDeltaLogs_Call) Return(_a0 error) *MockLoader_LoadDelta
 	return _c
 }
 
-func (_c *MockLoader_LoadDeltaLogs_Call) RunAndReturn(run func(context.Context, Segment, []*datapb.FieldBinlog) error) *MockLoader_LoadDeltaLogs_Call {
+func (_c *MockLoader_LoadDeltaLogs_Call) RunAndReturn(run func(context.Context, Segment, *querypb.SegmentLoadInfo) error) *MockLoader_LoadDeltaLogs_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -402,17 +400,17 @@ func (_c *MockLoader_LoadJSONIndex_Call) RunAndReturn(run func(context.Context, 
 	return _c
 }
 
-// LoadLazySegment provides a mock function with given fields: ctx, segment, loadInfo
-func (_m *MockLoader) LoadLazySegment(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error {
-	ret := _m.Called(ctx, segment, loadInfo)
+// ReopenSegments provides a mock function with given fields: ctx, loadInfos
+func (_m *MockLoader) ReopenSegments(ctx context.Context, loadInfos []*querypb.SegmentLoadInfo) error {
+	ret := _m.Called(ctx, loadInfos)
 
 	if len(ret) == 0 {
-		panic("no return value specified for LoadLazySegment")
+		panic("no return value specified for ReopenSegments")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, Segment, *querypb.SegmentLoadInfo) error); ok {
-		r0 = rf(ctx, segment, loadInfo)
+	if rf, ok := ret.Get(0).(func(context.Context, []*querypb.SegmentLoadInfo) error); ok {
+		r0 = rf(ctx, loadInfos)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -420,32 +418,31 @@ func (_m *MockLoader) LoadLazySegment(ctx context.Context, segment Segment, load
 	return r0
 }
 
-// MockLoader_LoadLazySegment_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'LoadLazySegment'
-type MockLoader_LoadLazySegment_Call struct {
+// MockLoader_ReopenSegments_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ReopenSegments'
+type MockLoader_ReopenSegments_Call struct {
 	*mock.Call
 }
 
-// LoadLazySegment is a helper method to define mock.On call
+// ReopenSegments is a helper method to define mock.On call
 //   - ctx context.Context
-//   - segment Segment
-//   - loadInfo *querypb.SegmentLoadInfo
-func (_e *MockLoader_Expecter) LoadLazySegment(ctx interface{}, segment interface{}, loadInfo interface{}) *MockLoader_LoadLazySegment_Call {
-	return &MockLoader_LoadLazySegment_Call{Call: _e.mock.On("LoadLazySegment", ctx, segment, loadInfo)}
+//   - loadInfos []*querypb.SegmentLoadInfo
+func (_e *MockLoader_Expecter) ReopenSegments(ctx interface{}, loadInfos interface{}) *MockLoader_ReopenSegments_Call {
+	return &MockLoader_ReopenSegments_Call{Call: _e.mock.On("ReopenSegments", ctx, loadInfos)}
 }
 
-func (_c *MockLoader_LoadLazySegment_Call) Run(run func(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo)) *MockLoader_LoadLazySegment_Call {
+func (_c *MockLoader_ReopenSegments_Call) Run(run func(ctx context.Context, loadInfos []*querypb.SegmentLoadInfo)) *MockLoader_ReopenSegments_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(Segment), args[2].(*querypb.SegmentLoadInfo))
+		run(args[0].(context.Context), args[1].([]*querypb.SegmentLoadInfo))
 	})
 	return _c
 }
 
-func (_c *MockLoader_LoadLazySegment_Call) Return(_a0 error) *MockLoader_LoadLazySegment_Call {
+func (_c *MockLoader_ReopenSegments_Call) Return(_a0 error) *MockLoader_ReopenSegments_Call {
 	_c.Call.Return(_a0)
 	return _c
 }
 
-func (_c *MockLoader_LoadLazySegment_Call) RunAndReturn(run func(context.Context, Segment, *querypb.SegmentLoadInfo) error) *MockLoader_LoadLazySegment_Call {
+func (_c *MockLoader_ReopenSegments_Call) RunAndReturn(run func(context.Context, []*querypb.SegmentLoadInfo) error) *MockLoader_ReopenSegments_Call {
 	_c.Call.Return(run)
 	return _c
 }

@@ -11,13 +11,21 @@
 
 #pragma once
 
+#include <stdint.h>
+#include <cstddef>
+#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
 #include "common/Chunk.h"
+#include "common/ChunkWriter.h"
+#include "common/Types.h"
 #include "common/FieldMeta.h"
+#include "common/OpContext.h"
 #include "mmap/Types.h"
 #include "segcore/storagev1translator/ChunkTranslator.h"
 
@@ -30,10 +38,10 @@ class DefaultValueChunkTranslator
     DefaultValueChunkTranslator(int64_t segment_id,
                                 FieldMeta field_meta,
                                 FieldDataInfo field_data_info,
-                                bool use_mmap);
-
+                                bool use_mmap,
+                                bool mmap_populate,
+                                const std::string& warmup_policy = "");
     ~DefaultValueChunkTranslator() override;
-
     size_t
     num_cells() const override;
     milvus::cachinglayer::cid_t
@@ -45,7 +53,8 @@ class DefaultValueChunkTranslator
     key() const override;
     std::vector<
         std::pair<milvus::cachinglayer::cid_t, std::unique_ptr<milvus::Chunk>>>
-    get_cells(const std::vector<milvus::cachinglayer::cid_t>& cids) override;
+    get_cells(milvus::OpContext* ctx,
+              const std::vector<milvus::cachinglayer::cid_t>& cids) override;
 
     milvus::cachinglayer::Meta*
     meta() override {
@@ -58,10 +67,43 @@ class DefaultValueChunkTranslator
         return 0;
     }
 
+    int64_t
+    value_size() const;
+
+    // preferred bytes per cell when splitting default-value column
+    static constexpr int64_t kTargetCellBytes = 64 * 1024;  // 64KB
+
  private:
+    // Build a ChunkBuffer for the given number of rows
+    milvus::ChunkBuffer
+    build_buffer_for_rows(int64_t num_rows, const std::string& suffix) const;
+
+    // total rows of this field in the segment
+    int64_t total_rows_{0};
+
+    // Number of rows in the primary cell (all full-sized cells).
+    // The last cell may contain fewer rows.
+    int64_t primary_cell_rows_{0};
+
+    // Shared chunk buffer for primary cells (all have primary_cell_rows_).
+    std::optional<milvus::ChunkBuffer> primary_buffer_;
+
+    // Separate buffer for tail cell if it has different row count.
+    // Only used for variable-length types where buffer layout depends on row count.
+    std::optional<milvus::ChunkBuffer> tail_buffer_;
+    int64_t tail_cell_rows_{0};
+
+    // Whether this field type can share buffers across cells with different
+    // row counts. True for fixed-width types, false for variable-length types
+    // (String, JSON, Array, etc.) because their buffer layout depends on row count.
+    bool can_share_buffer_{true};
+
     int64_t segment_id_;
+    int64_t field_id_;
     std::string key_;
     bool use_mmap_;
+    bool mmap_populate_;
+    std::string mmap_dir_path_;
     CTMeta meta_;
     milvus::FieldMeta field_meta_;
 };

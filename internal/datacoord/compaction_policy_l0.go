@@ -17,56 +17,24 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
+// Chooses qualified L0 segments to do L0 compaction
 type l0CompactionPolicy struct {
 	meta *meta
 
 	activeCollections *activeCollections
 	allocator         allocator.Allocator
-
-	// key: collectionID, value: reference count
-	skipCompactionCollections map[int64]int
-	skipLocker                sync.RWMutex
 }
 
 func newL0CompactionPolicy(meta *meta, allocator allocator.Allocator) *l0CompactionPolicy {
 	return &l0CompactionPolicy{
-		meta:                      meta,
-		activeCollections:         newActiveCollections(),
-		allocator:                 allocator,
-		skipCompactionCollections: make(map[int64]int),
+		meta:              meta,
+		activeCollections: newActiveCollections(),
+		allocator:         allocator,
 	}
 }
 
 func (policy *l0CompactionPolicy) Enable() bool {
 	return Params.DataCoordCfg.EnableAutoCompaction.GetAsBool()
-}
-
-func (policy *l0CompactionPolicy) AddSkipCollection(collectionID UniqueID) {
-	policy.skipLocker.Lock()
-	defer policy.skipLocker.Unlock()
-
-	if _, ok := policy.skipCompactionCollections[collectionID]; !ok {
-		policy.skipCompactionCollections[collectionID] = 1
-	} else {
-		policy.skipCompactionCollections[collectionID]++
-	}
-}
-
-func (policy *l0CompactionPolicy) RemoveSkipCollection(collectionID UniqueID) {
-	policy.skipLocker.Lock()
-	defer policy.skipLocker.Unlock()
-	refCount := policy.skipCompactionCollections[collectionID]
-	if refCount > 1 {
-		policy.skipCompactionCollections[collectionID]--
-	} else {
-		delete(policy.skipCompactionCollections, collectionID)
-	}
-}
-
-func (policy *l0CompactionPolicy) isSkipCollection(collectionID UniqueID) bool {
-	policy.skipLocker.RLock()
-	defer policy.skipLocker.RUnlock()
-	return policy.skipCompactionCollections[collectionID] > 0
 }
 
 // Notify policy to record the active updated(when adding a new L0 segment) collections.
@@ -93,7 +61,12 @@ func (policy *l0CompactionPolicy) Trigger(ctx context.Context) (events map[Compa
 	}
 	events = make(map[CompactionTriggerType][]CompactionView)
 	for collID, segments := range latestCollSegs {
-		if policy.isSkipCollection(collID) {
+		collection := policy.meta.GetCollection(collID)
+		if collection == nil {
+			continue
+		}
+		if collection.IsExternal() {
+			log.Ctx(ctx).Info("skip l0 compaction for external collection", zap.Int64("collectionID", collID))
 			continue
 		}
 
@@ -110,8 +83,8 @@ func (policy *l0CompactionPolicy) Trigger(ctx context.Context) (events map[Compa
 		} else {
 			activeL0Views = append(activeL0Views, labelViews...)
 		}
-
 	}
+
 	if len(activeL0Views) > 0 {
 		events[TriggerTypeLevelZeroViewChange] = activeL0Views
 	}
@@ -122,32 +95,17 @@ func (policy *l0CompactionPolicy) Trigger(ctx context.Context) (events map[Compa
 	return
 }
 
-func (policy *l0CompactionPolicy) groupL0ViewsByPartChan(collectionID UniqueID, levelZeroSegments []*SegmentView, triggerID UniqueID) []CompactionView {
-	partChanView := make(map[string]*LevelZeroSegmentsView) // "part-chan" as key
-	for _, view := range levelZeroSegments {
-		key := view.label.Key()
-		if _, ok := partChanView[key]; !ok {
-			partChanView[key] = &LevelZeroSegmentsView{
-				label:                     view.label,
-				segments:                  []*SegmentView{view},
-				earliestGrowingSegmentPos: policy.meta.GetEarliestStartPositionOfGrowingSegments(view.label),
-				triggerID:                 triggerID,
-			}
-		} else {
-			partChanView[key].Append(view)
-		}
-	}
-
-	return lo.Map(lo.Values(partChanView), func(view *LevelZeroSegmentsView, _ int) CompactionView {
-		return view
-	})
-}
-
 func (policy *l0CompactionPolicy) triggerOneCollection(ctx context.Context, collectionID int64) ([]CompactionView, int64, error) {
 	log := log.Ctx(ctx).With(zap.Int64("collectionID", collectionID))
 	log.Info("start trigger collection l0 compaction")
-	if policy.isSkipCollection(collectionID) {
-		return nil, 0, merr.WrapErrCollectionNotLoaded(collectionID, "the collection being paused by importing cannot do force l0 compaction")
+	collection := policy.meta.GetCollection(collectionID)
+	if collection == nil {
+		log.Warn("collection not found in meta")
+		return nil, 0, merr.WrapErrCollectionNotLoaded(collectionID, "collection not found")
+	}
+	if collection.IsExternal() {
+		log.Info("skip trigger l0 compaction for external collection")
+		return nil, 0, nil
 	}
 	allL0Segments := policy.meta.SelectSegments(ctx, WithCollection(collectionID), SegmentFilterFunc(func(segment *SegmentInfo) bool {
 		return isSegmentHealthy(segment) &&
@@ -168,6 +126,32 @@ func (policy *l0CompactionPolicy) triggerOneCollection(ctx context.Context, coll
 	}
 	views := policy.groupL0ViewsByPartChan(collectionID, GetViewsByInfo(allL0Segments...), newTriggerID)
 	return views, newTriggerID, nil
+}
+
+func (policy *l0CompactionPolicy) groupL0ViewsByPartChan(collectionID UniqueID, levelZeroSegments []*SegmentView, triggerID UniqueID) []CompactionView {
+	partChanView := make(map[string]*LevelZeroCompactionView) // "part-chan" as key
+	for _, segView := range levelZeroSegments {
+		key := segView.label.Key()
+		if _, ok := partChanView[key]; !ok {
+			earliestGrowingStartPos := policy.meta.GetEarliestStartPositionOfGrowingSegments(segView.label)
+			partChanView[key] = &LevelZeroCompactionView{
+				label:           segView.label,
+				l0Segments:      []*SegmentView{},
+				latestDeletePos: earliestGrowingStartPos,
+				triggerID:       triggerID,
+			}
+		}
+
+		l0View := partChanView[key]
+		// Only choose segments with position less than or equal to the earliest growing segment position
+		if segView.dmlPos.GetTimestamp() <= l0View.latestDeletePos.GetTimestamp() {
+			l0View.Append(segView)
+		}
+	}
+
+	return lo.Map(lo.Values(partChanView), func(view *LevelZeroCompactionView, _ int) CompactionView {
+		return view
+	})
 }
 
 type activeCollection struct {

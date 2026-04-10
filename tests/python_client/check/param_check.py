@@ -190,6 +190,12 @@ def compare_lists_with_epsilon_ignore_dict_order_deepdiff(a, b, epsilon=epsilon)
     # Normalize both lists to handle type differences
     a_normalized = normalize_value(a)
     b_normalized = normalize_value(b)
+
+    # Check length first
+    if len(a_normalized) != len(b_normalized):
+        log.debug(f"[COMPARE_LISTS] Length mismatch: Query result length({len(a_normalized)}) != Expected result length({len(b_normalized)})")
+        return False
+    
     for i in range(len(a_normalized)):
         diff = DeepDiff(
             a_normalized[i],
@@ -202,6 +208,8 @@ def compare_lists_with_epsilon_ignore_dict_order_deepdiff(a, b, epsilon=epsilon)
         )
         if diff:
             log.debug(f"[COMPARE_LISTS] Found differences at row {i}: {diff}")
+            return False
+    return True
 
 def ip_check(ip):
     if ip == "localhost":
@@ -233,10 +241,17 @@ def exist_check(param, _list):
 
 
 def dict_equal_check(dict1, dict2):
+    """Check if dict2 is a subset of dict1.
+
+    This allows API responses to include additional fields without breaking tests.
+    For example, if dict1 = {'a': 1, 'b': 2, 'c': 3} and dict2 = {'a': 1, 'b': 2},
+    the check will pass because all key-value pairs in dict2 exist in dict1.
+    """
     if not isinstance(dict1, dict) or not isinstance(dict2, dict):
         log.error("[DICT_EQUAL_CHECK] Type of dict(%s) or dict(%s) is not a dict." % (str(dict1), str(dict2)))
         return False
-    return operator.eq(dict1, dict2)
+    # Check if dict2 is a subset of dict1
+    return all(k in dict1 and dict1[k] == v for k, v in dict2.items())
 
 
 def list_de_duplication(_list):
@@ -292,9 +307,8 @@ def list_contain_check(sublist, superlist):
         else:
             superlist.remove(i)
     if not check_result:
-        log.error("list_contain_check: List(%s) does not contain list(%s)"
-                  % (str(superlist), str(sublist)))
-
+        #  truncate the lists to 100 items in log message
+        log.error(f"list_contain_check: List({str(superlist[:20])}...) does not contain list({str(sublist[:20])}...)")
     return check_result
 
 
@@ -431,20 +445,31 @@ def output_field_value_check(search_res, original, pk_name):
     :return: True or False
     """
     pk_name = ct.default_primary_field_name if pk_name is None else pk_name
+    nq = len(search_res)
     limit = len(search_res[0])
-    for i in range(limit):
-        entity = search_res[0][i].fields
-        _id = search_res[0][i].id
-        for field in entity.keys():
-            if isinstance(entity[field], list):
-                for order in range(0, len(entity[field]), 4):
-                    assert abs(original[field][_id][order] - entity[field][order]) < ct.epsilon
-            elif isinstance(entity[field], dict) and field != ct.default_json_field_name:
-                # sparse checking, sparse vector must be the last, this is a bit hacky,
-                # but sparse only supports list data type insertion for now
-                assert entity[field].keys() == original[-1][_id].keys()
-            else:
-                num = original[original[pk_name] == _id].index.to_list()[0]
-                assert original[field][num] == entity[field]
+    check_nqs = min(2, nq)       # the output field values are wrong only at nq>=2  #45338
+    for n in range(check_nqs):
+        for i in range(limit):
+            entity = search_res[n][i].fields
+            _id = search_res[n][i].id
+            for field in entity.keys():
+                if isinstance(entity[field], list):
+                    for order in range(0, len(entity[field]), 4):
+                        assert abs(original[field][_id][order] - entity[field][order]) < ct.epsilon
+                elif isinstance(entity[field], dict) and field != ct.default_json_field_name:
+                    # sparse vector checking: compare keys (indices) of the sparse vector
+                    num = original[original[pk_name] == _id].index.to_list()[0]
+                    assert entity[field].keys() == original[field][num].keys()
+                elif isinstance(entity[field], bytes):
+                    # bfloat16/float16/binary vectors returned as bytes — skip value check
+                    # (numpy dtype 'E' cannot be compared via ufunc 'equal' or converted to buffer)
+                    continue
+                else:
+                    num = original[original[pk_name] == _id].index.to_list()[0]
+                    expected_val = original[field][num]
+                    # pandas converts None to NaN, while Milvus returns None for nullable fields
+                    if entity[field] is None and (expected_val is None or (isinstance(expected_val, float) and np.isnan(expected_val))):
+                        continue
+                    assert expected_val == entity[field], f"the output field values are wrong at nq={n}"
 
     return True

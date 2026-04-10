@@ -59,12 +59,12 @@ func (s *ClusteringCompactionPolicySuite) SetupTest() {
 	catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil).Maybe()
 	catalog.EXPECT().SaveCompactionTask(mock.Anything, mock.Anything).Return(nil).Maybe()
 	catalog.EXPECT().ListIndexes(mock.Anything).Return(nil, nil).Maybe()
-	catalog.EXPECT().ListSegmentIndexes(mock.Anything).Return(nil, nil).Maybe()
+	catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	s.catalog = catalog
 
 	compactionTaskMeta, _ := newCompactionTaskMeta(context.TODO(), s.catalog)
 	partitionStatsMeta, _ := newPartitionStatsMeta(context.TODO(), s.catalog)
-	indexMeta, _ := newIndexMeta(context.TODO(), s.catalog)
+	indexMeta, _ := newIndexMeta(context.TODO(), s.catalog, nil)
 
 	meta := &meta{
 		segments:           NewSegmentsInfo(),
@@ -185,6 +185,14 @@ func (s *ClusteringCompactionPolicySuite) TestCalculateClusteringCompactionConfi
 	for _, test := range testCases {
 		s.Run(test.description, func() {
 			expectedSegmentSize := getExpectedSegmentSize(s.meta, test.coll.ID, test.coll.Schema)
+			if view, ok := test.view.(*ClusteringSegmentsView); ok {
+				for _, segment := range view.segments {
+					if segment == nil || segment.NumOfRows <= 0 || test.maxSegmentRows == 0 {
+						continue
+					}
+					segment.Size = float64(expectedSegmentSize) * float64(segment.NumOfRows) / float64(test.maxSegmentRows)
+				}
+			}
 			totalRows, maxSegmentRows, preferSegmentRows, err := calculateClusteringCompactionConfig(test.coll, test.view, expectedSegmentSize)
 			s.Equal(test.totalRows, totalRows)
 			s.Equal(test.maxSegmentRows, maxSegmentRows)
@@ -208,6 +216,25 @@ func (s *ClusteringCompactionPolicySuite) TestTriggerOneCollectionAbnormal() {
 	s.NoError(err2)
 	s.Nil(views2)
 	s.Equal(int64(0), triggerID2)
+}
+
+func (s *ClusteringCompactionPolicySuite) TestTriggerOneCollectionSkipExternal() {
+	collID := int64(100)
+	s.handler.EXPECT().GetCollection(mock.Anything, collID).Return(&collectionInfo{
+		ID: collID,
+		Schema: func() *schemapb.CollectionSchema {
+			schema := newTestScalarClusteringKeySchema()
+			schema.ExternalSource = "s3://external"
+			// External collections are identified by having ExternalField set on fields.
+			schema.Fields[0].ExternalField = "field1_col"
+			return schema
+		}(),
+	}, nil)
+
+	views, triggerID, err := s.clusteringCompactionPolicy.triggerOneCollection(context.Background(), collID, false)
+	s.NoError(err)
+	s.Nil(views)
+	s.EqualValues(0, triggerID)
 }
 
 func (s *ClusteringCompactionPolicySuite) TestTriggerOneCollectionNoClusteringKeySchema() {

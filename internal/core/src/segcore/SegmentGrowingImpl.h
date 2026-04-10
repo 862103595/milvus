@@ -11,29 +11,70 @@
 
 #pragma once
 
-#include <deque>
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
-#include <tbb/concurrent_priority_queue.h>
-#include <tbb/concurrent_unordered_map.h>
-#include <tbb/concurrent_vector.h>
-#include <vector>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
-#include "cachinglayer/CacheSlot.h"
 #include "AckResponder.h"
 #include "ConcurrentVector.h"
 #include "DeletedRecord.h"
 #include "FieldIndexing.h"
 #include "InsertRecord.h"
-#include "SealedIndexingRecord.h"
+#include "NamedType/underlying_functionalities.hpp"
 #include "SegmentGrowing.h"
+#include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/Manager.h"
+#include "cachinglayer/Utils.h"
+#include "common/Array.h"
+#include "common/ArrayOffsets.h"
+#include "common/BitsetView.h"
 #include "common/EasyAssert.h"
-#include "common/IndexMeta.h"
-#include "common/Types.h"
-#include "query/PlanNode.h"
+#include "common/FieldData.h"
+#include "common/FieldMeta.h"
 #include "common/GeometryCache.h"
+#include "common/IndexMeta.h"
+#include "common/Json.h"
+#include "common/LoadInfo.h"
+#include "common/OpContext.h"
+#include "common/QueryInfo.h"
+#include "common/QueryResult.h"
+#include "common/Schema.h"
+#include "common/Span.h"
+#include "common/SystemProperty.h"
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "common/Utils.h"
+#include "common/VectorArray.h"
+#include "common/VectorTrait.h"
+#include "common/protobuf_utils.h"
+#include "fmt/core.h"
+#include "folly/FBVector.h"
+#include "geos_c.h"
+#include "google/protobuf/message.h"
+#include "index/Index.h"
+#include "milvus-storage/column_groups.h"
+#include "milvus-storage/properties.h"
+#include "milvus-storage/reader.h"
+#include "pb/plan.pb.h"
+#include "pb/schema.pb.h"
+#include "pb/segcore.pb.h"
+#include "query/PlanImpl.h"
+#include "segcore/SegcoreConfig.h"
+#include "segcore/SegmentInterface.h"
+#include "storage/MmapChunkManager.h"
+#include "storage/MmapManager.h"
 
 namespace milvus::segcore {
 
@@ -66,7 +107,8 @@ class SegmentGrowingImpl : public SegmentGrowing {
     LoadDeletedRecord(const LoadDeletedRecordInfo& info) override;
 
     void
-    LoadFieldData(const LoadFieldDataInfo& info) override;
+    LoadFieldData(const LoadFieldDataInfo& info,
+                  milvus::OpContext* op_ctx = nullptr) override;
 
     int64_t
     get_segment_id() const override {
@@ -82,7 +124,8 @@ class SegmentGrowingImpl : public SegmentGrowing {
     };
 
     void
-    CreateTextIndex(FieldId field_id) override;
+    CreateTextIndex(FieldId field_id,
+                    milvus::OpContext* op_ctx = nullptr) override;
 
     void
     load_field_data_internal(const LoadFieldDataInfo& load_info);
@@ -101,10 +144,15 @@ class SegmentGrowingImpl : public SegmentGrowing {
     Reopen(SchemaPtr sch) override;
 
     void
+    Reopen(
+        const milvus::proto::segcore::SegmentLoadInfo& new_load_info) override;
+
+    void
     LazyCheckSchema(SchemaPtr sch) override;
 
     void
-    FinishLoad() override;
+    Load(milvus::tracer::TraceContext& trace_ctx,
+         milvus::OpContext* op_ctx = nullptr) override;
 
  private:
     // Build geometry cache for inserted data
@@ -166,7 +214,7 @@ class SegmentGrowingImpl : public SegmentGrowing {
         return segcore_config_.get_chunk_rows();
     }
 
-    virtual int64_t
+    int64_t
     chunk_size(FieldId field_id, int64_t chunk_id) const final {
         return segcore_config_.get_chunk_rows();
     }
@@ -219,7 +267,8 @@ class SegmentGrowingImpl : public SegmentGrowing {
                         const VectorBase* vec_raw,
                         const int64_t* seg_offsets,
                         int64_t count,
-                        T* output) const;
+                        T* output,
+                        bool small_int_raw_type = false) const;
 
     template <typename S>
     void
@@ -229,6 +278,13 @@ class SegmentGrowingImpl : public SegmentGrowing {
         const int64_t* seg_offsets,
         int64_t count,
         google::protobuf::RepeatedPtrField<std::string>* dst) const;
+
+    template <typename S, typename T = S>
+    void
+    bulk_subscript_ptr_impl(const VectorBase* vec_raw,
+                            const int64_t* seg_offsets,
+                            int64_t count,
+                            T* dst) const;
 
     // for scalar array vectors
     template <typename T>
@@ -275,6 +331,16 @@ class SegmentGrowingImpl : public SegmentGrowing {
                    int64_t count,
                    void* output) const override;
 
+    void
+    bulk_subscript(milvus::OpContext* op_ctx,
+                   FieldId field_id,
+                   DataType data_type,
+                   const int64_t* seg_offsets,
+                   int64_t count,
+                   void* data,
+                   TargetBitmap& valid_map,
+                   bool small_int_raw_type = false) const override;
+
     std::unique_ptr<DataArray>
     bulk_subscript(milvus::OpContext* op_ctx,
                    FieldId field_id,
@@ -292,7 +358,7 @@ class SegmentGrowingImpl : public SegmentGrowing {
     virtual void
     BulkGetJsonData(milvus::OpContext* op_ctx,
                     FieldId field_id,
-                    std::function<void(milvus::Json, size_t, bool)> fn,
+                    const std::function<void(milvus::Json, size_t, bool)>& fn,
                     const int64_t* offsets,
                     int64_t count) const override;
 
@@ -321,12 +387,14 @@ class SegmentGrowingImpl : public SegmentGrowing {
               &insert_record_,
               [this](const std::vector<PkType>& pks,
                      const Timestamp* timestamps,
-                     std::function<void(const SegOffset offset,
-                                        const Timestamp ts)> callback) {
+                     const std::function<void(const SegOffset offset,
+                                              const Timestamp ts)>& callback) {
                   this->search_batch_pks(pks, timestamps, false, callback);
               },
               segment_id) {
         this->CreateTextIndexes();
+        this->InitializeArrayOffsets();
+        this->UpdateResourceTracking();
     }
 
     ~SegmentGrowingImpl() {
@@ -345,6 +413,14 @@ class SegmentGrowingImpl : public SegmentGrowing {
             auto mcm =
                 storage::MmapManager::GetInstance().GetMmapChunkManager();
             mcm->UnRegister(mmap_descriptor_);
+        }
+
+        // Refund any tracked resources before destruction
+        // No lock needed - destructor implies exclusive access
+        if (tracked_resource_.AnyGTZero()) {
+            Manager::GetInstance().RefundLoadedResource(
+                tracked_resource_,
+                fmt::format("growing_segment_{}_destructor", id_));
         }
     }
 
@@ -376,7 +452,7 @@ class SegmentGrowingImpl : public SegmentGrowing {
     search_ids(BitsetType& bitset, const IdArray& id_array) const override;
 
     bool
-    HasIndex(FieldId field_id) const {
+    HasIndex(FieldId field_id) const override {
         auto& field_meta = schema_->operator[](field_id);
         if ((IsVectorDataType(field_meta.get_data_type()) ||
              IsGeometryType(field_meta.get_data_type())) &&
@@ -445,8 +521,16 @@ class SegmentGrowingImpl : public SegmentGrowing {
     }
 
     std::pair<std::vector<OffsetMap::OffsetType>, bool>
-    find_first(int64_t limit, const BitsetType& bitset) const override {
-        return insert_record_.pk2offset_->find_first(limit, bitset);
+    find_first_n(int64_t limit, const BitsetTypeView& bitset) const override {
+        return insert_record_.pk2offset_->find_first_n(limit, bitset);
+    }
+
+    std::tuple<std::vector<int64_t>, std::vector<std::vector<int32_t>>, bool>
+    find_first_n_element(int64_t limit,
+                         const BitsetTypeView& element_bitset,
+                         const IArrayOffsets* array_offsets) const override {
+        return insert_record_.pk2offset_->find_first_n_element(
+            limit, element_bitset, array_offsets);
     }
 
     bool
@@ -468,24 +552,41 @@ class SegmentGrowingImpl : public SegmentGrowing {
                schema_->get_fields().end();
     }
 
-    void
-    LoadJsonStats(FieldId field_id,
-                  index::CacheJsonKeyStatsPtr cache_slot) override {
-        ThrowInfo(ErrorCode::NotImplemented,
-                  "LoadJsonStats not implemented for SegmentGrowingImpl");
+    std::shared_ptr<const IArrayOffsets>
+    GetArrayOffsets(FieldId field_id) const override {
+        auto it = array_offsets_map_.find(field_id);
+        if (it != array_offsets_map_.end()) {
+            return it->second;
+        }
+        return nullptr;
     }
+    struct ValidResult {
+        int64_t valid_count = 0;
+        std::unique_ptr<bool[]> valid_data;
+        std::vector<int64_t> valid_offsets;
+    };
 
-    PinWrapper<index::JsonKeyStats*>
-    GetJsonStats(milvus::OpContext* op_ctx, FieldId field_id) const override {
-        ThrowInfo(ErrorCode::NotImplemented,
-                  "GetJsonStats not implemented for SegmentGrowingImpl");
-    }
+    ValidResult
+    FilterVectorValidOffsets(milvus::OpContext* op_ctx,
+                             FieldId field_id,
+                             const int64_t* seg_offsets,
+                             int64_t count) const;
 
-    void
-    RemoveJsonStats(FieldId field_id) override {
-        ThrowInfo(ErrorCode::NotImplemented,
-                  "RemoveJsonStats not implemented for SegmentGrowingImpl");
-    }
+    /**
+     * @brief Estimate the current total resource usage of the growing segment
+     *
+     * This includes memory/disk usage for:
+     * - Field data (raw vectors and scalars)
+     * - Timestamps
+     * - PK-to-offset index
+     * - Interim vector indexes (if enabled)
+     * - Text match indexes (if enabled)
+     * - Deleted records
+     *
+     * @return ResourceUsage containing memory_bytes and file_bytes estimates
+     */
+    ResourceUsage
+    EstimateSegmentResourceUsage() const;
 
  protected:
     int64_t
@@ -544,6 +645,20 @@ class SegmentGrowingImpl : public SegmentGrowing {
     void
     fill_empty_field(const FieldMeta& field_meta);
 
+    /**
+     * @brief Update resource tracking by refunding old estimate and charging new
+     *
+     * This method:
+     * 1. Estimates current total resource usage of the growing segment
+     * 2. Refunds the previously tracked resource from the cache manager
+     * 3. Charges the new resource usage to the cache manager
+     * 4. Updates the tracked resource checkpoint
+     *
+     * Should be called after data modifications (Insert, Delete, etc.)
+     */
+    void
+    UpdateResourceTracking();
+
  private:
     void
     AddTexts(FieldId field_id,
@@ -554,6 +669,37 @@ class SegmentGrowingImpl : public SegmentGrowing {
 
     void
     CreateTextIndexes();
+
+    /**
+     * @brief Load all column groups from a manifest file path
+     *
+     * This method parses the manifest path to retrieve column groups metadata
+     * and loads each column group into the growing segment.
+     *
+     * @param manifest_path JSON string containing base_path and version fields
+     */
+    void
+    LoadColumnsGroups(std::string manifest_path);
+
+    /**
+     * @brief Load a single column group and return field data
+     *
+     * Reads a specific column group from milvus storage and converts it to
+     * field data format that can be inserted into the growing segment.
+     *
+     * @param column_groups Metadata about all available column groups
+     * @param properties Storage properties for accessing the data
+     * @param index Index of the column group to load
+     * @return Map of field IDs to their corresponding field data vectors
+     */
+    std::unordered_map<FieldId, std::vector<FieldDataPtr>>
+    LoadColumnGroup(
+        const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
+        const std::shared_ptr<milvus_storage::api::Properties>& properties,
+        int64_t index);
+
+    void
+    InitializeArrayOffsets();
 
  private:
     storage::MmapChunkDescriptorPtr mmap_descriptor_ = nullptr;
@@ -575,6 +721,24 @@ class SegmentGrowingImpl : public SegmentGrowing {
     int64_t id_;
 
     SegmentStats stats_{};
+
+    // milvus storage internal api reader instance
+    std::unique_ptr<milvus_storage::api::Reader> reader_;
+
+    // field_id -> ArrayOffsetsGrowing (for fast lookup via GetArrayOffsets)
+    // Multiple field_ids from the same struct point to the same ArrayOffsetsGrowing
+    std::unordered_map<FieldId, std::shared_ptr<ArrayOffsetsGrowing>>
+        array_offsets_map_;
+
+    // Representative field_id for each struct (used to extract array lengths during Insert)
+    // One field_id per struct, since all fields in the same struct have identical array lengths
+    std::unordered_set<FieldId> struct_representative_fields_;
+
+    // Tracked resource usage for refund-then-charge pattern
+    // This stores the last estimated resource usage that was charged to the cache manager
+    ResourceUsage tracked_resource_{};
+    // Mutex to protect tracked_resource_ updates (refund-then-charge must be atomic)
+    mutable std::mutex resource_tracking_mutex_;
 };
 
 inline SegmentGrowingPtr

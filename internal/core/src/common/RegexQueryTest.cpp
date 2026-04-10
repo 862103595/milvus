@@ -9,23 +9,50 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <folly/FBVector.h>
 #include <gtest/gtest.h>
-#include <boost/format.hpp>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <ratio>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include "bitset/bitset.h"
+#include "common/Consts.h"
+#include "common/FieldMeta.h"
+#include "common/IndexMeta.h"
+#include "common/Schema.h"
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
+#include "gtest/gtest.h"
+#include "index/Index.h"
+#include "index/InvertedIndexTantivy.h"
+#include "index/ScalarIndexSort.h"
+#include "index/StringIndexMarisa.h"
+#include "knowhere/comp/index_param.h"
+#include "pb/common.pb.h"
 #include "pb/plan.pb.h"
-#include "segcore/SegmentSealed.h"
-
+#include "pb/schema.pb.h"
+#include "plan/PlanNode.h"
+#include "query/ExecPlanNodeVisitor.h"
+#include "query/PlanProto.h"
+#include "query/Utils.h"
+#include "segcore/ChunkedSegmentSealedImpl.h"
 #include "segcore/SegmentGrowing.h"
 #include "segcore/SegmentGrowingImpl.h"
-#include "pb/schema.pb.h"
-#include "test_utils/cachinglayer_test_utils.h"
+#include "segcore/SegmentSealed.h"
+#include "segcore/TimestampIndex.h"
+#include "segcore/Types.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/GenExprProto.h"
-#include "query/PlanProto.h"
-#include "query/ExecPlanNodeVisitor.h"
-#include "index/InvertedIndexTantivy.h"
+#include "test_utils/cachinglayer_test_utils.h"
 #include "test_utils/storage_test_utils.h"
-#include "index/StringIndexMarisa.h"
 
 using namespace milvus;
 using namespace milvus::query;
@@ -187,7 +214,7 @@ struct MockStringIndex : index::StringIndexMarisa {
     }
 
     bool
-    SupportRegexQuery() const override {
+    SupportPatternQuery() const override {
         return false;
     }
 };
@@ -246,11 +273,10 @@ class SealedSegmentRegexQueryTest : public ::testing::Test {
     LoadStlSortIndex() {
         auto index = index::CreateScalarIndexSort<int64_t>();
         index->BuildWithRawDataForUT(N, raw_int.data());
-        LoadIndexInfo info{
-            .field_id = schema->get_field_id(FieldName("another_int64")).get(),
-            .index_params = GenIndexParams(index.get()),
-            .cache_index = CreateTestCacheIndex("test", std::move(index)),
-        };
+        LoadIndexInfo info{};
+        info.field_id = schema->get_field_id(FieldName("another_int64")).get();
+        info.index_params = GenIndexParams(index.get());
+        info.cache_index = CreateTestCacheIndex("test", std::move(index));
         seg->LoadIndex(info);
     }
 
@@ -259,11 +285,10 @@ class SealedSegmentRegexQueryTest : public ::testing::Test {
         auto index =
             std::make_unique<index::InvertedIndexTantivy<std::string>>();
         index->BuildWithRawDataForUT(N, raw_str.data());
-        LoadIndexInfo info{
-            .field_id = schema->get_field_id(FieldName("str")).get(),
-            .index_params = GenIndexParams(index.get()),
-            .cache_index = CreateTestCacheIndex("test", std::move(index)),
-        };
+        LoadIndexInfo info{};
+        info.field_id = schema->get_field_id(FieldName("str")).get();
+        info.index_params = GenIndexParams(index.get());
+        info.cache_index = CreateTestCacheIndex("test", std::move(index));
         seg->LoadIndex(info);
     }
 
@@ -277,11 +302,10 @@ class SealedSegmentRegexQueryTest : public ::testing::Test {
         std::vector<uint8_t> buffer(arr.ByteSizeLong());
         ASSERT_TRUE(arr.SerializeToArray(buffer.data(), arr.ByteSizeLong()));
         index->BuildWithRawDataForUT(arr.ByteSizeLong(), buffer.data());
-        LoadIndexInfo info{
-            .field_id = schema->get_field_id(FieldName("str")).get(),
-            .index_params = GenIndexParams(index.get()),
-            .cache_index = CreateTestCacheIndex("test", std::move(index)),
-        };
+        LoadIndexInfo info{};
+        info.field_id = schema->get_field_id(FieldName("str")).get();
+        info.index_params = GenIndexParams(index.get());
+        info.cache_index = CreateTestCacheIndex("test", std::move(index));
         seg->LoadIndex(info);
     }
 

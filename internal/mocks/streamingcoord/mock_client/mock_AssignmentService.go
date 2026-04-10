@@ -3,13 +3,17 @@
 package mock_client
 
 import (
+	assignment "github.com/milvus-io/milvus/internal/streamingcoord/client/assignment"
+
 	context "context"
 
-	commonpb "github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	milvuspb "github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 
 	mock "github.com/stretchr/testify/mock"
 
 	replicateutil "github.com/milvus-io/milvus/pkg/v2/util/replicateutil"
+
+	streamingpb "github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 
 	types "github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 )
@@ -132,9 +136,74 @@ func (_c *MockAssignmentService_GetLatestAssignments_Call) RunAndReturn(run func
 	return _c
 }
 
-// GetReplicateConfiguration provides a mock function with given fields: ctx
-func (_m *MockAssignmentService) GetReplicateConfiguration(ctx context.Context) (*replicateutil.ConfigHelper, error) {
+// GetLatestStreamingVersion provides a mock function with given fields: ctx
+func (_m *MockAssignmentService) GetLatestStreamingVersion(ctx context.Context) (*streamingpb.StreamingVersion, error) {
 	ret := _m.Called(ctx)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetLatestStreamingVersion")
+	}
+
+	var r0 *streamingpb.StreamingVersion
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context) (*streamingpb.StreamingVersion, error)); ok {
+		return rf(ctx)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context) *streamingpb.StreamingVersion); ok {
+		r0 = rf(ctx)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*streamingpb.StreamingVersion)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context) error); ok {
+		r1 = rf(ctx)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockAssignmentService_GetLatestStreamingVersion_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetLatestStreamingVersion'
+type MockAssignmentService_GetLatestStreamingVersion_Call struct {
+	*mock.Call
+}
+
+// GetLatestStreamingVersion is a helper method to define mock.On call
+//   - ctx context.Context
+func (_e *MockAssignmentService_Expecter) GetLatestStreamingVersion(ctx interface{}) *MockAssignmentService_GetLatestStreamingVersion_Call {
+	return &MockAssignmentService_GetLatestStreamingVersion_Call{Call: _e.mock.On("GetLatestStreamingVersion", ctx)}
+}
+
+func (_c *MockAssignmentService_GetLatestStreamingVersion_Call) Run(run func(ctx context.Context)) *MockAssignmentService_GetLatestStreamingVersion_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context))
+	})
+	return _c
+}
+
+func (_c *MockAssignmentService_GetLatestStreamingVersion_Call) Return(_a0 *streamingpb.StreamingVersion, _a1 error) *MockAssignmentService_GetLatestStreamingVersion_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockAssignmentService_GetLatestStreamingVersion_Call) RunAndReturn(run func(context.Context) (*streamingpb.StreamingVersion, error)) *MockAssignmentService_GetLatestStreamingVersion_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// GetReplicateConfiguration provides a mock function with given fields: ctx, opts
+func (_m *MockAssignmentService) GetReplicateConfiguration(ctx context.Context, opts ...assignment.GetReplicateConfigurationOpt) (*replicateutil.ConfigHelper, error) {
+	_va := make([]interface{}, len(opts))
+	for _i := range opts {
+		_va[_i] = opts[_i]
+	}
+	var _ca []interface{}
+	_ca = append(_ca, ctx)
+	_ca = append(_ca, _va...)
+	ret := _m.Called(_ca...)
 
 	if len(ret) == 0 {
 		panic("no return value specified for GetReplicateConfiguration")
@@ -142,19 +211,19 @@ func (_m *MockAssignmentService) GetReplicateConfiguration(ctx context.Context) 
 
 	var r0 *replicateutil.ConfigHelper
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context) (*replicateutil.ConfigHelper, error)); ok {
-		return rf(ctx)
+	if rf, ok := ret.Get(0).(func(context.Context, ...assignment.GetReplicateConfigurationOpt) (*replicateutil.ConfigHelper, error)); ok {
+		return rf(ctx, opts...)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context) *replicateutil.ConfigHelper); ok {
-		r0 = rf(ctx)
+	if rf, ok := ret.Get(0).(func(context.Context, ...assignment.GetReplicateConfigurationOpt) *replicateutil.ConfigHelper); ok {
+		r0 = rf(ctx, opts...)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(*replicateutil.ConfigHelper)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context) error); ok {
-		r1 = rf(ctx)
+	if rf, ok := ret.Get(1).(func(context.Context, ...assignment.GetReplicateConfigurationOpt) error); ok {
+		r1 = rf(ctx, opts...)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -169,13 +238,21 @@ type MockAssignmentService_GetReplicateConfiguration_Call struct {
 
 // GetReplicateConfiguration is a helper method to define mock.On call
 //   - ctx context.Context
-func (_e *MockAssignmentService_Expecter) GetReplicateConfiguration(ctx interface{}) *MockAssignmentService_GetReplicateConfiguration_Call {
-	return &MockAssignmentService_GetReplicateConfiguration_Call{Call: _e.mock.On("GetReplicateConfiguration", ctx)}
+//   - opts ...assignment.GetReplicateConfigurationOpt
+func (_e *MockAssignmentService_Expecter) GetReplicateConfiguration(ctx interface{}, opts ...interface{}) *MockAssignmentService_GetReplicateConfiguration_Call {
+	return &MockAssignmentService_GetReplicateConfiguration_Call{Call: _e.mock.On("GetReplicateConfiguration",
+		append([]interface{}{ctx}, opts...)...)}
 }
 
-func (_c *MockAssignmentService_GetReplicateConfiguration_Call) Run(run func(ctx context.Context)) *MockAssignmentService_GetReplicateConfiguration_Call {
+func (_c *MockAssignmentService_GetReplicateConfiguration_Call) Run(run func(ctx context.Context, opts ...assignment.GetReplicateConfigurationOpt)) *MockAssignmentService_GetReplicateConfiguration_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context))
+		variadicArgs := make([]assignment.GetReplicateConfigurationOpt, len(args)-1)
+		for i, a := range args[1:] {
+			if a != nil {
+				variadicArgs[i] = a.(assignment.GetReplicateConfigurationOpt)
+			}
+		}
+		run(args[0].(context.Context), variadicArgs...)
 	})
 	return _c
 }
@@ -185,7 +262,7 @@ func (_c *MockAssignmentService_GetReplicateConfiguration_Call) Return(_a0 *repl
 	return _c
 }
 
-func (_c *MockAssignmentService_GetReplicateConfiguration_Call) RunAndReturn(run func(context.Context) (*replicateutil.ConfigHelper, error)) *MockAssignmentService_GetReplicateConfiguration_Call {
+func (_c *MockAssignmentService_GetReplicateConfiguration_Call) RunAndReturn(run func(context.Context, ...assignment.GetReplicateConfigurationOpt) (*replicateutil.ConfigHelper, error)) *MockAssignmentService_GetReplicateConfiguration_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -238,17 +315,17 @@ func (_c *MockAssignmentService_ReportAssignmentError_Call) RunAndReturn(run fun
 	return _c
 }
 
-// UpdateReplicateConfiguration provides a mock function with given fields: ctx, config
-func (_m *MockAssignmentService) UpdateReplicateConfiguration(ctx context.Context, config *commonpb.ReplicateConfiguration) error {
-	ret := _m.Called(ctx, config)
+// UpdateReplicateConfiguration provides a mock function with given fields: ctx, req
+func (_m *MockAssignmentService) UpdateReplicateConfiguration(ctx context.Context, req *milvuspb.UpdateReplicateConfigurationRequest) error {
+	ret := _m.Called(ctx, req)
 
 	if len(ret) == 0 {
 		panic("no return value specified for UpdateReplicateConfiguration")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, *commonpb.ReplicateConfiguration) error); ok {
-		r0 = rf(ctx, config)
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.UpdateReplicateConfigurationRequest) error); ok {
+		r0 = rf(ctx, req)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -263,14 +340,14 @@ type MockAssignmentService_UpdateReplicateConfiguration_Call struct {
 
 // UpdateReplicateConfiguration is a helper method to define mock.On call
 //   - ctx context.Context
-//   - config *commonpb.ReplicateConfiguration
-func (_e *MockAssignmentService_Expecter) UpdateReplicateConfiguration(ctx interface{}, config interface{}) *MockAssignmentService_UpdateReplicateConfiguration_Call {
-	return &MockAssignmentService_UpdateReplicateConfiguration_Call{Call: _e.mock.On("UpdateReplicateConfiguration", ctx, config)}
+//   - req *milvuspb.UpdateReplicateConfigurationRequest
+func (_e *MockAssignmentService_Expecter) UpdateReplicateConfiguration(ctx interface{}, req interface{}) *MockAssignmentService_UpdateReplicateConfiguration_Call {
+	return &MockAssignmentService_UpdateReplicateConfiguration_Call{Call: _e.mock.On("UpdateReplicateConfiguration", ctx, req)}
 }
 
-func (_c *MockAssignmentService_UpdateReplicateConfiguration_Call) Run(run func(ctx context.Context, config *commonpb.ReplicateConfiguration)) *MockAssignmentService_UpdateReplicateConfiguration_Call {
+func (_c *MockAssignmentService_UpdateReplicateConfiguration_Call) Run(run func(ctx context.Context, req *milvuspb.UpdateReplicateConfigurationRequest)) *MockAssignmentService_UpdateReplicateConfiguration_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(*commonpb.ReplicateConfiguration))
+		run(args[0].(context.Context), args[1].(*milvuspb.UpdateReplicateConfigurationRequest))
 	})
 	return _c
 }
@@ -280,7 +357,7 @@ func (_c *MockAssignmentService_UpdateReplicateConfiguration_Call) Return(_a0 er
 	return _c
 }
 
-func (_c *MockAssignmentService_UpdateReplicateConfiguration_Call) RunAndReturn(run func(context.Context, *commonpb.ReplicateConfiguration) error) *MockAssignmentService_UpdateReplicateConfiguration_Call {
+func (_c *MockAssignmentService_UpdateReplicateConfiguration_Call) RunAndReturn(run func(context.Context, *milvuspb.UpdateReplicateConfigurationRequest) error) *MockAssignmentService_UpdateReplicateConfiguration_Call {
 	_c.Call.Return(run)
 	return _c
 }

@@ -20,8 +20,9 @@
 extern "C" {
 #endif
 
-#include <stdbool.h>
 #include <stdint.h>
+#include <stdbool.h>
+
 #include "common/type_c.h"
 
 void
@@ -38,6 +39,9 @@ SetMiddlePriorityThreadCoreCoefficient(const float);
 
 void
 SetLowPriorityThreadCoreCoefficient(const float);
+
+void
+SetThreadPoolMaxThreadsSize(const int);
 
 void
 SetDefaultExprEvalBatchSize(int64_t val);
@@ -57,6 +61,9 @@ SetDefaultConfigParamTypeCheck(bool val);
 void
 SetDefaultEnableParquetStatsSkipIndex(bool val);
 
+void
+SetEnableLatestDeleteSnapshotOptimization(bool val);
+
 // dynamic update segcore params
 void
 SetLogLevel(const char* level);
@@ -66,6 +73,10 @@ InitTrace(CTraceConfig* config);
 
 void
 SetTrace(CTraceConfig* config);
+
+// OpenSSL FIPS status
+void
+LogOpenSSLFIPSStatus();
 
 // Expr result cache
 void

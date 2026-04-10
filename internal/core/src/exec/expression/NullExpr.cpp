@@ -15,12 +15,24 @@
 // limitations under the License.
 
 #include "NullExpr.h"
+
+#include <cstdint>
 #include <memory>
+#include <string_view>
 #include <utility>
+
 #include "common/Array.h"
+#include "common/EasyAssert.h"
+#include "common/Json.h"
+#include "common/Tracer.h"
 #include "common/Types.h"
-#include "log/Log.h"
-#include "query/Utils.h"
+#include "common/type_c.h"
+#include "opentelemetry/trace/span.h"
+#include "pb/plan.pb.h"
+#include "segcore/SegmentInterface.h"
+#include "storage/MmapManager.h"
+#include "storage/Types.h"
+
 namespace milvus {
 namespace exec {
 
@@ -31,7 +43,11 @@ PhyNullExpr::Eval(EvalCtx& context, VectorPtr& result) {
                                  static_cast<int>(expr_->column_.data_type_));
 
     auto input = context.get_offset_input();
-    switch (expr_->column_.data_type_) {
+    auto data_type = expr_->column_.data_type_;
+    if (expr_->column_.element_level_) {
+        data_type = expr_->column_.element_type_;
+    }
+    switch (data_type) {
         case DataType::BOOL: {
             result = ExecVisitorImpl<bool>(input);
             break;
@@ -107,16 +123,16 @@ PhyNullExpr::ExecVisitorImpl(OffsetVector* input) {
     if (auto res = PreCheckNullable(input)) {
         return res;
     }
-    auto valid_res = (input != nullptr)
-                         ? ProcessChunksForValidByOffsets<T>(
-                               SegmentExpr::CanUseIndex(), *input)
-                         : ProcessChunksForValid<T>(SegmentExpr::CanUseIndex());
+    auto valid_res =
+        (input != nullptr)
+            ? ProcessChunksForValidByOffsets<T>(UseIndexCursor(), *input)
+            : ProcessChunksForValid<T>(UseIndexCursor());
     TargetBitmap res = valid_res.clone();
     if (expr_->op_ == proto::plan::NullExpr_NullOp_IsNull) {
         res.flip();
     }
-    auto res_vec =
-        std::make_shared<ColumnVector>(std::move(res), std::move(valid_res));
+    auto res_vec = std::make_shared<ColumnVector>(
+        std::move(res), TargetBitmap(valid_res.size(), true));
     return res_vec;
 }
 

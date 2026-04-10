@@ -10,13 +10,29 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #pragma once
-#include "common/Json.h"
-#include "query/PlanImpl.h"
-#include "segcore/SegmentGrowing.h"
+#include <assert.h>
+#include <folly/CancellationToken.h>
+#include <stdint.h>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <type_traits>
+#include <vector>
+
+#include "segcore/Utils.h"
 #include <utility>
 #include "PlanNodeVisitor.h"
-#include "plan/PlanNode.h"
+#include "common/Consts.h"
+#include "common/EasyAssert.h"
+#include "common/OpContext.h"
+#include "common/QueryResult.h"
+#include "common/Types.h"
+#include "common/Vector.h"
 #include "exec/QueryContext.h"
+#include "plan/PlanNode.h"
+#include "query/PlanImpl.h"
+#include "query/PlanNode.h"
+#include "segcore/SegmentInterface.h"
 
 namespace milvus::query {
 
@@ -34,23 +50,44 @@ class ExecPlanNodeVisitor : public PlanNodeVisitor {
     ExecPlanNodeVisitor(const segcore::SegmentInterface& segment,
                         Timestamp timestamp,
                         const PlaceholderGroup* placeholder_group,
-                        int32_t consystency_level = 0,
-                        Timestamp collection_ttl = 0)
+                        const folly::CancellationToken& cancel_token =
+                            folly::CancellationToken(),
+                        int32_t consistency_level = 0,
+                        Timestamp collection_ttl = 0,
+                        int64_t entity_ttl_physical_time_us = 0)
         : segment_(segment),
           timestamp_(timestamp),
-          collection_ttl_timestamp_(collection_ttl),
+          entity_ttl_physical_time_us_(
+              entity_ttl_physical_time_us > 0
+                  ? entity_ttl_physical_time_us
+                  : static_cast<int64_t>(
+                        milvus::segcore::TimestampToPhysicalMs(timestamp)) *
+                        1000),
           placeholder_group_(placeholder_group),
-          consystency_level_(consystency_level) {
+          cancel_token_(cancel_token),
+          consistency_level_(consistency_level),
+          collection_ttl_timestamp_(collection_ttl) {
     }
 
+    // Only used for test
     ExecPlanNodeVisitor(const segcore::SegmentInterface& segment,
                         Timestamp timestamp,
-                        int32_t consystency_level = 0,
-                        Timestamp collection_ttl = 0)
+                        const folly::CancellationToken& cancel_token =
+                            folly::CancellationToken(),
+                        int32_t consistency_level = 0,
+                        Timestamp collection_ttl = 0,
+                        int64_t entity_ttl_physical_time_us = 0)
         : segment_(segment),
           timestamp_(timestamp),
-          collection_ttl_timestamp_(collection_ttl),
-          consystency_level_(consystency_level) {
+          entity_ttl_physical_time_us_(
+              entity_ttl_physical_time_us > 0
+                  ? entity_ttl_physical_time_us
+                  : static_cast<int64_t>(
+                        milvus::segcore::TimestampToPhysicalMs(timestamp)) *
+                        1000),
+          cancel_token_(cancel_token),
+          consistency_level_(consistency_level),
+          collection_ttl_timestamp_(collection_ttl) {
         placeholder_group_ = nullptr;
     }
 
@@ -87,24 +124,32 @@ class ExecPlanNodeVisitor : public PlanNodeVisitor {
         return expr_use_pk_index_;
     }
 
-    static BitsetType
+    static RowVectorPtr
     ExecuteTask(plan::PlanFragment& plan,
                 std::shared_ptr<milvus::exec::QueryContext> query_context);
 
- private:
     void
-    VectorVisitorImpl(VectorPlanNode& node);
+    setupRetrieveResult(
+        const RowVectorPtr& result,
+        const OpContext& op_context,
+        const RetrievePlanNode& node,
+        RetrieveResult& tmp_retrieve_result,
+        const segcore::SegmentInternalInterface* segment,
+        std::shared_ptr<milvus::exec::QueryContext> query_context);
 
  private:
     const segcore::SegmentInterface& segment_;
     Timestamp timestamp_;
-    Timestamp collection_ttl_timestamp_;
+    int64_t entity_ttl_physical_time_us_;
     const PlaceholderGroup* placeholder_group_;
+    folly::CancellationToken cancel_token_;
+    int32_t consistency_level_ = 0;
+    Timestamp collection_ttl_timestamp_;
 
     SearchResultOpt search_result_opt_;
     RetrieveResultOpt retrieve_result_opt_;
+
     bool expr_use_pk_index_ = false;
-    int32_t consystency_level_ = 0;
 };
 
 // for test use only
@@ -117,12 +162,54 @@ ExecuteQueryExpr(std::shared_ptr<milvus::plan::PlanNode> plannode,
 
     auto query_context = std::make_shared<milvus::exec::QueryContext>(
         DEAFULT_QUERY_ID, segment, active_count, timestamp);
-    auto bitset =
-        ExecPlanNodeVisitor::ExecuteTask(plan_fragment, query_context);
+    auto row = ExecPlanNodeVisitor::ExecuteTask(plan_fragment, query_context);
+    AssertInfo(row != nullptr,
+               "ExecuteTask returned null row vector for query expression");
+    AssertInfo(
+        row->childrens().size() == 1,
+        "query expr operator's result vector's children size not equal one");
+    auto col_vec = std::dynamic_pointer_cast<ColumnVector>(row->childrens()[0]);
+    AssertInfo(col_vec != nullptr, "failed to cast to ColumnVector");
+    BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+    BitsetType query_view(view);
+    query_view.flip();
+    return query_view;
+}
 
-    // For test case, bitset 1 indicates true but executor is verse
-    bitset.flip();
-    return bitset;
+// for test use only - with explicit entity_ttl_physical_time_us
+inline BitsetType
+ExecuteQueryExpr(std::shared_ptr<milvus::plan::PlanNode> plannode,
+                 const milvus::segcore::SegmentInternalInterface* segment,
+                 uint64_t active_count,
+                 uint64_t timestamp,
+                 int64_t entity_ttl_physical_time_us) {
+    auto plan_fragment = plan::PlanFragment(plannode);
+
+    auto query_context = std::make_shared<milvus::exec::QueryContext>(
+        DEAFULT_QUERY_ID,
+        segment,
+        active_count,
+        timestamp,
+        0,
+        0,
+        milvus::query::PlanOptions(),
+        std::make_shared<milvus::exec::QueryConfig>(),
+        nullptr,
+        std::unordered_map<std::string,
+                           std::shared_ptr<milvus::exec::BaseConfig>>(),
+        entity_ttl_physical_time_us);
+    auto row = ExecPlanNodeVisitor::ExecuteTask(plan_fragment, query_context);
+    AssertInfo(row != nullptr,
+               "ExecuteTask returned null row vector for query expression");
+    AssertInfo(
+        row->childrens().size() == 1,
+        "query expr operator's result vector's children size not equal one");
+    auto col_vec = std::dynamic_pointer_cast<ColumnVector>(row->childrens()[0]);
+    AssertInfo(col_vec != nullptr, "failed to cast to ColumnVector");
+    BitsetTypeView view(col_vec->GetRawData(), col_vec->size());
+    BitsetType query_view(view);
+    query_view.flip();
+    return query_view;
 }
 
 }  // namespace milvus::query

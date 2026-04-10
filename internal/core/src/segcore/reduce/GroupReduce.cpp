@@ -10,8 +10,18 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "GroupReduce.h"
+
+#include <cstdint>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+
+#include "common/Consts.h"
+#include "common/EasyAssert.h"
+#include "common/QueryResult.h"
 #include "log/Log.h"
-#include "segcore/SegmentInterface.h"
 #include "segcore/ReduceUtils.h"
 
 namespace milvus::segcore {
@@ -67,6 +77,10 @@ GroupReduceHelper::RefreshSingleSearchResult(SearchResult* search_result,
     std::vector<float> distances(size);
     std::vector<int64_t> seg_offsets(size);
     std::vector<GroupByValueType> group_by_values(size);
+    std::vector<int32_t> element_indices;
+    if (search_result->element_level_) {
+        element_indices.resize(size);
+    }
 
     uint32_t index = 0;
     for (int j = 0; j < total_nq_; j++) {
@@ -76,6 +90,10 @@ GroupReduceHelper::RefreshSingleSearchResult(SearchResult* search_result,
             seg_offsets[index] = search_result->seg_offsets_[offset];
             group_by_values[index] =
                 search_result->group_by_values_.value()[offset];
+            if (search_result->element_level_) {
+                element_indices[index] =
+                    search_result->element_indices_[offset];
+            }
             index++;
             real_topks[j]++;
         }
@@ -84,6 +102,9 @@ GroupReduceHelper::RefreshSingleSearchResult(SearchResult* search_result,
     search_result->distances_.swap(distances);
     search_result->seg_offsets_.swap(seg_offsets);
     search_result->group_by_values_.value().swap(group_by_values);
+    if (search_result->element_level_) {
+        search_result->element_indices_.swap(element_indices);
+    }
     AssertInfo(search_result->primary_keys_.size() ==
                    search_result->group_by_values_.value().size(),
                "Wrong size for group_by_values size after refresh:{}, "
@@ -187,6 +208,22 @@ GroupReduceHelper::ReduceSearchResultForOneNQ(int64_t qi,
             heap.push(pilot);
         }
     }
+    AssertInfo(static_cast<int64_t>(group_by_map.size()) <= topk,
+               "group_by_map size {} exceeds topk {}, qi={}, offset={}, "
+               "filtered_count={}",
+               group_by_map.size(),
+               topk,
+               qi,
+               offset,
+               filtered_count);
+    LOG_TRACE(
+        "GroupReduceHelper::ReduceSearchResultForOneNQ qi={}, topk={}, "
+        "offset={}, filtered_count={}, group_by_map_size={}",
+        qi,
+        topk,
+        offset,
+        filtered_count,
+        group_by_map.size());
     return filtered_count;
 }
 

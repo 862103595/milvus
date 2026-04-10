@@ -23,12 +23,14 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 )
 
@@ -90,20 +92,22 @@ func (p *ServiceParam) WoodpeckerEnable() bool {
 // --- etcd ---
 type EtcdConfig struct {
 	// --- ETCD ---
-	Endpoints         ParamItem          `refreshable:"false"`
-	RootPath          ParamItem          `refreshable:"false"`
-	MetaSubPath       ParamItem          `refreshable:"false"`
-	KvSubPath         ParamItem          `refreshable:"false"`
-	MetaRootPath      CompositeParamItem `refreshable:"false"`
-	KvRootPath        CompositeParamItem `refreshable:"false"`
-	EtcdLogLevel      ParamItem          `refreshable:"false"`
-	EtcdLogPath       ParamItem          `refreshable:"false"`
-	EtcdUseSSL        ParamItem          `refreshable:"false"`
-	EtcdTLSCert       ParamItem          `refreshable:"false"`
-	EtcdTLSKey        ParamItem          `refreshable:"false"`
-	EtcdTLSCACert     ParamItem          `refreshable:"false"`
-	EtcdTLSMinVersion ParamItem          `refreshable:"false"`
-	RequestTimeout    ParamItem          `refreshable:"false"`
+	Endpoints            ParamItem          `refreshable:"false"`
+	RootPath             ParamItem          `refreshable:"false"`
+	MetaSubPath          ParamItem          `refreshable:"false"`
+	KvSubPath            ParamItem          `refreshable:"false"`
+	MetaRootPath         CompositeParamItem `refreshable:"false"`
+	KvRootPath           CompositeParamItem `refreshable:"false"`
+	EtcdLogLevel         ParamItem          `refreshable:"false"`
+	EtcdLogPath          ParamItem          `refreshable:"false"`
+	EtcdUseSSL           ParamItem          `refreshable:"false"`
+	EtcdTLSCert          ParamItem          `refreshable:"false"`
+	EtcdTLSKey           ParamItem          `refreshable:"false"`
+	EtcdTLSCACert        ParamItem          `refreshable:"false"`
+	EtcdTLSMinVersion    ParamItem          `refreshable:"false"`
+	RequestTimeout       ParamItem          `refreshable:"false"`
+	DialKeepAliveTime    ParamItem          `refreshable:"false"`
+	DialKeepAliveTimeout ParamItem          `refreshable:"false"`
 
 	// --- Embed ETCD ---
 	UseEmbedEtcd ParamItem `refreshable:"false"`
@@ -286,6 +290,24 @@ We recommend using version 1.2 and above.`,
 	}
 	p.RequestTimeout.Init(base.mgr)
 
+	p.DialKeepAliveTime = ParamItem{
+		Key:          "etcd.dialKeepAliveTime",
+		DefaultValue: "3000",
+		Version:      "2.6.6",
+		Doc:          `Interval in milliseconds for gRPC dial keepalive pings sent to etcd endpoints.`,
+		Export:       true,
+	}
+	p.DialKeepAliveTime.Init(base.mgr)
+
+	p.DialKeepAliveTimeout = ParamItem{
+		Key:          "etcd.dialKeepAliveTimeout",
+		DefaultValue: "2000",
+		Version:      "2.6.6",
+		Doc:          `Timeout in milliseconds waiting for keepalive responses before marking the connection as unhealthy.`,
+		Export:       true,
+	}
+	p.DialKeepAliveTimeout.Init(base.mgr)
+
 	p.EtcdEnableAuth = ParamItem{
 		Key:          "etcd.auth.enabled",
 		DefaultValue: "false",
@@ -318,17 +340,31 @@ We recommend using version 1.2 and above.`,
 
 func (p *EtcdConfig) GetAll() map[string]string {
 	return map[string]string{
-		"etcd.endpoints":         p.Endpoints.GetValue(),
-		"etcd.metaRootPath":      p.MetaRootPath.GetValue(),
-		"etcd.ssl.enabled":       p.EtcdUseSSL.GetValue(),
-		"etcd.ssl.tlsCert":       p.EtcdTLSCert.GetValue(),
-		"etcd.ssl.tlsKey":        p.EtcdTLSKey.GetValue(),
-		"etcd.ssl.tlsCACert":     p.EtcdTLSCACert.GetValue(),
-		"etcd.ssl.tlsMinVersion": p.EtcdTLSMinVersion.GetValue(),
-		"etcd.requestTimeout":    p.RequestTimeout.GetValue(),
-		"etcd.auth.enabled":      p.EtcdEnableAuth.GetValue(),
-		"etcd.auth.userName":     p.EtcdAuthUserName.GetValue(),
-		"etcd.auth.password":     p.EtcdAuthPassword.GetValue(),
+		"etcd.endpoints":            p.Endpoints.GetValue(),
+		"etcd.metaRootPath":         p.MetaRootPath.GetValue(),
+		"etcd.ssl.enabled":          p.EtcdUseSSL.GetValue(),
+		"etcd.ssl.tlsCert":          p.EtcdTLSCert.GetValue(),
+		"etcd.ssl.tlsKey":           p.EtcdTLSKey.GetValue(),
+		"etcd.ssl.tlsCACert":        p.EtcdTLSCACert.GetValue(),
+		"etcd.ssl.tlsMinVersion":    p.EtcdTLSMinVersion.GetValue(),
+		"etcd.requestTimeout":       p.RequestTimeout.GetValue(),
+		"etcd.dialKeepAliveTime":    p.DialKeepAliveTime.GetValue(),
+		"etcd.dialKeepAliveTimeout": p.DialKeepAliveTimeout.GetValue(),
+		"etcd.auth.enabled":         p.EtcdEnableAuth.GetValue(),
+		"etcd.auth.userName":        p.EtcdAuthUserName.GetValue(),
+		"etcd.auth.password":        p.EtcdAuthPassword.GetValue(),
+	}
+}
+
+func (p *EtcdConfig) ClientOptions() []etcd.ClientOption {
+	dialKeepAliveTime := p.DialKeepAliveTime.GetAsDuration(time.Millisecond)
+	dialKeepAliveTimeout := p.DialKeepAliveTimeout.GetAsDuration(time.Millisecond)
+
+	if dialKeepAliveTime <= 0 && dialKeepAliveTimeout <= 0 {
+		return nil
+	}
+	return []etcd.ClientOption{
+		etcd.WithDialKeepAlive(dialKeepAliveTime, dialKeepAliveTimeout),
 	}
 }
 
@@ -570,7 +606,8 @@ func (p *MQConfig) Init(base *BaseTable) {
 		DefaultValue: "default",
 		Doc: `Default value: "default"
 Valid values: [default, pulsar, kafka, rocksmq, woodpecker]`,
-		Export: true,
+		Export:    true,
+		Immutable: true,
 	}
 	p.Type.Init(base.mgr)
 
@@ -686,6 +723,18 @@ type WoodpeckerConfig struct {
 	SegmentRollingMaxBlocks ParamItem `refreshable:"true"`
 	AuditorMaxInterval      ParamItem `refreshable:"true"`
 
+	// quorum configuration
+	// Buffer pools for different regions
+	QuorumBufferPools ParamItem `refreshable:"true"`
+
+	// Quorum selection strategy
+	QuorumAffinityMode ParamItem `refreshable:"true"`
+	QuorumReplicas     ParamItem `refreshable:"true"`
+	QuorumStrategy     ParamItem `refreshable:"true"`
+
+	// Custom placement for replicas
+	QuorumCustomPlacement ParamItem `refreshable:"true"`
+
 	// logstore
 	SyncMaxInterval                ParamItem `refreshable:"true"`
 	SyncMaxIntervalForLocalStorage ParamItem `refreshable:"true"`
@@ -700,6 +749,8 @@ type WoodpeckerConfig struct {
 	CompactionMaxParallelReads     ParamItem `refreshable:"true"`
 	ReaderMaxBatchSize             ParamItem `refreshable:"true"`
 	ReaderMaxFetchThreads          ParamItem `refreshable:"true"`
+	RetentionTTL                   ParamItem `refreshable:"true"`
+	FencePolicyConditionWrite      ParamItem `refreshable:"true"`
 
 	// storage
 	StorageType ParamItem `refreshable:"false"`
@@ -778,6 +829,80 @@ func (p *WoodpeckerConfig) Init(base *BaseTable) {
 		Export:       true,
 	}
 	p.AuditorMaxInterval.Init(base.mgr)
+
+	// Buffer pools for different regions
+	p.QuorumBufferPools = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumBufferPools",
+		Version:      "2.6.0",
+		DefaultValue: "",
+		Doc: `Quorum Buffer Pools: Define groups of nodes for different purposes
+Example configuration below:
+  - name: region1 # Name of the region pool
+    seeds: [n1,n2,n3] # List of seed node addresses for this pool
+  - name: region2 # Name of the region pool
+    seeds: [n4,n5,n6] # List of seed node addresses for this pool`,
+		Export: false,
+	}
+	p.QuorumBufferPools.Init(base.mgr)
+
+	// Quorum selection strategy
+	p.QuorumAffinityMode = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.affinityMode",
+		Version:      "2.6.0",
+		DefaultValue: "soft",
+		Doc:          "Affinity mode for node selection rules. Valid values: [soft, hard]",
+		Export:       false,
+	}
+	p.QuorumAffinityMode.Init(base.mgr)
+
+	p.QuorumReplicas = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.replicas",
+		Version:      "2.6.0",
+		DefaultValue: "3",
+		Doc:          "Number of replicas in the quorum ensemble. Valid values: [3, 5]",
+		Export:       false,
+	}
+	p.QuorumReplicas.Init(base.mgr)
+
+	p.QuorumStrategy = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.strategy",
+		Version:      "2.6.0",
+		DefaultValue: "random",
+		Doc: `Node selection strategy
+Valid values: [random, single-az-single-rg, single-az-multi-rg, multi-az-single-rg, multi-az-multi-rg, cross-region, custom]
+random: nodes are selected randomly
+single-az-single-rg: All nodes in same availability zone and resource group
+single-az-multi-rg: Same availability zone, multiple resource groups
+multi-az-single-rg: Multiple availability zones, single resource group
+multi-az-multi-rg: Multiple availability zones and resource groups
+cross-region: Nodes across different regions for maximum durability
+custom: Use custom expressions defined below`,
+		Export: false,
+	}
+	p.QuorumStrategy.Init(base.mgr)
+
+	// Custom placement for replica 1
+	p.QuorumCustomPlacement = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.customPlacement",
+		Version:      "2.6.0",
+		DefaultValue: "",
+		Doc: `Custom expressions for node selection (only used when strategy is 'custom')
+Example configuration below:
+  - name: replica-1
+    region: "default-region-pool"
+    az: "az-1"
+    resourceGroup: "rg.*"
+  - name: replica-2
+    region: "default-region-pool"
+    az: "az-2"
+    resourceGroup: "rg.*"
+  - name: replica-3
+    region: "default-region-pool"
+    az: "az.*"
+    resourceGroup: "rg.*"`,
+		Export: false,
+	}
+	p.QuorumCustomPlacement.Init(base.mgr)
 
 	p.SyncMaxInterval = ParamItem{
 		Key:          "woodpecker.logstore.segmentSyncPolicy.maxInterval",
@@ -895,6 +1020,26 @@ func (p *WoodpeckerConfig) Init(base *BaseTable) {
 		Export:       true,
 	}
 	p.ReaderMaxFetchThreads.Init(base.mgr)
+
+	p.RetentionTTL = ParamItem{
+		Key:          "woodpecker.logstore.retentionPolicy.ttl",
+		Version:      "2.6.0",
+		DefaultValue: "72h",
+		FallbackKeys: []string{"streaming.walTruncate.retentionInterval"},
+		Doc:          "Time to live for truncated segments in seconds, default is 72h",
+		Export:       true,
+	}
+	p.RetentionTTL.Init(base.mgr)
+
+	p.FencePolicyConditionWrite = ParamItem{
+		Key:          "woodpecker.logstore.fencePolicy.conditionWrite",
+		Version:      "2.6.0",
+		DefaultValue: "auto",
+		Doc: `Enable conditional write for embedded mode, default is auto, which will automatically detect whether the storage supports conditional write.
+Valid values: [auto, enable, disable]`,
+		Export: true,
+	}
+	p.FencePolicyConditionWrite.Init(base.mgr)
 
 	p.StorageType = ParamItem{
 		Key:          "woodpecker.storage.type",
@@ -1083,8 +1228,7 @@ set this option to non-zero will create a subscription seek to latest position t
 If these options is non-zero, the wal data in pulsar is fully protected by retention policy, 
 so admin of pulsar should give enough retention time to avoid the wal message lost.
 If these options is zero, no subscription will be created, so pulsar cluster must close the backlog protection, otherwise the milvus can not recovered if backlog exceed.
-Moreover, if these option is zero, Milvus use a truncation subscriber to protect the wal data in pulsar if user disable the subscriptionExpirationTimeMinutes.
-The retention policy of pulsar can set shorter to save the storage space in this case.`,
+If this option is zero or negative, it will be ignored and the default value (100m) will be used.`,
 		Export: true,
 	}
 	p.BacklogAutoClearBytes.Init(base.mgr)
@@ -1324,6 +1468,7 @@ type MinioConfig struct {
 	SecretAccessKey    ParamItem `refreshable:"false"`
 	UseSSL             ParamItem `refreshable:"false"`
 	SslCACert          ParamItem `refreshable:"false"`
+	SslTLSMinVersion   ParamItem `refreshable:"false"`
 	BucketName         ParamItem `refreshable:"false"`
 	RootPath           ParamItem `refreshable:"false"`
 	UseIAM             ParamItem `refreshable:"false"`
@@ -1334,7 +1479,9 @@ type MinioConfig struct {
 	Region             ParamItem `refreshable:"false"`
 	UseVirtualHost     ParamItem `refreshable:"false"`
 	RequestTimeoutMs   ParamItem `refreshable:"false"`
+	MaxConnections     ParamItem `refreshable:"false"`
 	ListObjectsMaxKeys ParamItem `refreshable:"true"`
+	UseCRC32C          ParamItem `refreshable:"false"`
 }
 
 func (p *MinioConfig) Init(base *BaseTable) {
@@ -1416,6 +1563,18 @@ The default value applies to MinIO or S3 service that started with the default d
 		Export:  true,
 	}
 	p.SslCACert.Init(base.mgr)
+
+	p.SslTLSMinVersion = ParamItem{
+		Key:          "minio.ssl.tlsMinVersion",
+		DefaultValue: "default",
+		Version:      "2.6.11",
+		Doc: `TLS minimum version for MinIO/S3 SSL connections.
+Optional values: "default", "1.0", "1.1", "1.2", "1.3".
+When set to "default", the SDK/runtime default is used (typically TLS 1.2).
+We recommend using version 1.2 and above.`,
+		Export: true,
+	}
+	p.SslTLSMinVersion.Init(base.mgr)
 
 	p.BucketName = ParamItem{
 		Key:          "minio.bucketName",
@@ -1537,15 +1696,32 @@ Leave it empty if you want to use AWS default endpoint`,
 	}
 	p.RequestTimeoutMs.Init(base.mgr)
 
+	p.MaxConnections = ParamItem{
+		Key:          "minio.maxConnections",
+		Version:      "2.6.6",
+		DefaultValue: DefaultMinioMaxConnections,
+		Doc:          "Maximum concurrent HTTP connections to object storage",
+	}
+	p.MaxConnections.Init(base.mgr)
+
 	p.ListObjectsMaxKeys = ParamItem{
 		Key:          "minio.listObjectsMaxKeys",
 		Version:      "2.4.1",
 		DefaultValue: "0",
 		Doc: `The maximum number of objects requested per batch in minio ListObjects rpc, 
-0 means using oss client by default, decrease these configration if ListObjects timeout`,
+0 means using oss client by default, decrease these configuration if ListObjects timeout`,
 		Export: true,
 	}
 	p.ListObjectsMaxKeys.Init(base.mgr)
+
+	p.UseCRC32C = ParamItem{
+		Key:          "minio.ssl.useCRC32C",
+		Version:      "2.6.11",
+		DefaultValue: "false",
+		Doc:          "Whether to use CRC32C checksum for data integrity validation on MinIO/S3 PutObject requests.",
+		Export:       true,
+	}
+	p.UseCRC32C.Init(base.mgr)
 }
 
 // profile config

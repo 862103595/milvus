@@ -15,8 +15,17 @@
 // limitations under the License.
 
 #include "MvccNode.h"
+
+#include <utility>
+#include <vector>
+
 #include "common/Tracer.h"
-#include "fmt/format.h"
+#include "exec/QueryContext.h"
+#include "exec/expression/Utils.h"
+#include "fmt/core.h"
+#include "plan/PlanNode.h"
+#include "segcore/SegmentInterface.h"
+
 namespace milvus {
 namespace exec {
 
@@ -44,18 +53,22 @@ PhyMvccNode::AddInput(RowVectorPtr& input) {
 
 RowVectorPtr
 PhyMvccNode::GetOutput() {
+    auto* query_context =
+        operator_context_->get_exec_context()->get_query_context();
+    milvus::exec::checkCancellation(query_context);
+
     if (is_finished_) {
         return nullptr;
     }
 
     tracer::AutoSpan span("PhyMvccNode::Execute", tracer::GetRootSpan(), true);
 
-    if (!is_source_node_ && input_ == nullptr) {
+    if (active_count_ == 0) {
+        is_finished_ = true;
         return nullptr;
     }
 
-    if (active_count_ == 0) {
-        is_finished_ = true;
+    if (!is_source_node_ && input_ == nullptr) {
         return nullptr;
     }
 
@@ -73,10 +86,6 @@ PhyMvccNode::GetOutput() {
         data, query_timestamp_, collection_ttl_timestamp_);
     segment_->mask_with_delete(data, active_count_, query_timestamp_);
     is_finished_ = true;
-
-    auto output_rows = active_count_ - data.count();
-    tracer::AddEvent(fmt::format(
-        "output_rows: {}, filtered: {}", output_rows, data.count()));
 
     // input_ have already been updated
     return std::make_shared<RowVector>(std::vector<VectorPtr>{col_input});

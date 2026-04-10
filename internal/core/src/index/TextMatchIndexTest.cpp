@@ -10,20 +10,56 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <gtest/gtest.h>
+#include <nlohmann/detail/iterators/iteration_proxy.hpp>
+#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
+#include <stdint.h>
+#include <chrono>
+#include <initializer_list>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <memory>
 #include <optional>
+#include <ratio>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include "bitset/bitset.h"
+#include "bitset/detail/element_vectorized.h"
+#include "common/Consts.h"
+#include "common/EasyAssert.h"
+#include "common/FieldMeta.h"
+#include "common/IndexMeta.h"
 #include "common/Schema.h"
+#include "common/Types.h"
+#include "common/common_type_c.h"
+#include "common/protobuf_utils.h"
+#include "exec/expression/ExprCache.h"
+#include "exec/expression/function/FunctionFactory.h"
+#include "expr/ITypeExpr.h"
+#include "filemanager/InputStream.h"
+#include "gtest/gtest.h"
+#include "index/TextMatchIndex.h"
+#include "index/Utils.h"
+#include "knowhere/comp/index_param.h"
+#include "pb/plan.pb.h"
+#include "pb/schema.pb.h"
+#include "plan/PlanNode.h"
+#include "query/ExecPlanNodeVisitor.h"
+#include "query/PlanNode.h"
+#include "query/PlanProto.h"
+#include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentGrowing.h"
 #include "segcore/SegmentGrowingImpl.h"
+#include "segcore/SegmentSealed.h"
+#include "segcore/segment_c.h"
+#include "storage/Util.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/GenExprProto.h"
-#include "query/PlanProto.h"
-#include "query/ExecPlanNodeVisitor.h"
-#include "expr/ITypeExpr.h"
-#include "segcore/segment_c.h"
 #include "test_utils/storage_test_utils.h"
-#include "exec/expression/ExprCache.h"
 
 using namespace milvus;
 using namespace milvus::query;
@@ -222,6 +258,171 @@ TEST(TextMatch, Index) {
     }
 }
 
+// Regression test: BuildIndexFromFieldData with multiple FieldData batches
+// and nullable fields must record correct global offsets in null_offset_.
+// Previously, null_offset_.push_back(i) used the batch-local index instead
+// of the global accumulated offset, causing wrong null tracking for all
+// batches after the first.
+TEST(TextMatch, BuildIndexFromFieldDataMultiBatchNullable) {
+    using Index = index::TextMatchIndex;
+
+    // Helper to create a nullable FieldData<std::string> batch.
+    auto make_batch =
+        [](const std::vector<std::string>& texts,
+           const std::vector<bool>& valids) -> milvus::FieldDataPtr {
+        auto fd = storage::CreateFieldData(
+            DataType::VARCHAR, DataType::NONE, true, 1, texts.size());
+        // Pack valid bits into uint8_t array (LSB first).
+        size_t byte_count = (texts.size() + 7) / 8;
+        std::vector<uint8_t> valid_bytes(byte_count, 0);
+        for (size_t i = 0; i < valids.size(); i++) {
+            if (valids[i]) {
+                valid_bytes[i >> 3] |= (1u << (i & 7));
+            }
+        }
+        fd->FillFieldData(texts.data(), valid_bytes.data(), texts.size(), 0);
+        return fd;
+    };
+
+    // Three batches, nulls scattered across all batches.
+    // Batch 0 (3 rows): "hello", NULL,  "world"
+    // Batch 1 (3 rows): NULL,   "foo",  NULL
+    // Batch 2 (2 rows): "bar",  NULL
+    //
+    // Global layout (8 rows total):
+    //   offset 0: "hello" (valid)
+    //   offset 1: ""      (null)
+    //   offset 2: "world" (valid)
+    //   offset 3: ""      (null)
+    //   offset 4: "foo"   (valid)
+    //   offset 5: ""      (null)
+    //   offset 6: "bar"   (valid)
+    //   offset 7: ""      (null)
+    auto batch0 = make_batch({"hello", "", "world"}, {true, false, true});
+    auto batch1 = make_batch({"", "foo", ""}, {false, true, false});
+    auto batch2 = make_batch({"bar", ""}, {true, false});
+
+    std::vector<milvus::FieldDataPtr> field_datas = {batch0, batch1, batch2};
+
+    auto index = std::make_unique<Index>(
+        200, "test_multi_batch", "milvus_tokenizer", "{}");
+    index->CreateReader(milvus::index::SetBitsetGrowing);
+    index->RegisterAnalyzer("milvus_tokenizer", "{}");
+
+    index->BuildIndexFromFieldData(field_datas, true /* nullable */);
+    index->Commit();
+    index->Reload();
+
+    // Verify null tracking: offsets 1, 3, 5, 7 should be null.
+    {
+        auto null_bits = index->IsNull();
+        ASSERT_EQ(null_bits.size(), 8);
+        ASSERT_FALSE(null_bits[0]);  // "hello"
+        ASSERT_TRUE(null_bits[1]);   // null
+        ASSERT_FALSE(null_bits[2]);  // "world"
+        ASSERT_TRUE(null_bits[3]);   // null (batch 1, row 0)
+        ASSERT_FALSE(null_bits[4]);  // "foo"
+        ASSERT_TRUE(null_bits[5]);   // null (batch 1, row 2)
+        ASSERT_FALSE(null_bits[6]);  // "bar"
+        ASSERT_TRUE(null_bits[7]);   // null (batch 2, row 1)
+    }
+
+    // Verify not-null tracking.
+    {
+        auto not_null_bits = index->IsNotNull();
+        ASSERT_EQ(not_null_bits.size(), 8);
+        ASSERT_TRUE(not_null_bits[0]);
+        ASSERT_FALSE(not_null_bits[1]);
+        ASSERT_TRUE(not_null_bits[2]);
+        ASSERT_FALSE(not_null_bits[3]);
+        ASSERT_TRUE(not_null_bits[4]);
+        ASSERT_FALSE(not_null_bits[5]);
+        ASSERT_TRUE(not_null_bits[6]);
+        ASSERT_FALSE(not_null_bits[7]);
+    }
+
+    // Verify text search still works on valid rows.
+    {
+        auto res = index->MatchQuery("hello", 1);
+        ASSERT_EQ(res.size(), 8);
+        ASSERT_TRUE(res[0]);
+        for (int i = 1; i < 8; i++) {
+            ASSERT_FALSE(res[i]) << "unexpected match at offset " << i;
+        }
+    }
+    {
+        auto res = index->MatchQuery("foo", 1);
+        ASSERT_EQ(res.size(), 8);
+        ASSERT_TRUE(res[4]);
+        for (int i = 0; i < 8; i++) {
+            if (i != 4) {
+                ASSERT_FALSE(res[i]) << "unexpected match at offset " << i;
+            }
+        }
+    }
+    {
+        auto res = index->MatchQuery("bar", 1);
+        ASSERT_EQ(res.size(), 8);
+        ASSERT_TRUE(res[6]);
+        for (int i = 0; i < 8; i++) {
+            if (i != 6) {
+                ASSERT_FALSE(res[i]) << "unexpected match at offset " << i;
+            }
+        }
+    }
+}
+
+// Regression test: BuildIndexFromFieldData with a single batch should still
+// work correctly (i == offset in this case, so the old bug was hidden).
+TEST(TextMatch, BuildIndexFromFieldDataSingleBatchNullable) {
+    using Index = index::TextMatchIndex;
+
+    auto fd =
+        storage::CreateFieldData(DataType::VARCHAR, DataType::NONE, true, 1, 4);
+    std::vector<std::string> texts = {"alpha", "", "beta", ""};
+    std::vector<bool> valids = {true, false, true, false};
+    size_t byte_count = (texts.size() + 7) / 8;
+    std::vector<uint8_t> valid_bytes(byte_count, 0);
+    for (size_t i = 0; i < valids.size(); i++) {
+        if (valids[i]) {
+            valid_bytes[i >> 3] |= (1u << (i & 7));
+        }
+    }
+    fd->FillFieldData(texts.data(), valid_bytes.data(), texts.size(), 0);
+
+    std::vector<milvus::FieldDataPtr> field_datas = {fd};
+
+    auto index = std::make_unique<Index>(
+        200, "test_single_batch", "milvus_tokenizer", "{}");
+    index->CreateReader(milvus::index::SetBitsetGrowing);
+    index->RegisterAnalyzer("milvus_tokenizer", "{}");
+
+    index->BuildIndexFromFieldData(field_datas, true);
+    index->Commit();
+    index->Reload();
+
+    auto null_bits = index->IsNull();
+    ASSERT_EQ(null_bits.size(), 4);
+    ASSERT_FALSE(null_bits[0]);
+    ASSERT_TRUE(null_bits[1]);
+    ASSERT_FALSE(null_bits[2]);
+    ASSERT_TRUE(null_bits[3]);
+
+    auto res = index->MatchQuery("alpha", 1);
+    ASSERT_EQ(res.size(), 4);
+    ASSERT_TRUE(res[0]);
+    ASSERT_FALSE(res[1]);
+    ASSERT_FALSE(res[2]);
+    ASSERT_FALSE(res[3]);
+
+    auto res2 = index->MatchQuery("beta", 1);
+    ASSERT_EQ(res2.size(), 4);
+    ASSERT_FALSE(res2[0]);
+    ASSERT_FALSE(res2[1]);
+    ASSERT_TRUE(res2[2]);
+    ASSERT_FALSE(res2[3]);
+}
+
 TEST(TextMatch, GrowingNaive) {
     auto schema = GenTestSchema();
     auto seg = CreateGrowingSegment(schema, empty_index_meta);
@@ -308,6 +509,82 @@ TEST(TextMatch, GrowingNaive) {
         ASSERT_EQ(final.size(), N);
         ASSERT_TRUE(final[0]);
         ASSERT_FALSE(final[1]);
+    }
+}
+
+// Regression test for https://github.com/milvus-io/milvus/issues/48388
+// On growing segments, the TextIndex may index rows beyond the query timestamp.
+// ExecTextMatch must truncate the result bitmap to active_count to avoid
+// FilterBitsNode assertion failure: col_vec_size != need_process_rows_.
+TEST(TextMatch, GrowingIndexAheadOfActiveCount) {
+    auto schema = GenTestSchema();
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+
+    // Batch 1: 3 rows with timestamps 0,1,2
+    int64_t N1 = 3;
+    uint64_t seed = 19190504;
+    auto data1 = DataGen(schema, N1, seed);
+    auto str_col1 = data1.raw_->mutable_fields_data()
+                        ->at(1)
+                        .mutable_scalars()
+                        ->mutable_string_data()
+                        ->mutable_data();
+    str_col1->at(0) = "football, basketball";
+    str_col1->at(1) = "swimming, tennis";
+    str_col1->at(2) = "football, swimming";
+    seg->PreInsert(N1);
+    seg->Insert(
+        0, N1, data1.row_ids_.data(), data1.timestamps_.data(), data1.raw_);
+
+    // Batch 2: 2 rows with timestamps 3,4 (later than batch 1)
+    int64_t N2 = 2;
+    auto data2 = DataGen(schema, N2, seed, N1);  // ts_offset=N1 → ts 3,4
+    // Fix row_ids to continue from batch 1
+    for (int i = 0; i < N2; i++) {
+        data2.row_ids_[i] = N1 + i;
+    }
+    auto str_col2 = data2.raw_->mutable_fields_data()
+                        ->at(1)
+                        .mutable_scalars()
+                        ->mutable_string_data()
+                        ->mutable_data();
+    str_col2->at(0) = "football, rugby";
+    str_col2->at(1) = "football, cricket";
+    seg->PreInsert(N2);
+    seg->Insert(
+        N1, N2, data2.row_ids_.data(), data2.timestamps_.data(), data2.raw_);
+
+    // Wait for TextIndex to index all 5 rows
+    std::this_thread::sleep_for(std::chrono::milliseconds(200) * 2);
+
+    // Query with timestamp=2 so only batch 1 (3 rows) is visible,
+    // but TextIndex has indexed all 5 rows.
+    // Before fix: assertion failure (bitset size 5 != need_process_rows 3)
+    // After fix: result is correctly truncated to 3 rows
+    int64_t query_ts = N1 - 1;  // timestamp=2, active_count should be N1
+    for (auto op : {OpType::TextMatch, OpType::PhraseMatch}) {
+        auto expr = GetMatchExpr(schema, "football", op);
+        BitsetType result = ExecuteQueryExpr(expr, seg.get(), N1, query_ts);
+        ASSERT_EQ(result.size(), N1)
+            << "result bitmap size should equal active_count (N1=" << N1
+            << "), not total indexed rows (" << N1 + N2 << ")";
+        // Row 0 ("football, basketball") and row 2 ("football, swimming") match
+        ASSERT_TRUE(result[0]);
+        ASSERT_FALSE(result[1]);
+        ASSERT_TRUE(result[2]);
+    }
+
+    // Also verify full-range query still works correctly
+    for (auto op : {OpType::TextMatch, OpType::PhraseMatch}) {
+        auto expr = GetMatchExpr(schema, "football", op);
+        BitsetType result =
+            ExecuteQueryExpr(expr, seg.get(), N1 + N2, MAX_TIMESTAMP);
+        ASSERT_EQ(result.size(), N1 + N2);
+        ASSERT_TRUE(result[0]);   // "football, basketball"
+        ASSERT_FALSE(result[1]);  // "swimming, tennis"
+        ASSERT_TRUE(result[2]);   // "football, swimming"
+        ASSERT_TRUE(result[3]);   // "football, rugby"
+        ASSERT_TRUE(result[4]);   // "football, cricket"
     }
 }
 
@@ -959,6 +1236,9 @@ TEST(TextMatch, SealedJieBaNullable) {
 
 // Test that growing segment loading flushed binlogs will build text match index.
 TEST(TextMatch, GrowingLoadData) {
+    milvus::exec::expression::FunctionFactory& factory =
+        milvus::exec::expression::FunctionFactory::Instance();
+    factory.Initialize();
     int64_t N = 7;
     auto schema = GenTestSchema({}, true);
     schema->AddField(

@@ -64,7 +64,6 @@ type MultiSegmentWriter struct {
 	binLogMaxSize uint64
 
 	res []*datapb.CompactionSegment
-	// DONOT leave it empty of all segments are deleted, just return a segment with zero meta for datacoord
 
 	storageVersion int64
 	params         compaction.Params
@@ -120,7 +119,7 @@ func (w *MultiSegmentWriter) closeWriter() error {
 			return err
 		}
 
-		fieldBinlogs, statsLog, bm25Logs := w.writer.GetLogs()
+		fieldBinlogs, statsLog, bm25Logs, manifest, expirQuantiles := w.writer.GetLogs()
 
 		result := &datapb.CompactionSegment{
 			SegmentID:           w.currentSegmentID,
@@ -130,6 +129,8 @@ func (w *MultiSegmentWriter) closeWriter() error {
 			Channel:             w.channel,
 			Bm25Logs:            lo.Values(bm25Logs),
 			StorageVersion:      w.storageVersion,
+			Manifest:            manifest,
+			ExpirQuantiles:      expirQuantiles,
 		}
 
 		w.res = append(w.res, result)
@@ -239,78 +240,6 @@ func (w *MultiSegmentWriter) Close() error {
 	return nil
 }
 
-func NewSegmentDeltaWriter(segmentID, partitionID, collectionID int64) *SegmentDeltaWriter {
-	return &SegmentDeltaWriter{
-		deleteData:   &storage.DeleteData{},
-		segmentID:    segmentID,
-		partitionID:  partitionID,
-		collectionID: collectionID,
-		tsFrom:       math.MaxUint64,
-		tsTo:         0,
-	}
-}
-
-type SegmentDeltaWriter struct {
-	deleteData   *storage.DeleteData
-	segmentID    int64
-	partitionID  int64
-	collectionID int64
-
-	tsFrom typeutil.Timestamp
-	tsTo   typeutil.Timestamp
-}
-
-func (w *SegmentDeltaWriter) GetCollectionID() int64 {
-	return w.collectionID
-}
-
-func (w *SegmentDeltaWriter) GetPartitionID() int64 {
-	return w.partitionID
-}
-
-func (w *SegmentDeltaWriter) GetSegmentID() int64 {
-	return w.segmentID
-}
-
-func (w *SegmentDeltaWriter) GetRowNum() int64 {
-	return w.deleteData.RowCount
-}
-
-func (w *SegmentDeltaWriter) GetTimeRange() *writebuffer.TimeRange {
-	return writebuffer.NewTimeRange(w.tsFrom, w.tsTo)
-}
-
-func (w *SegmentDeltaWriter) updateRange(ts typeutil.Timestamp) {
-	if ts < w.tsFrom {
-		w.tsFrom = ts
-	}
-	if ts > w.tsTo {
-		w.tsTo = ts
-	}
-}
-
-func (w *SegmentDeltaWriter) Write(pk storage.PrimaryKey, ts typeutil.Timestamp) {
-	w.deleteData.Append(pk, ts)
-	w.updateRange(ts)
-}
-
-func (w *SegmentDeltaWriter) WriteBatch(pks []storage.PrimaryKey, tss []typeutil.Timestamp) {
-	w.deleteData.AppendBatch(pks, tss)
-
-	for _, ts := range tss {
-		w.updateRange(ts)
-	}
-}
-
-func (w *SegmentDeltaWriter) Finish() (*storage.Blob, *writebuffer.TimeRange, error) {
-	blob, err := storage.NewDeleteCodec().Serialize(w.collectionID, w.partitionID, w.segmentID, w.deleteData)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return blob, w.GetTimeRange(), nil
-}
-
 type SegmentWriter struct {
 	writer  *storage.BinlogSerializeWriter
 	closers []func() (*storage.Blob, error)
@@ -376,9 +305,7 @@ func (w *SegmentWriter) WriteRecord(r storage.Record) error {
 			w.pkstats.Update(pk)
 		case schemapb.DataType_VarChar:
 			pkArray := r.Column(w.GetPkID()).(*array.String)
-			pk := &storage.VarCharPrimaryKey{
-				Value: pkArray.Value(i),
-			}
+			pk := storage.NewVarCharPrimaryKey(pkArray.Value(i))
 			w.pkstats.Update(pk)
 		default:
 			panic("invalid data type")
@@ -492,7 +419,9 @@ func (w *SegmentWriter) SerializeYield() ([]*storage.Blob, *writebuffer.TimeRang
 	}
 
 	tr := w.GetTimeRange()
-	w.clear()
+	if err := w.clear(); err != nil {
+		return nil, nil, err
+	}
 
 	return fieldData, tr, nil
 }
@@ -501,14 +430,18 @@ func (w *SegmentWriter) GetTotalSize() int64 {
 	return w.syncedSize.Load() + int64(w.writer.GetWrittenUncompressed())
 }
 
-func (w *SegmentWriter) clear() {
+func (w *SegmentWriter) clear() error {
 	w.syncedSize.Add(int64(w.writer.GetWrittenUncompressed()))
 
-	writer, closers, _ := newBinlogWriter(w.collectionID, w.partitionID, w.segmentID, w.sch, w.batchSize)
+	writer, closers, err := newBinlogWriter(w.collectionID, w.partitionID, w.segmentID, w.sch, w.batchSize)
+	if err != nil {
+		return err
+	}
 	w.writer = writer
 	w.closers = closers
 	w.tsFrom = math.MaxUint64
 	w.tsTo = 0
+	return nil
 }
 
 // deprecated: use NewMultiSegmentWriter instead

@@ -18,8 +18,8 @@
 namespace milvus::tantivy {
 using Map = std::map<std::string, std::string>;
 
-static constexpr const char* DEFAULT_TOKENIZER_NAME = "milvus_tokenizer";
-static const char* DEFAULT_analyzer_params = "{}";
+static constexpr const char* DEFAULT_ANALYZER_NAME = "milvus_tokenizer";
+static const char* DEFAULT_ANALYZER_PARAMS = "{}";
 static constexpr uintptr_t DEFAULT_NUM_THREADS =
     1;  // Every field with index writer will generate a thread, make huge thread amount, wait for refactoring.
 static constexpr uintptr_t DEFAULT_OVERALL_MEMORY_BUDGET_IN_BYTES =
@@ -134,8 +134,9 @@ struct TantivyIndexWrapper {
                         bool in_ram,
                         const char* path,
                         uint32_t tantivy_index_version,
-                        const char* tokenizer_name = DEFAULT_TOKENIZER_NAME,
-                        const char* analyzer_params = DEFAULT_analyzer_params,
+                        const char* analyzer_name = DEFAULT_ANALYZER_NAME,
+                        const char* analyzer_params = DEFAULT_ANALYZER_PARAMS,
+                        const char* analyzer_extra_info = "",
                         uintptr_t num_threads = DEFAULT_NUM_THREADS,
                         uintptr_t overall_memory_budget_in_bytes =
                             DEFAULT_OVERALL_MEMORY_BUDGET_IN_BYTES) {
@@ -143,8 +144,9 @@ struct TantivyIndexWrapper {
             tantivy_create_text_writer(field_name,
                                        path,
                                        tantivy_index_version,
-                                       tokenizer_name,
+                                       analyzer_name,
                                        analyzer_params,
+                                       analyzer_extra_info,
                                        num_threads,
                                        overall_memory_budget_in_bytes,
                                        in_ram));
@@ -226,11 +228,19 @@ struct TantivyIndexWrapper {
     }
 
     void
+    set_analyzer_extra_info(std::string analyzer_extra_info) {
+        analyzer_extra_info_ = analyzer_extra_info;
+    }
+
+    void
     register_tokenizer(const char* tokenizer_name,
                        const char* analyzer_params) {
         if (reader_ != nullptr) {
-            auto res = RustResultWrapper(tantivy_register_tokenizer(
-                reader_, tokenizer_name, analyzer_params));
+            auto res = RustResultWrapper(
+                tantivy_register_tokenizer(reader_,
+                                           tokenizer_name,
+                                           analyzer_params,
+                                           analyzer_extra_info_.c_str()));
             AssertInfo(res.result_->success,
                        "failed to register tokenizer: {}",
                        res.result_->error);
@@ -308,9 +318,11 @@ struct TantivyIndexWrapper {
         if constexpr (std::is_same_v<T, std::string>) {
             // TODO: not very efficient, a lot of overhead due to rust-ffi call.
             for (uintptr_t i = 0; i < len; i++) {
+                const auto& s = static_cast<const std::string*>(array)[i];
                 auto res = RustResultWrapper(tantivy_index_add_string(
                     writer_,
-                    static_cast<const std::string*>(array)[i].c_str(),
+                    reinterpret_cast<const uint8_t*>(s.data()),
+                    s.size(),
                     offset_begin + i));
                 AssertInfo(res.result_->success,
                            "failed to add string: {}",
@@ -355,6 +367,7 @@ struct TantivyIndexWrapper {
                         int64_t offset_begin) {
         assert(!finished_);
         std::vector<const char*> views;
+        views.reserve(len);
         for (uintptr_t i = 0; i < len; i++) {
             views.push_back(array[i].c_str());
         }
@@ -434,12 +447,17 @@ struct TantivyIndexWrapper {
         }
 
         if constexpr (std::is_same_v<T, std::string>) {
-            std::vector<const char*> views;
+            std::vector<const uint8_t*> ptrs;
+            std::vector<uintptr_t> str_lens;
+            ptrs.reserve(len);
+            str_lens.reserve(len);
             for (uintptr_t i = 0; i < len; i++) {
-                views.push_back(array[i].c_str());
+                ptrs.push_back(
+                    reinterpret_cast<const uint8_t*>(array[i].data()));
+                str_lens.push_back(array[i].size());
             }
             auto res = RustResultWrapper(tantivy_index_add_array_keywords(
-                writer_, views.data(), len, offset));
+                writer_, ptrs.data(), str_lens.data(), len, offset));
             AssertInfo(res.result_->success,
                        "failed to add multi keywords: {}",
                        res.result_->error);
@@ -529,10 +547,12 @@ struct TantivyIndexWrapper {
         if constexpr (std::is_same_v<T, std::string>) {
             // TODO: not very efficient, a lot of overhead due to rust-ffi call.
             for (uintptr_t i = 0; i < len; i++) {
+                const auto& s = static_cast<const std::string*>(array)[i];
                 auto res = RustResultWrapper(
                     tantivy_index_add_string_by_single_segment_writer(
                         writer_,
-                        static_cast<const std::string*>(array)[i].c_str()));
+                        reinterpret_cast<const uint8_t*>(s.data()),
+                        s.size()));
                 AssertInfo(res.result_->success,
                            "failed to add string: {}",
                            res.result_->error);
@@ -620,13 +640,18 @@ struct TantivyIndexWrapper {
         }
 
         if constexpr (std::is_same_v<T, std::string>) {
-            std::vector<const char*> views;
+            std::vector<const uint8_t*> ptrs;
+            std::vector<uintptr_t> str_lens;
+            ptrs.reserve(len);
+            str_lens.reserve(len);
             for (uintptr_t i = 0; i < len; i++) {
-                views.push_back(array[i].c_str());
+                ptrs.push_back(
+                    reinterpret_cast<const uint8_t*>(array[i].data()));
+                str_lens.push_back(array[i].size());
             }
             auto res = RustResultWrapper(
                 tantivy_index_add_array_keywords_by_single_segment_writer(
-                    writer_, views.data(), len));
+                    writer_, ptrs.data(), str_lens.data(), len));
             AssertInfo(res.result_->success,
                        "failed to add multi keywords: {}",
                        res.result_->error);
@@ -709,6 +734,7 @@ struct TantivyIndexWrapper {
                 } else {
                     // smaller integer should be converted first
                     std::vector<int64_t> buf(len);
+                    buf.reserve(len);
                     for (uintptr_t i = 0; i < len; ++i) {
                         buf[i] = static_cast<int64_t>(terms[i]);
                     }
@@ -726,6 +752,7 @@ struct TantivyIndexWrapper {
                         bitset);
                 } else {
                     std::vector<double> buf(len);
+                    buf.reserve(len);
                     for (uintptr_t i = 0; i < len; ++i) {
                         buf[i] = static_cast<double>(terms[i]);
                     }
@@ -736,6 +763,7 @@ struct TantivyIndexWrapper {
 
             if constexpr (std::is_same_v<T, std::string>) {
                 std::vector<const char*> views;
+                views.reserve(len);
                 for (uintptr_t i = 0; i < len; i++) {
                     views.push_back(terms[i].c_str());
                 }
@@ -928,8 +956,11 @@ struct TantivyIndexWrapper {
 
     void
     prefix_query(const std::string& prefix, void* bitset) {
-        auto array =
-            tantivy_prefix_query_keyword(reader_, prefix.c_str(), bitset);
+        auto array = tantivy_prefix_query_keyword(
+            reader_,
+            reinterpret_cast<const uint8_t*>(prefix.data()),
+            prefix.size(),
+            bitset);
         auto res = RustResultWrapper(array);
         AssertInfo(res.result_->success,
                    "TantivyIndexWrapper.prefix_query: {}",
@@ -940,7 +971,11 @@ struct TantivyIndexWrapper {
 
     void
     regex_query(const std::string& pattern, void* bitset) {
-        auto array = tantivy_regex_query(reader_, pattern.c_str(), bitset);
+        auto array = tantivy_regex_query(
+            reader_,
+            reinterpret_cast<const uint8_t*>(pattern.data()),
+            pattern.size(),
+            bitset);
         auto res = RustResultWrapper(array);
         AssertInfo(res.result_->success,
                    "TantivyIndexWrapper.regex_query: {}",
@@ -990,6 +1025,52 @@ struct TantivyIndexWrapper {
         AssertInfo(
             res.result_->value.tag == Value::Tag::None,
             "TantivyIndexWrapper.ngram_match_query: invalid result type");
+    }
+
+    // Tokenize literals into ngram terms and return them sorted by doc_freq (ascending).
+    // For Match type queries like `%xxx%yyy%`, literals = ["xxx", "yyy"].
+    // For InnerMatch type queries like `%xxx%`, literals = ["xxx"].
+    std::vector<std::string>
+    ngram_tokenize(const std::vector<std::string>& literals,
+                   uintptr_t min_gram,
+                   uintptr_t max_gram) {
+        std::vector<const char*> c_literals;
+        c_literals.reserve(literals.size());
+        for (const auto& lit : literals) {
+            c_literals.push_back(lit.c_str());
+        }
+
+        auto array = tantivy_ngram_tokenize(
+            reader_, c_literals.data(), c_literals.size(), min_gram, max_gram);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.ngram_tokenize: {}",
+                   res.result_->error);
+        AssertInfo(res.result_->value.tag == Value::Tag::RustStringArray,
+                   "TantivyIndexWrapper.ngram_tokenize: invalid result type");
+
+        // Convert RustStringArray to std::vector<std::string>
+        auto& rust_array = res.result_->value.rust_string_array._0;
+        std::vector<std::string> result;
+        result.reserve(rust_array.len);
+        for (size_t i = 0; i < rust_array.len; i++) {
+            result.emplace_back(rust_array.array[i]);
+        }
+        return result;
+    }
+
+    // Get the posting list for a single ngram term.
+    void
+    ngram_term_posting_list(const std::string& term, void* bitset) {
+        auto array =
+            tantivy_ngram_term_posting_list(reader_, term.c_str(), bitset);
+        auto res = RustResultWrapper(array);
+        AssertInfo(res.result_->success,
+                   "TantivyIndexWrapper.ngram_term_posting_list: {}",
+                   res.result_->error);
+        AssertInfo(
+            res.result_->value.tag == Value::Tag::None,
+            "TantivyIndexWrapper.ngram_term_posting_list: invalid result type");
     }
 
     // json query
@@ -1132,7 +1213,11 @@ struct TantivyIndexWrapper {
                      const std::string& pattern,
                      void* bitset) {
         auto array = tantivy_json_regex_query(
-            reader_, json_path.c_str(), pattern.c_str(), bitset);
+            reader_,
+            json_path.c_str(),
+            reinterpret_cast<const uint8_t*>(pattern.data()),
+            pattern.size(),
+            bitset);
         auto res = RustResultWrapper(array);
         AssertInfo(res.result_->success,
                    "TantivyIndexWrapper.json_regex_query: {}",
@@ -1146,7 +1231,11 @@ struct TantivyIndexWrapper {
                       const std::string& prefix,
                       void* bitset) {
         auto array = tantivy_json_prefix_query(
-            reader_, json_path.c_str(), prefix.c_str(), bitset);
+            reader_,
+            json_path.c_str(),
+            reinterpret_cast<const uint8_t*>(prefix.data()),
+            prefix.size(),
+            bitset);
         auto res = RustResultWrapper(array);
         AssertInfo(res.result_->success,
                    "TantivyIndexWrapper.json_prefix_query: {}",
@@ -1192,5 +1281,6 @@ struct TantivyIndexWrapper {
     IndexReader reader_ = nullptr;
     std::string path_;
     bool load_in_mmap_ = true;
+    std::string analyzer_extra_info_ = "";
 };
 }  // namespace milvus::tantivy

@@ -46,7 +46,7 @@ const (
 
 	HeaderAuthorize     = "authorization"
 	HeaderToken         = "token"
-	CredentialSeperator = ":"
+	CredentialSeparator = ":"
 	UserRoot            = "root"
 	PasswordHolder      = "___"
 	DefaultTenant       = ""
@@ -71,6 +71,8 @@ const (
 	RoleConfigObjectName = "object_name"
 	RoleConfigDBName     = "db_name"
 	RoleConfigPrivilege  = "privilege"
+
+	PreserveFieldIdsKey = "preserve_field_ids"
 )
 
 var (
@@ -109,6 +111,7 @@ var (
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeGetImportProgress.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeListImport.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeAddCollectionField.String()),
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeRefreshExternalCollection.String()),
 		},
 		commonpb.ObjectType_Global.String(): {
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeAll.String()),
@@ -160,6 +163,12 @@ var (
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeGroupCollectionReadWrite.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeGroupCollectionAdmin.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeUpdateReplicateConfiguration.String()),
+
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeCreateSnapshot.String()),
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeDropSnapshot.String()),
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeDescribeSnapshot.String()),
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeRestoreSnapshot.String()),
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeListSnapshots.String()),
 		},
 		commonpb.ObjectType_User.String(): {
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeUpdateUser.String()),
@@ -193,6 +202,8 @@ var (
 		commonpb.ObjectPrivilege_PrivilegeDescribeDatabase.String(),
 		commonpb.ObjectPrivilege_PrivilegeDescribeAlias.String(),
 		commonpb.ObjectPrivilege_PrivilegeGetStatistics.String(),
+		commonpb.ObjectPrivilege_PrivilegeDescribeSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeListSnapshots.String(),
 	}
 	ReadWritePrivilegeGroup = []string{
 		commonpb.ObjectPrivilege_PrivilegeQuery.String(),
@@ -226,6 +237,11 @@ var (
 		commonpb.ObjectPrivilege_PrivilegeRenameCollection.String(),
 		commonpb.ObjectPrivilege_PrivilegeCreateAlias.String(),
 		commonpb.ObjectPrivilege_PrivilegeDropAlias.String(),
+		commonpb.ObjectPrivilege_PrivilegeCreateSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeDropSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeDescribeSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeListSnapshots.String(),
+		commonpb.ObjectPrivilege_PrivilegeRefreshExternalCollection.String(),
 	}
 	AdminPrivilegeGroup = []string{
 		commonpb.ObjectPrivilege_PrivilegeCreateCollection.String(),
@@ -283,6 +299,12 @@ var (
 		commonpb.ObjectPrivilege_PrivilegeAlterDatabase.String(),
 		commonpb.ObjectPrivilege_PrivilegeFlush.String(),
 		commonpb.ObjectPrivilege_PrivilegeUpdateReplicateConfiguration.String(),
+		commonpb.ObjectPrivilege_PrivilegeCreateSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeDropSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeDescribeSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeListSnapshots.String(),
+		commonpb.ObjectPrivilege_PrivilegeRestoreSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeRefreshExternalCollection.String(),
 	}
 )
 
@@ -321,6 +343,7 @@ var (
 			commonpb.ObjectPrivilege_PrivilegeCreatePartition.String(),
 			commonpb.ObjectPrivilege_PrivilegeDropPartition.String(),
 			commonpb.ObjectPrivilege_PrivilegeAddCollectionField.String(),
+			commonpb.ObjectPrivilege_PrivilegeRefreshExternalCollection.String(),
 		})...,
 	)
 
@@ -356,6 +379,8 @@ var (
 		commonpb.ObjectPrivilege_PrivilegeDescribeResourceGroup.String(),
 		commonpb.ObjectPrivilege_PrivilegeListResourceGroups.String(),
 		commonpb.ObjectPrivilege_PrivilegeListPrivilegeGroups.String(),
+		commonpb.ObjectPrivilege_PrivilegeGetReplicateConfiguration.String(),
+		commonpb.ObjectPrivilege_PrivilegeListFileResources.String(),
 	})
 
 	ClusterReadWritePrivileges = append(ClusterReadOnlyPrivileges,
@@ -364,6 +389,8 @@ var (
 			commonpb.ObjectPrivilege_PrivilegeTransferNode.String(),
 			commonpb.ObjectPrivilege_PrivilegeTransferReplica.String(),
 			commonpb.ObjectPrivilege_PrivilegeUpdateResourceGroups.String(),
+			commonpb.ObjectPrivilege_PrivilegeAddFileResource.String(),
+			commonpb.ObjectPrivilege_PrivilegeRemoveFileResource.String(),
 		})...,
 	)
 

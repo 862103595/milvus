@@ -168,11 +168,10 @@ func (r *replicateStreamClient) Replicate(msg message.ImmutableMessage) error {
 	case <-r.ctx.Done():
 		return nil
 	default:
-		// TODO: Should be done at streamingnode, but after move it into streamingnode, the metric need to be adjusted.
 		if msg.MessageType().IsSelfControlled() {
+			// If no messages are being replicated, update the last replicated time tick.
 			if r.pendingMessages.Len() == 0 {
-				// if there is no pending messages, there's no lag between source and target.
-				r.metrics.OnNoIncomingMessages()
+				r.metrics.UpdateLastReplicatedTimeTick(msg.TimeTick())
 			}
 			return ErrReplicateIgnored
 		}
@@ -321,6 +320,14 @@ func (r *replicateStreamClient) recvLoop(ctx context.Context) (err error) {
 func (r *replicateStreamClient) handleAlterReplicateConfigMessage(msg message.ImmutableMessage) (replicationRemoved bool) {
 	logger := log.With(zap.String("key", r.channel.Key), zap.Int64("revision", r.channel.ModRevision))
 	logger.Info("handle AlterReplicateConfigMessage", log.FieldMessage(msg))
+
+	// Check ignore field - if true, skip processing
+	// This is used for incomplete switchover messages that should be ignored after force promote
+	alterMsg := message.MustAsImmutableAlterReplicateConfigMessageV2(msg)
+	if alterMsg.Header().Ignore {
+		logger.Info("AlterReplicateConfig message has ignore flag set, skipping processing")
+		return false
+	}
 
 	replicationRemoved = util.IsReplicationRemovedByAlterReplicateConfigMessage(msg, r.channel.Value)
 	if replicationRemoved {

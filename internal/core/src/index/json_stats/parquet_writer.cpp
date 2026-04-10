@@ -15,13 +15,13 @@
 // limitations under the License.
 
 #include "index/json_stats/parquet_writer.h"
-#include <arrow/array/array_binary.h>
-#include <arrow/array/array_primitive.h>
+
 #include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_primitive.h>
-#include <arrow/io/file.h>
-#include <parquet/arrow/writer.h>
-#include <parquet/exception.h>
+#include <exception>
+
+#include "arrow/array/builder_base.h"
+#include "milvus-storage/packed/writer.h"
 
 namespace milvus::index {
 
@@ -81,12 +81,13 @@ JsonStatsParquetWriter::WriteCurrentBatch() {
     }
 
     std::vector<std::shared_ptr<arrow::Array>> arrays;
+    arrays.reserve(builders_.size());
     for (auto& builder : builders_) {
         std::shared_ptr<arrow::Array> array;
         auto status = builder->Finish(&array);
         AssertInfo(
             status.ok(), "failed to finish builder: {}", status.ToString());
-        arrays.push_back(array);
+        arrays.push_back(std::move(array));
         builder->Reset();
     }
 
@@ -108,18 +109,21 @@ JsonStatsParquetWriter::Init(const ParquetWriteContext& context) {
     schema_ = context.schema;
     builders_ = context.builders;
     builders_map_ = context.builders_map;
-    kv_metadata_ = std::move(context.kv_metadata);
+    kv_metadata_ = context.kv_metadata;
     column_groups_ = context.column_groups;
     file_paths_ = context.file_paths;
-    packed_writer_ = std::make_unique<milvus_storage::PackedRecordBatchWriter>(
-        fs_,
-        file_paths_,
-        schema_,
-        storage_config_,
-        column_groups_,
-        buffer_size_);
+    auto result = milvus_storage::PackedRecordBatchWriter::Make(fs_,
+                                                                file_paths_,
+                                                                schema_,
+                                                                storage_config_,
+                                                                column_groups_,
+                                                                buffer_size_);
+    AssertInfo(result.ok(),
+               "[StorageV2] Failed to create packed writer: " +
+                   result.status().ToString());
+    packed_writer_ = result.ValueOrDie();
     for (const auto& [key, value] : kv_metadata_) {
-        packed_writer_->AddUserMetadata(key, value);
+        (void)packed_writer_->AddUserMetadata(key, value);
     }
 }
 
@@ -157,7 +161,7 @@ JsonStatsParquetWriter::AppendValue(const std::string& key,
             ErrorCode::UnexpectedError, "builder for key {} not found", key);
     }
 
-    auto builder = it->second;
+    auto& builder = it->second;
     auto ast = AppendDataToBuilder(value, builder);
     AssertInfo(ast.ok(), "failed to append data to builder");
 }
@@ -173,7 +177,7 @@ JsonStatsParquetWriter::AppendRow(
                       key);
         }
 
-        auto builder = it->second;
+        auto& builder = it->second;
         auto status = AppendDataToBuilder(value, builder);
         AssertInfo(status.ok(), "failed to append data to builder");
     }

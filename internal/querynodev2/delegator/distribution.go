@@ -23,11 +23,13 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/internal/querynodev2/pkoracle"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -94,9 +96,7 @@ func (q *channelQueryView) Serviceable() bool {
 	// Note: after we support channel level target(data view), we can remove this flag
 	viewReady := q.syncedByCoord
 
-	// if partial result is enabled, we can skip the viewReady check
-	enablePartialResult := paramtable.Get().QueryNodeCfg.PartialResultRequiredDataRatio.GetAsFloat() < 1.0
-	return dataReady && (viewReady || enablePartialResult)
+	return dataReady && viewReady
 }
 
 func (q *channelQueryView) GetLoadedRatio() float64 {
@@ -136,6 +136,12 @@ type SegmentEntry struct {
 	TargetVersion int64
 	Level         datapb.SegmentLevel
 	Offline       bool // if delegator failed to execute forwardDelete/Query/Search on segment, it will be offline
+
+	// Candidate for PK existence check (BF query)
+	// - For sealed segments: *pkoracle.BloomFilterSet
+	// - For growing segments: segments.Segment (LocalSegment)
+	// Note: nil for offline segments or L0 segments
+	Candidate pkoracle.Candidate
 }
 
 func NewDistribution(channelName string, queryView *channelQueryView) *distribution {
@@ -193,8 +199,8 @@ func (d *distribution) PinReadableSegments(requiredLoadRatio float64, partitions
 	sealed, growing = current.Get(partitions...)
 	version = current.version
 	sealedRowCount = d.queryView.sealedSegmentRowCount
-	if d.queryView.GetLoadedRatio() == 1.0 {
-		// if query view is fully loaded, we can use current target version to filter segments
+	if d.queryView.Serviceable() {
+		// if query view is serviceable, we can use current target version to filter segments
 		targetVersion := current.GetTargetVersion()
 		filterReadable := d.readableFilter(targetVersion)
 		sealed, growing = d.filterSegments(sealed, growing, filterReadable)
@@ -330,7 +336,7 @@ func (d *distribution) updateServiceable(triggerAction string) {
 // AddDistributions add multiple segment entries.
 func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 	d.mut.Lock()
-	defer d.mut.Unlock()
+	var toRefund []pkoracle.Candidate
 
 	for _, entry := range entries {
 		oldEntry, ok := d.sealedSegments[entry.SegmentID]
@@ -342,12 +348,20 @@ func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 				zap.Int64("newVersion", entry.Version),
 				zap.Int64("newNode", entry.NodeID),
 			)
+			// if new entry has candidate but we skip it, refund the new candidate
+			if entry.Candidate != nil {
+				toRefund = append(toRefund, entry.Candidate)
+			}
 			continue
 		}
 
 		if ok {
 			// remain the target version for already loaded segment to void skipping this segment when executing search
 			entry.TargetVersion = oldEntry.TargetVersion
+			// if old entry has candidate and we're replacing it, refund old candidate
+			if oldEntry.Candidate != nil {
+				toRefund = append(toRefund, oldEntry.Candidate)
+			}
 		} else {
 			entry.TargetVersion = unreadableTargetVersion
 		}
@@ -356,6 +370,17 @@ func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 
 	d.genSnapshot()
 	d.updateServiceable("AddDistributions")
+	d.mut.Unlock()
+
+	// refund old candidates after releasing lock (synchronous to avoid use-after-free)
+	refundCandidates(toRefund)
+}
+
+// refundCandidates refunds resources for removed candidates.
+func refundCandidates(candidates []pkoracle.Candidate) {
+	for _, c := range candidates {
+		c.Refund()
+	}
 }
 
 // AddGrowing adds growing segment distribution.
@@ -483,7 +508,7 @@ func (d *distribution) GetQueryView() *channelQueryView {
 // RemoveDistributions remove segments distributions and returns the clear signal channel.
 func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growingSegments []SegmentEntry) chan struct{} {
 	d.mut.Lock()
-	defer d.mut.Unlock()
+	var toRefund []pkoracle.Candidate
 
 	for _, sealed := range sealedSegments {
 		entry, ok := d.sealedSegments[sealed.SegmentID]
@@ -491,6 +516,10 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 			continue
 		}
 		if entry.NodeID == sealed.NodeID || sealed.NodeID == wildcardNodeID {
+			// collect candidate before deletion
+			if entry.Candidate != nil {
+				toRefund = append(toRefund, entry.Candidate)
+			}
 			delete(d.sealedSegments, sealed.SegmentID)
 		}
 	}
@@ -500,7 +529,9 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 		if !ok {
 			continue
 		}
-
+		// Note: growing segment's Candidate (LocalSegment) is NOT refunded here
+		// because the segment lifecycle is managed by segmentManager
+		// The BF inside LocalSegment will be cleaned when segment.Release() is called
 		delete(d.growingSegments, growing.SegmentID)
 	}
 
@@ -508,12 +539,19 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 		zap.String("channelName", d.channelName),
 		zap.Int64s("growing", lo.Map(growingSegments, func(s SegmentEntry, _ int) int64 { return s.SegmentID })),
 		zap.Int64s("sealed", lo.Map(sealedSegments, func(s SegmentEntry, _ int) int64 { return s.SegmentID })),
+		zap.Int("sealedCandidatesRefunded", len(toRefund)),
 	)
 
 	d.updateServiceable("RemoveDistributions")
 	// wait previous read even not distribution changed
 	// in case of segment balance caused segment lost track
-	return d.genSnapshot()
+	signal := d.genSnapshot()
+	d.mut.Unlock()
+
+	// refund sealed segment candidates after releasing lock (synchronous to avoid use-after-free)
+	refundCandidates(toRefund)
+
+	return signal
 }
 
 // getSnapshot converts current distribution to snapshot format.
@@ -584,4 +622,94 @@ func (d *distribution) getCleanup(version int64) snapshotCleanup {
 	return func() {
 		d.snapshots.GetAndRemove(version)
 	}
+}
+
+// SealedSegmentExists checks if a sealed segment exists in distribution.
+func (d *distribution) SealedSegmentExists(segmentID int64) bool {
+	d.mut.RLock()
+	defer d.mut.RUnlock()
+	_, ok := d.sealedSegments[segmentID]
+	return ok
+}
+
+// SealedSegmentExistsOnNode checks if a sealed segment exists on a specific node.
+func (d *distribution) SealedSegmentExistsOnNode(segmentID int64, nodeID int64) bool {
+	d.mut.RLock()
+	defer d.mut.RUnlock()
+	entry, ok := d.sealedSegments[segmentID]
+	return ok && entry.NodeID == nodeID
+}
+
+// GrowingSegmentExists checks if a growing segment exists in distribution.
+func (d *distribution) GrowingSegmentExists(segmentID int64) bool {
+	d.mut.RLock()
+	defer d.mut.RUnlock()
+	_, ok := d.growingSegments[segmentID]
+	return ok
+}
+
+// BatchGetFromSegments performs batch PK existence check on the provided pinned segments.
+// This ensures consistency between BF check and delete application by using the same
+// segment snapshot. This function operates on explicitly provided segments rather than
+// live distribution data, preventing race conditions where new segments could be added
+// between PinOnlineSegments and this call.
+//
+// Parameters:
+//   - pks: Primary keys to check
+//   - partitionID: Partition filter (use common.AllPartitionsID for all)
+//   - sealed: Pinned sealed segments from PinOnlineSegments()
+//   - growing: Pinned growing segments from PinOnlineSegments()
+//
+// Returns:
+//   - map[segmentID][]bool: For each segment, a bool slice indicating PK existence
+func BatchGetFromSegments(pks []storage.PrimaryKey, partitionID int64, sealed []SnapshotItem, growing []SegmentEntry) map[int64][]bool {
+	result := make(map[int64][]bool)
+	lc := storage.NewBatchLocationsCache(pks)
+
+	// Check sealed segments from pinned snapshot
+	for _, item := range sealed {
+		for _, entry := range item.Segments {
+			if entry.Offline || entry.Candidate == nil {
+				continue
+			}
+			if partitionID != common.AllPartitionsID && entry.Candidate.Partition() != partitionID {
+				continue
+			}
+			result[entry.SegmentID] = entry.Candidate.BatchPkExist(lc)
+		}
+	}
+
+	// Check growing segments from pinned snapshot
+	for _, entry := range growing {
+		if entry.Candidate == nil {
+			continue
+		}
+		if partitionID != common.AllPartitionsID && entry.Candidate.Partition() != partitionID {
+			continue
+		}
+		result[entry.SegmentID] = entry.Candidate.BatchPkExist(lc)
+	}
+
+	return result
+}
+
+// RefundAllCandidates refunds resources for all sealed segment candidates.
+// Used during shutdown to clean up and refund resources.
+// Note: Growing segment candidates (LocalSegment) are managed by segmentManager.
+func (d *distribution) RefundAllCandidates() {
+	d.mut.Lock()
+	var toRefund []pkoracle.Candidate
+
+	// Only refund sealed segment candidates
+	// Growing segment candidates (LocalSegment) are managed by segmentManager
+	for segmentID, entry := range d.sealedSegments {
+		if entry.Candidate != nil {
+			toRefund = append(toRefund, entry.Candidate)
+			entry.Candidate = nil
+			d.sealedSegments[segmentID] = entry
+		}
+	}
+	d.mut.Unlock()
+
+	refundCandidates(toRefund)
 }

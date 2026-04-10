@@ -70,11 +70,17 @@ constexpr const char* INDEX_VERSION = "index_version";
 constexpr const char* INDEX_ENGINE_VERSION = "index_engine_version";
 constexpr const char* BITMAP_INDEX_CARDINALITY_LIMIT =
     "bitmap_cardinality_limit";
+constexpr const char* HYBRID_LOW_CARDINALITY_INDEX_TYPE =
+    "hybrid_low_cardinality_index_type";
+constexpr const char* HYBRID_HIGH_CARDINALITY_INDEX_TYPE =
+    "hybrid_high_cardinality_index_type";
 
 // index config key
 constexpr const char* MMAP_FILE_PATH = "mmap_filepath";
 constexpr const char* ENABLE_MMAP = "enable_mmap";
+constexpr const char* WARMUP = "warmup";
 constexpr const char* INDEX_FILES = "index_files";
+constexpr const char* INDEX_SIZE = "index_size";
 constexpr const char* ENABLE_OFFSET_CACHE = "indexoffsetcache.enabled";
 
 // VecIndex file metas
@@ -83,6 +89,7 @@ constexpr const char* DISK_ANN_RAW_DATA_PATH = "data_path";
 constexpr const char* EMB_LIST_META_PATH = "emb_list_meta_file_path";
 constexpr const char* EMB_LIST_META_FILE_NAME = "emb_list_meta";
 constexpr const char* EMB_LIST_OFFSETS_PATH = "emb_list_offset_file_path";
+constexpr const char* VALID_DATA_PATH_KEY = "valid_data_file_path";
 
 // VecIndex node filtering
 constexpr const char* VEC_OPT_FIELDS_PATH = "opt_fields_path";
@@ -105,4 +112,8 @@ constexpr const char* DISK_ANN_PREPARE_USE_BFS_CACHE = "use_bfs_cache";
 // DiskAnn query params
 constexpr const char* DISK_ANN_QUERY_LIST = "search_list";
 constexpr const char* DISK_ANN_QUERY_BEAMWIDTH = "beamwidth";
+// UT-only flag: when true, index Upload()/Load() route to V3 paths.
+// In production, V2/V3 routing is handled by callers (ScalarIndexCreator, SealedIndexTranslator).
+// Delete this along with V2 Upload/Load code when V2 compatibility is dropped.
+extern bool kScalarIndexUseV3;
 }  // namespace milvus::index

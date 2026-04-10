@@ -9,22 +9,54 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <folly/FBVector.h>
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
+#include "common/IndexMeta.h"
+#include "common/QueryResult.h"
+#include "common/Schema.h"
+#include "common/TypeTraits.h"
+#include "common/Types.h"
 #include "common/Utils.h"
+#include "common/VectorTrait.h"
+#include "common/protobuf_utils.h"
+#include "filemanager/InputStream.h"
+#include "gtest/gtest.h"
+#include "index/IndexInfo.h"
+#include "index/VectorMemIndex.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
+#include "knowhere/expected.h"
+#include "knowhere/object.h"
+#include "knowhere/operands.h"
+#include "knowhere/sparse_utils.h"
+#include "knowhere/version.h"
+#include "pb/common.pb.h"
 #include "pb/plan.pb.h"
 #include "pb/schema.pb.h"
 #include "query/Plan.h"
 #include "segcore/ConcurrentVector.h"
+#include "segcore/InsertRecord.h"
+#include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentGrowing.h"
 #include "segcore/SegmentGrowingImpl.h"
+#include "storage/FileManager.h"
 #include "test_utils/DataGen.h"
-#include "index/IndexFactory.h"
 #include "test_utils/indexbuilder_test_utils.h"
 
 using namespace milvus;
 using namespace milvus::segcore;
-namespace pb = milvus::proto;
 
 using Param = std::tuple<DataType,
                          /*index type*/ std::string,
@@ -159,7 +191,7 @@ TEST_P(GrowingIndexTest, Correctness) {
     auto dim = 4;
     auto schema = std::make_shared<Schema>();
     auto pk = schema->AddDebugField("pk", DataType::INT64);
-    auto random = schema->AddDebugField("random", DataType::DOUBLE);
+    schema->AddDebugField("random", DataType::DOUBLE);
     auto vec = schema->AddDebugField("embeddings", data_type, dim, metric_type);
     schema->set_primary_field_id(pk);
 
@@ -280,11 +312,10 @@ TEST_P(GrowingIndexTest, Correctness) {
         auto inserted = (i + 1) * per_batch;
         // once index built, chunk data will be removed.
         // growing index will only be built when num rows reached
-        // get_build_threshold(). This value for sparse is 0, thus sparse index
-        // will be built since the first chunk. Dense segment buffers the first
+        // get_build_threshold(). Both sparse and dense segment buffer the first
         // 2 chunks before building an index in this test case.
 
-        if ((!is_sparse && i < 2) || !intermin_index_with_raw_data) {
+        if (i < 2 || !intermin_index_with_raw_data) {
             EXPECT_EQ(field_data->num_chunk(),
                       upper_div(inserted, field_data->get_size_per_chunk()));
         } else {
@@ -339,7 +370,6 @@ TEST_P(GrowingIndexTest, Correctness) {
 
 TEST_P(GrowingIndexTest, AddWithoutBuildPool) {
     constexpr int N = 1024;
-    constexpr int TOPK = 100;
     constexpr int dim = 4;
     constexpr int add_cont = 5;
 
@@ -352,7 +382,7 @@ TEST_P(GrowingIndexTest, AddWithoutBuildPool) {
 
     auto schema = std::make_shared<Schema>();
     auto pk = schema->AddDebugField("pk", DataType::INT64);
-    auto random = schema->AddDebugField("random", DataType::DOUBLE);
+    schema->AddDebugField("random", DataType::DOUBLE);
     auto vec = schema->AddDebugField("embeddings", data_type, dim, metric_type);
     schema->set_primary_field_id(pk);
 
@@ -411,10 +441,17 @@ TEST_P(GrowingIndexTest, AddWithoutBuildPool) {
         }
         EXPECT_EQ(index->Count(), (add_cont + 1) * N);
     } else if (is_sparse) {
+        // Use the CC (concurrent) variant of sparse index types, since
+        // non-CC sparse indices do not support incremental Add() after
+        // the initial Build().
+        auto cc_index_type =
+            (index_type == knowhere::IndexEnum::INDEX_SPARSE_WAND)
+                ? knowhere::IndexEnum::INDEX_SPARSE_WAND_CC
+                : knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX_CC;
         auto index =
             std::make_unique<milvus::index::VectorMemIndex<sparse_u32_f32>>(
                 DataType::NONE,
-                index_type,
+                cc_index_type,
                 metric_type,
                 knowhere::Version::GetCurrentVersion().VersionNumber(),
                 false,
@@ -439,8 +476,8 @@ TEST_P(GrowingIndexTest, MissIndexMeta) {
     auto dim = 4;
     auto schema = std::make_shared<Schema>();
     auto pk = schema->AddDebugField("pk", DataType::INT64);
-    auto random = schema->AddDebugField("random", DataType::DOUBLE);
-    auto vec = schema->AddDebugField("embeddings", data_type, dim, metric_type);
+    schema->AddDebugField("random", DataType::DOUBLE);
+    schema->AddDebugField("embeddings", data_type, dim, metric_type);
     schema->set_primary_field_id(pk);
 
     auto& config = SegcoreConfig::default_config();
@@ -453,7 +490,7 @@ TEST_P(GrowingIndexTest, GetVector) {
     auto dim = 4;
     auto schema = std::make_shared<Schema>();
     auto pk = schema->AddDebugField("pk", DataType::INT64);
-    auto random = schema->AddDebugField("random", DataType::DOUBLE);
+    schema->AddDebugField("random", DataType::DOUBLE);
     auto vec = schema->AddDebugField("embeddings", data_type, dim, metric_type);
     schema->set_primary_field_id(pk);
 

@@ -25,6 +25,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
@@ -60,11 +61,19 @@ func (n *noopReplicateService) Append(ctx context.Context, msg message.Replicate
 	return nil, nil
 }
 
-func (n *noopReplicateService) UpdateReplicateConfiguration(ctx context.Context, config *commonpb.ReplicateConfiguration) error {
+func (n *noopReplicateService) UpdateReplicateConfiguration(ctx context.Context, req *milvuspb.UpdateReplicateConfigurationRequest) error {
 	return nil
 }
 
+func (n *noopReplicateService) GetReplicateConfiguration(ctx context.Context) (*commonpb.ReplicateConfiguration, error) {
+	return nil, nil
+}
+
 func (n *noopReplicateService) GetReplicateCheckpoint(ctx context.Context, channelName string) (*wal.ReplicateCheckpoint, error) {
+	return nil, nil
+}
+
+func (n *noopReplicateService) GetSalvageCheckpoint(ctx context.Context, channelName string) ([]*wal.ReplicateCheckpoint, error) {
 	return nil, nil
 }
 
@@ -179,13 +188,6 @@ func (n *noopWALAccesser) Local() Local {
 	return &noopLocal{}
 }
 
-func (n *noopWALAccesser) Txn(ctx context.Context, opts TxnOption) (Txn, error) {
-	if err := getExpectErr(); err != nil {
-		return nil, err
-	}
-	return &noopTxn{}, nil
-}
-
 func (n *noopWALAccesser) RawAppend(ctx context.Context, msgs message.MutableMessage, opts ...AppendOption) (*types.AppendResult, error) {
 	if err := getExpectErr(); err != nil {
 		return nil, err
@@ -222,10 +224,6 @@ func (n *noopWALAccesser) AppendMessages(ctx context.Context, msgs ...message.Mu
 	return AppendResponses{}
 }
 
-func (n *noopWALAccesser) AppendMessagesWithOption(ctx context.Context, opts AppendOption, msgs ...message.MutableMessage) AppendResponses {
-	return AppendResponses{}
-}
-
 func (n *noopWALAccesser) GetReplicateConfiguration(ctx context.Context) (*commonpb.ReplicateConfiguration, error) {
 	return nil, nil
 }
@@ -234,8 +232,18 @@ func (n *noopWALAccesser) GetReplicateCheckpoint(ctx context.Context, channelNam
 	return nil, nil
 }
 
-func (n *noopWALAccesser) UpdateReplicateConfiguration(ctx context.Context, config *commonpb.ReplicateConfiguration) error {
+func (n *noopWALAccesser) UpdateReplicateConfiguration(ctx context.Context, req *milvuspb.UpdateReplicateConfigurationRequest) error {
 	return nil
+}
+
+func (n *noopWALAccesser) ForwardService() ForwardService {
+	return &noopForwardService{}
+}
+
+type noopForwardService struct{}
+
+func (n *noopForwardService) ForwardLegacyProxy(ctx context.Context, request any, opts ...ForwardOption) (any, error) {
+	return nil, ErrForwardDisabled
 }
 
 type noopScanner struct{}

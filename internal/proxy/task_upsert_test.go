@@ -17,10 +17,10 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/bytedance/mockey"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
@@ -341,40 +341,6 @@ func TestUpsertTask(t *testing.T) {
 	})
 }
 
-func TestUpsertTaskForReplicate(t *testing.T) {
-	cache := globalMetaCache
-	defer func() { globalMetaCache = cache }()
-	mockCache := NewMockCache(t)
-	globalMetaCache = mockCache
-	ctx := context.Background()
-
-	t.Run("fail to get collection info", func(t *testing.T) {
-		ut := upsertTask{
-			ctx: ctx,
-			req: &milvuspb.UpsertRequest{
-				CollectionName: "col-0",
-			},
-		}
-		mockCache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("foo")).Once()
-		err := ut.PreExecute(ctx)
-		assert.Error(t, err)
-	})
-
-	t.Run("replicate mode", func(t *testing.T) {
-		ut := upsertTask{
-			ctx: ctx,
-			req: &milvuspb.UpsertRequest{
-				CollectionName: "col-0",
-			},
-		}
-		mockCache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&collectionInfo{
-			replicateID: "local-mac",
-		}, nil).Once()
-		err := ut.PreExecute(ctx)
-		assert.Error(t, err)
-	})
-}
-
 func TestUpsertTask_Function(t *testing.T) {
 	paramtable.Init()
 	paramtable.Get().CredentialCfg.Credential.GetFunc = func() map[string]string {
@@ -537,8 +503,13 @@ func TestUpsertTaskForSchemaMismatch(t *testing.T) {
 		mockCache.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
 		mockCache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&collectionInfo{
 			updateTimestamp: 100,
+			schema: newSchemaInfo(&schemapb.CollectionSchema{
+				Name: "col-0",
+				Fields: []*schemapb.FieldSchema{
+					{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+				},
+			}),
 		}, nil)
-		mockCache.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{dbID: 0}, nil)
 		err := ut.PreExecute(ctx)
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, merr.ErrCollectionSchemaMismatch)
@@ -846,18 +817,41 @@ func TestUpdateTask_queryPreExecute_Success(t *testing.T) {
 							FieldName: "id",
 							FieldId:   100,
 							Type:      schemapb.DataType_Int64,
+							Field: &schemapb.FieldData_Scalars{
+								Scalars: &schemapb.ScalarField{
+									Data: &schemapb.ScalarField_LongData{
+										LongData: &schemapb.LongArray{Data: []int64{1, 2, 3}},
+									},
+								},
+							},
 						},
 						{
 							FieldName: "name",
 							FieldId:   102,
 							Type:      schemapb.DataType_VarChar,
+							Field: &schemapb.FieldData_Scalars{
+								Scalars: &schemapb.ScalarField{
+									Data: &schemapb.ScalarField_StringData{
+										StringData: &schemapb.StringArray{Data: []string{"test1", "test2", "test3"}},
+									},
+								},
+							},
 						},
 						{
 							FieldName: "vector",
 							FieldId:   101,
 							Type:      schemapb.DataType_FloatVector,
+							Field: &schemapb.FieldData_Vectors{
+								Vectors: &schemapb.VectorField{
+									Dim: 128,
+									Data: &schemapb.VectorField_FloatVector{
+										FloatVector: &schemapb.FloatArray{Data: make([]float32, 384)}, // 3 * 128
+									},
+								},
+							},
 						},
 					},
+					NumRows: 3,
 				},
 			},
 		}
@@ -943,15 +937,15 @@ func TestUpdateTask_PreExecute_Success(t *testing.T) {
 		// Setup mocks
 		globalMetaCache = &MetaCache{}
 
-		mockey.Mock(GetReplicateID).Return("", nil).Build()
-
 		mockey.Mock((*MetaCache).GetCollectionID).Return(int64(1001), nil).Build()
 
+		schema := createTestSchema()
 		mockey.Mock((*MetaCache).GetCollectionInfo).Return(&collectionInfo{
 			updateTimestamp: 12345,
+			schema:          schema,
 		}, nil).Build()
 
-		mockey.Mock((*MetaCache).GetCollectionSchema).Return(createTestSchema(), nil).Build()
+		mockey.Mock((*MetaCache).GetCollectionSchema).Return(schema, nil).Build()
 
 		mockey.Mock(isPartitionKeyMode).Return(false, nil).Build()
 
@@ -980,26 +974,9 @@ func TestUpdateTask_PreExecute_Success(t *testing.T) {
 	})
 }
 
-func TestUpdateTask_PreExecute_ReplicateIDError(t *testing.T) {
-	mockey.PatchConvey("TestUpdateTask_PreExecute_ReplicateIDError", t, func() {
-		globalMetaCache = &MetaCache{}
-
-		mockey.Mock(GetReplicateID).Return("replica1", nil).Build()
-
-		task := createTestUpdateTask()
-
-		err := task.PreExecute(context.Background())
-
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "can't operate on the collection under standby mode")
-	})
-}
-
 func TestUpdateTask_PreExecute_GetCollectionIDError(t *testing.T) {
 	mockey.PatchConvey("TestUpdateTask_PreExecute_GetCollectionIDError", t, func() {
 		globalMetaCache = &MetaCache{}
-
-		mockey.Mock(GetReplicateID).Return("", nil).Build()
 
 		expectedErr := merr.WrapErrCollectionNotFound("test_collection")
 		mockey.Mock((*MetaCache).GetCollectionID).Return(int64(0), expectedErr).Build()
@@ -1016,12 +993,13 @@ func TestUpdateTask_PreExecute_PartitionKeyModeError(t *testing.T) {
 	mockey.PatchConvey("TestUpdateTask_PreExecute_PartitionKeyModeError", t, func() {
 		globalMetaCache = &MetaCache{}
 
-		mockey.Mock(GetReplicateID).Return("", nil).Build()
+		schema := createTestSchema()
 		mockey.Mock((*MetaCache).GetCollectionID).Return(int64(1001), nil).Build()
 		mockey.Mock((*MetaCache).GetCollectionInfo).Return(&collectionInfo{
 			updateTimestamp: 12345,
+			schema:          schema,
 		}, nil).Build()
-		mockey.Mock((*MetaCache).GetCollectionSchema).Return(createTestSchema(), nil).Build()
+		mockey.Mock((*MetaCache).GetCollectionSchema).Return(schema, nil).Build()
 
 		mockey.Mock(isPartitionKeyMode).Return(true, nil).Build()
 
@@ -1039,18 +1017,20 @@ func TestUpdateTask_PreExecute_InvalidNumRows(t *testing.T) {
 	mockey.PatchConvey("TestUpdateTask_PreExecute_InvalidNumRows", t, func() {
 		globalMetaCache = &MetaCache{}
 
-		mockey.Mock(GetReplicateID).Return("", nil).Build()
+		schema := createTestSchema()
 		mockey.Mock((*MetaCache).GetCollectionID).Return(int64(1001), nil).Build()
 		mockey.Mock((*MetaCache).GetCollectionInfo).Return(&collectionInfo{
 			updateTimestamp: 12345,
+			schema:          schema,
 		}, nil).Build()
-		mockey.Mock((*MetaCache).GetCollectionSchema).Return(createTestSchema(), nil).Build()
+		mockey.Mock((*MetaCache).GetCollectionSchema).Return(schema, nil).Build()
 		mockey.Mock(isPartitionKeyMode).Return(false, nil).Build()
 		mockey.Mock((*MetaCache).GetPartitionInfo).Return(&partitionInfo{
 			name: "_default",
 		}, nil).Build()
 
 		task := createTestUpdateTask()
+		task.req.FieldsData = []*schemapb.FieldData{}
 		task.req.NumRows = 0 // Invalid num_rows
 
 		err := task.PreExecute(context.Background())
@@ -1064,12 +1044,13 @@ func TestUpdateTask_PreExecute_QueryPreExecuteError(t *testing.T) {
 	mockey.PatchConvey("TestUpdateTask_PreExecute_QueryPreExecuteError", t, func() {
 		globalMetaCache = &MetaCache{}
 
-		mockey.Mock(GetReplicateID).Return("", nil).Build()
+		schema := createTestSchema()
 		mockey.Mock((*MetaCache).GetCollectionID).Return(int64(1001), nil).Build()
 		mockey.Mock((*MetaCache).GetCollectionInfo).Return(&collectionInfo{
 			updateTimestamp: 12345,
+			schema:          schema,
 		}, nil).Build()
-		mockey.Mock((*MetaCache).GetCollectionSchema).Return(createTestSchema(), nil).Build()
+		mockey.Mock((*MetaCache).GetCollectionSchema).Return(schema, nil).Build()
 		mockey.Mock(isPartitionKeyMode).Return(false, nil).Build()
 		mockey.Mock((*MetaCache).GetPartitionInfo).Return(&partitionInfo{
 			name: "_default",
@@ -1358,6 +1339,376 @@ func TestUpsertTask_queryPreExecute_PureUpdate(t *testing.T) {
 	assert.Equal(t, []int32{600, 700}, valueField.GetScalars().GetIntData().GetData())
 }
 
+func TestCheckDynamicFieldDataForPartialUpdate(t *testing.T) {
+	t.Run("preserves $meta keys matching static field names after schema evolution", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "dfA", DataType: schemapb.DataType_Int64},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		// $meta contains {"dfA": 111, "dfB": "keep_me", "dfC": 999}
+		// All keys must be preserved — including "dfA" which matches a static field name.
+		metaJSON, _ := json.Marshal(map[string]interface{}{"dfA": 111, "dfB": "keep_me", "dfC": 999})
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{metaJSON}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.NoError(t, err)
+
+		jsonData := insertMsg.FieldsData[0].GetScalars().GetJsonData().GetData()
+		assert.Len(t, jsonData, 1)
+
+		var m map[string]interface{}
+		err = json.Unmarshal(jsonData[0], &m)
+		assert.NoError(t, err)
+		assert.Contains(t, m, "dfA", "key matching static field name must be preserved")
+		assert.Contains(t, m, "dfB", "non-conflicting key must be preserved")
+		assert.Equal(t, "keep_me", m["dfB"])
+		assert.Contains(t, m, "dfC", "non-conflicting key must be preserved")
+	})
+
+	t.Run("rejects $meta key in dynamic field", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		metaJSON := []byte(`{"$meta": "bad_value"}`)
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{metaJSON}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "$meta")
+	})
+
+	t.Run("rejects malformed JSON", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{[]byte(`{invalid json`)}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.Error(t, err)
+	})
+
+	t.Run("rejects dynamic field when dynamic schema is disabled", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: false,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			},
+		}
+
+		metaJSON := []byte(`{"key": "value"}`)
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{metaJSON}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "without dynamic schema enabled")
+	})
+
+	t.Run("auto-generates empty dynamic field when none present", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			},
+		}
+
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				NumRows: 2,
+				Version: msgpb.InsertDataVersion_ColumnBased,
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{
+							LongData: &schemapb.LongArray{Data: []int64{1, 2}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.NoError(t, err)
+		// Should have appended a dynamic field
+		assert.Len(t, insertMsg.FieldsData, 2)
+		assert.True(t, insertMsg.FieldsData[1].IsDynamic)
+		assert.Len(t, insertMsg.FieldsData[1].GetScalars().GetJsonData().GetData(), 2)
+	})
+
+	t.Run("strict checkDynamicFieldData rejects what partial update allows", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "end_timestamp", DataType: schemapb.DataType_Int64},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		makeMsg := func() *msgstream.InsertMsg {
+			metaJSON := []byte(`{"end_timestamp": 1234, "color": "red"}`)
+			return &msgstream.InsertMsg{
+				InsertRequest: &msgpb.InsertRequest{
+					FieldsData: []*schemapb.FieldData{
+						{
+							FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+							Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+								JsonData: &schemapb.JSONArray{Data: [][]byte{metaJSON}},
+							}}},
+						},
+					},
+				},
+			}
+		}
+
+		// Strict path must reject: $meta contains "end_timestamp" which is a static field
+		err := checkDynamicFieldData(schema, makeMsg())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "end_timestamp")
+
+		// Partial update path must allow the same data
+		err = checkDynamicFieldDataForPartialUpdate(schema, makeMsg())
+		assert.NoError(t, err)
+	})
+
+	t.Run("multiple rows with mixed dynamic keys", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "status", DataType: schemapb.DataType_VarChar},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		row1 := []byte(`{"status": "active", "color": "red"}`)   // "status" matches static field
+		row2 := []byte(`{"color": "blue", "size": 42}`)          // no conflict
+		row3 := []byte(`{"status": "done", "tag": "important"}`) // "status" matches static field
+
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{row1, row2, row3}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.NoError(t, err)
+
+		// Verify all 3 rows preserved intact
+		jsonRows := insertMsg.FieldsData[0].GetScalars().GetJsonData().GetData()
+		assert.Len(t, jsonRows, 3)
+		for i, row := range jsonRows {
+			var m map[string]interface{}
+			assert.NoError(t, json.Unmarshal(row, &m), "row %d must be valid JSON", i)
+		}
+	})
+
+	t.Run("multiple static fields with overlapping keys in $meta", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "fieldA", DataType: schemapb.DataType_Int64},
+				{FieldID: 102, Name: "fieldB", DataType: schemapb.DataType_VarChar},
+				{FieldID: 103, Name: "fieldC", DataType: schemapb.DataType_Float},
+				{FieldID: 104, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		// $meta contains keys matching ALL 3 static fields plus an extra dynamic key
+		metaJSON := []byte(`{"fieldA": 1, "fieldB": "val", "fieldC": 3.14, "extra": true}`)
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "$meta", FieldId: 104, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{metaJSON}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.NoError(t, err)
+
+		var m map[string]interface{}
+		err = json.Unmarshal(insertMsg.FieldsData[0].GetScalars().GetJsonData().GetData()[0], &m)
+		assert.NoError(t, err)
+		assert.Contains(t, m, "fieldA")
+		assert.Contains(t, m, "fieldB")
+		assert.Contains(t, m, "fieldC")
+		assert.Contains(t, m, "extra")
+	})
+
+	t.Run("sets FieldName to $meta for IsDynamic field", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		metaJSON := []byte(`{"color": "green"}`)
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "original_name", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{metaJSON}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.NoError(t, err)
+		// The function must normalize FieldName to "$meta"
+		assert.Equal(t, "$meta", insertMsg.FieldsData[0].GetFieldName())
+	})
+
+	t.Run("non-conflicting keys pass both strict and partial update", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "status", DataType: schemapb.DataType_VarChar},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		makeMsg := func() *msgstream.InsertMsg {
+			metaJSON := []byte(`{"color": "blue", "size": 42}`)
+			return &msgstream.InsertMsg{
+				InsertRequest: &msgpb.InsertRequest{
+					FieldsData: []*schemapb.FieldData{
+						{
+							FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+							Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+								JsonData: &schemapb.JSONArray{Data: [][]byte{metaJSON}},
+							}}},
+						},
+					},
+				},
+			}
+		}
+
+		// Both paths must accept $meta with no static field conflicts
+		err := checkDynamicFieldData(schema, makeMsg())
+		assert.NoError(t, err)
+
+		err = checkDynamicFieldDataForPartialUpdate(schema, makeMsg())
+		assert.NoError(t, err)
+	})
+
+	t.Run("empty JSON object in $meta", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:               "test_collection",
+			EnableDynamicField: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "value", DataType: schemapb.DataType_Int64},
+				{FieldID: 102, Name: "$meta", DataType: schemapb.DataType_JSON, IsDynamic: true},
+			},
+		}
+
+		insertMsg := &msgstream.InsertMsg{
+			InsertRequest: &msgpb.InsertRequest{
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "$meta", FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+						Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{Data: [][]byte{[]byte(`{}`)}},
+						}}},
+					},
+				},
+			},
+		}
+
+		err := checkDynamicFieldDataForPartialUpdate(schema, insertMsg)
+		assert.NoError(t, err)
+	})
+}
+
 // Test ToCompressedFormatNullable for Geometry and Timestamptz types
 func TestToCompressedFormatNullable_GeometryAndTimestamptz(t *testing.T) {
 	t.Run("timestamptz with null values", func(t *testing.T) {
@@ -1466,71 +1817,1253 @@ func TestGenNullableFieldData_GeometryAndTimestamptz(t *testing.T) {
 	})
 }
 
-func TestUpsertTask_PlanNamespace_AfterPreExecute(t *testing.T) {
-	mockey.PatchConvey("TestUpsertTask_PlanNamespace_AfterPreExecute", t, func() {
-		// Setup global meta cache and common mocks
-		globalMetaCache = &MetaCache{}
-		mockey.Mock(GetReplicateID).Return("", nil).Build()
-		mockey.Mock((*MetaCache).GetCollectionID).Return(int64(1001), nil).Build()
-		mockey.Mock((*MetaCache).GetCollectionInfo).Return(&collectionInfo{updateTimestamp: 12345}, nil).Build()
-		mockey.Mock((*MetaCache).GetPartitionInfo).Return(&partitionInfo{name: "_default"}, nil).Build()
-		mockey.Mock((*MetaCache).GetPartitionID).Return(int64(1002), nil).Build()
-		mockey.Mock(isPartitionKeyMode).Return(false, nil).Build()
-		mockey.Mock(validatePartitionTag).Return(nil).Build()
+func TestUpsertTask_DuplicatePK_Int64(t *testing.T) {
+	schema := &schemapb.CollectionSchema{
+		Name: "test_duplicate_pk",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "value", DataType: schemapb.DataType_Int32},
+		},
+	}
 
-		// Schema with namespace enabled
-		mockey.Mock((*MetaCache).GetCollectionSchema).To(func(_ *MetaCache, _ context.Context, _ string, _ string) (*schemaInfo, error) {
-			info := createTestSchema()
-			info.CollectionSchema.Properties = append(info.CollectionSchema.Properties, &commonpb.KeyValuePair{Key: common.NamespaceEnabledKey, Value: "true"})
-			return info, nil
-		}).Build()
+	// Data with duplicate primary keys: 1, 2, 1 (duplicate)
+	fieldsData := []*schemapb.FieldData{
+		{
+			FieldName: "id",
+			FieldId:   100,
+			Type:      schemapb.DataType_Int64,
+			Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_LongData{
+						LongData: &schemapb.LongArray{Data: []int64{1, 2, 1}},
+					},
+				},
+			},
+		},
+		{
+			FieldName: "value",
+			FieldId:   101,
+			Type:      schemapb.DataType_Int32,
+			Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_IntData{
+						IntData: &schemapb.IntArray{Data: []int32{100, 200, 300}},
+					},
+				},
+			},
+		},
+	}
 
-		// Capture plan to verify namespace
-		var capturedPlan *planpb.PlanNode
-		mockey.Mock(planparserv2.CreateRequeryPlan).To(func(_ *schemapb.FieldSchema, _ *schemapb.IDs) *planpb.PlanNode {
-			capturedPlan = &planpb.PlanNode{}
-			return capturedPlan
-		}).Build()
+	// Test CheckDuplicatePkExist directly
+	primaryFieldSchema, err := typeutil.GetPrimaryFieldSchema(schema)
+	assert.NoError(t, err)
+	hasDuplicate, err := CheckDuplicatePkExist(primaryFieldSchema, fieldsData)
+	assert.NoError(t, err)
+	assert.True(t, hasDuplicate, "should detect duplicate primary keys")
+}
 
-		// Mock query to return a valid result for queryPreExecute merge path
-		mockey.Mock((*Proxy).query).Return(&milvuspb.QueryResults{
+func TestUpsertTask_DuplicatePK_VarChar(t *testing.T) {
+	schema := &schemapb.CollectionSchema{
+		Name: "test_duplicate_pk_varchar",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_VarChar, TypeParams: []*commonpb.KeyValuePair{{Key: "max_length", Value: "100"}}},
+			{FieldID: 101, Name: "value", DataType: schemapb.DataType_Int32},
+		},
+	}
+
+	// Data with duplicate primary keys: "a", "b", "a" (duplicate)
+	fieldsData := []*schemapb.FieldData{
+		{
+			FieldName: "id",
+			FieldId:   100,
+			Type:      schemapb.DataType_VarChar,
+			Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_StringData{
+						StringData: &schemapb.StringArray{Data: []string{"a", "b", "a"}},
+					},
+				},
+			},
+		},
+		{
+			FieldName: "value",
+			FieldId:   101,
+			Type:      schemapb.DataType_Int32,
+			Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_IntData{
+						IntData: &schemapb.IntArray{Data: []int32{100, 200, 300}},
+					},
+				},
+			},
+		},
+	}
+
+	// Test CheckDuplicatePkExist directly
+	primaryFieldSchema, err := typeutil.GetPrimaryFieldSchema(schema)
+	assert.NoError(t, err)
+	hasDuplicate, err := CheckDuplicatePkExist(primaryFieldSchema, fieldsData)
+	assert.NoError(t, err)
+	assert.True(t, hasDuplicate, "should detect duplicate primary keys")
+}
+
+func TestUpsertTask_NoDuplicatePK(t *testing.T) {
+	schema := &schemapb.CollectionSchema{
+		Name: "test_no_duplicate_pk",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "value", DataType: schemapb.DataType_Int32},
+		},
+	}
+
+	// Data with unique primary keys: 1, 2, 3
+	fieldsData := []*schemapb.FieldData{
+		{
+			FieldName: "id",
+			FieldId:   100,
+			Type:      schemapb.DataType_Int64,
+			Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_LongData{
+						LongData: &schemapb.LongArray{Data: []int64{1, 2, 3}},
+					},
+				},
+			},
+		},
+		{
+			FieldName: "value",
+			FieldId:   101,
+			Type:      schemapb.DataType_Int32,
+			Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_IntData{
+						IntData: &schemapb.IntArray{Data: []int32{100, 200, 300}},
+					},
+				},
+			},
+		},
+	}
+
+	// Call CheckDuplicatePkExist directly to verify no duplicate error
+	primaryFieldSchema, err := typeutil.GetPrimaryFieldSchema(schema)
+	assert.NoError(t, err)
+	hasDuplicate, err := CheckDuplicatePkExist(primaryFieldSchema, fieldsData)
+	assert.NoError(t, err)
+	assert.False(t, hasDuplicate, "should not have duplicate primary keys")
+}
+
+// TestUpsertTask_queryPreExecute_EmptyDataArray tests the scenario where:
+// 1. Partial update is enabled
+// 2. Three columns are passed: pk (a), vector (b), scalar (c)
+// 3. Columns a and b have 10 rows of data, column c has FieldData but empty data array
+// 4. Verifies both nullable and non-nullable scenarios for column c
+func TestUpsertTask_queryPreExecute_EmptyDataArray(t *testing.T) {
+	numRows := 10
+	dim := 128
+
+	t.Run("scalar field with empty data array nullable field", func(t *testing.T) {
+		// Schema with nullable scalar field c
+		schema := newSchemaInfo(&schemapb.CollectionSchema{
+			Name: "test_empty_data_array",
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "a", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{
+					FieldID:  101,
+					Name:     "b",
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: "dim", Value: "128"},
+					},
+				},
+				{FieldID: 102, Name: "c", DataType: schemapb.DataType_Int32, Nullable: true},
+			},
+		})
+
+		// Upsert data: a (pk, 10 rows), b (vector, 10 rows), c (scalar, FieldData exists but data array is empty)
+		pkData := make([]int64, numRows)
+		for i := 0; i < numRows; i++ {
+			pkData[i] = int64(i + 1)
+		}
+		vectorData := make([]float32, numRows*dim)
+
+		upsertData := []*schemapb.FieldData{
+			{
+				FieldName: "a", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: pkData}}}},
+			},
+			{
+				FieldName: "b", FieldId: 101, Type: schemapb.DataType_FloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: int64(dim), Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: vectorData}}}},
+			},
+			{
+				// c has FieldData but empty data array
+				FieldName: "c", FieldId: 102, Type: schemapb.DataType_Int32,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{}}}}},
+			},
+		}
+
+		// Query result returns empty (all are new inserts)
+		mockQueryResult := &milvuspb.QueryResults{
 			Status: merr.Success(),
 			FieldsData: []*schemapb.FieldData{
 				{
-					FieldName: "id",
-					FieldId:   100,
-					Type:      schemapb.DataType_Int64,
-					Field:     &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2}}}}},
+					FieldName: "a", FieldId: 100, Type: schemapb.DataType_Int64,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{}}}}},
 				},
 				{
-					FieldName: "name",
-					FieldId:   102,
-					Type:      schemapb.DataType_VarChar,
-					Field:     &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"old1", "old2"}}}}},
+					FieldName: "b", FieldId: 101, Type: schemapb.DataType_FloatVector,
+					Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: int64(dim), Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: []float32{}}}}},
 				},
 				{
-					FieldName: "vector",
-					FieldId:   101,
-					Type:      schemapb.DataType_FloatVector,
-					Field:     &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: 128, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, 256)}}}},
+					FieldName: "c", FieldId: 102, Type: schemapb.DataType_Int32,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{}}}}},
 				},
 			},
-		}, segcore.StorageCost{}, nil).Build()
+		}
 
-		// Build task
-		task := createTestUpdateTask()
-		ns := "ns-1"
-		task.req.PartialUpdate = true
-		task.req.Namespace = &ns
+		mockey.PatchConvey("test nullable field", t, func() {
+			// Setup mocks using mockey
+			mockey.Mock((*MetaCache).GetCollectionID).Return(int64(1001), nil).Build()
+			mockey.Mock((*MetaCache).GetCollectionInfo).Return(&collectionInfo{updateTimestamp: 12345, schema: schema}, nil).Build()
+			mockey.Mock((*MetaCache).GetCollectionSchema).Return(schema, nil).Build()
+			mockey.Mock(isPartitionKeyMode).Return(false, nil).Build()
+			mockey.Mock((*MetaCache).GetPartitionInfo).Return(&partitionInfo{name: "_default"}, nil).Build()
+			mockey.Mock((*MetaCache).GetDatabaseInfo).Return(&databaseInfo{dbID: 0}, nil).Build()
+			mockey.Mock(retrieveByPKs).Return(mockQueryResult, segcore.StorageCost{}, nil).Build()
 
-		// Skip insert/delete heavy logic
-		mockey.Mock((*upsertTask).insertPreExecute).Return(nil).Build()
-		mockey.Mock((*upsertTask).deletePreExecute).Return(nil).Build()
+			globalMetaCache = &MetaCache{}
 
-		err := task.PreExecute(context.Background())
+			// Setup idAllocator
+			ctx := context.Background()
+			rc := mocks.NewMockRootCoordClient(t)
+			rc.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
+				Status: merr.Status(nil),
+				ID:     1000,
+				Count:  uint32(numRows),
+			}, nil).Maybe()
+			idAllocator, err := allocator.NewIDAllocator(ctx, rc, 0)
+			assert.NoError(t, err)
+			idAllocator.Start()
+			defer idAllocator.Close()
+
+			task := &upsertTask{
+				ctx:    ctx,
+				schema: schema,
+				req: &milvuspb.UpsertRequest{
+					CollectionName: "test_empty_data_array",
+					FieldsData:     upsertData,
+					NumRows:        uint32(numRows),
+				},
+				upsertMsg: &msgstream.UpsertMsg{
+					InsertMsg: &msgstream.InsertMsg{
+						InsertRequest: &msgpb.InsertRequest{
+							CollectionName: "test_empty_data_array",
+							FieldsData:     upsertData,
+							NumRows:        uint64(numRows),
+						},
+					},
+				},
+				idAllocator: idAllocator,
+				result:      &milvuspb.MutationResult{},
+				node:        &Proxy{},
+			}
+
+			// case1: test upsert
+			err = task.PreExecute(ctx)
+			assert.Error(t, err)
+
+			// case2: test partial update
+			task.req.PartialUpdate = true
+			err = task.PreExecute(ctx)
+			assert.Error(t, err)
+		})
+	})
+
+	t.Run("scalar field with empty data array - non-nullable field", func(t *testing.T) {
+		// Schema with non-nullable scalar field c
+		schema := newSchemaInfo(&schemapb.CollectionSchema{
+			Name: "test_empty_data_array_non_nullable",
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "a", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{
+					FieldID:  101,
+					Name:     "b",
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: "dim", Value: "128"},
+					},
+				},
+				{FieldID: 102, Name: "c", DataType: schemapb.DataType_Int32, Nullable: false},
+			},
+		})
+
+		// Upsert data: a (pk, 10 rows), b (vector, 10 rows), c (scalar, FieldData exists but data array is empty)
+		pkData := make([]int64, numRows)
+		for i := 0; i < numRows; i++ {
+			pkData[i] = int64(i + 1)
+		}
+		vectorData := make([]float32, numRows*dim)
+
+		upsertData := []*schemapb.FieldData{
+			{
+				FieldName: "a", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: pkData}}}},
+			},
+			{
+				FieldName: "b", FieldId: 101, Type: schemapb.DataType_FloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: int64(dim), Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: vectorData}}}},
+			},
+			{
+				// c has FieldData but empty data array - this should cause validation error for non-nullable field
+				FieldName: "c", FieldId: 102, Type: schemapb.DataType_Int32,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{}}}}},
+			},
+		}
+
+		// Query result returns empty (all are new inserts)
+		mockQueryResult := &milvuspb.QueryResults{
+			Status: merr.Success(),
+			FieldsData: []*schemapb.FieldData{
+				{
+					FieldName: "a", FieldId: 100, Type: schemapb.DataType_Int64,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{}}}}},
+				},
+				{
+					FieldName: "b", FieldId: 101, Type: schemapb.DataType_FloatVector,
+					Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: int64(dim), Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: []float32{}}}}},
+				},
+				{
+					FieldName: "c", FieldId: 102, Type: schemapb.DataType_Int32,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{}}}}},
+				},
+			},
+		}
+
+		mockey.PatchConvey("test non-nullable field", t, func() {
+			// Setup mocks using mockey
+			mockey.Mock((*MetaCache).GetCollectionID).Return(int64(1001), nil).Build()
+			mockey.Mock((*MetaCache).GetCollectionInfo).Return(&collectionInfo{updateTimestamp: 12345, schema: schema}, nil).Build()
+			mockey.Mock((*MetaCache).GetCollectionSchema).Return(schema, nil).Build()
+			mockey.Mock(isPartitionKeyMode).Return(false, nil).Build()
+			mockey.Mock((*MetaCache).GetPartitionInfo).Return(&partitionInfo{name: "_default"}, nil).Build()
+			mockey.Mock((*MetaCache).GetDatabaseInfo).Return(&databaseInfo{dbID: 0}, nil).Build()
+			mockey.Mock(retrieveByPKs).Return(mockQueryResult, segcore.StorageCost{}, nil).Build()
+
+			globalMetaCache = &MetaCache{}
+
+			// Setup idAllocator
+			ctx := context.Background()
+			rc := mocks.NewMockRootCoordClient(t)
+			rc.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
+				Status: merr.Status(nil),
+				ID:     1000,
+				Count:  uint32(numRows),
+			}, nil).Maybe()
+			idAllocator, err := allocator.NewIDAllocator(ctx, rc, 0)
+			assert.NoError(t, err)
+			idAllocator.Start()
+			defer idAllocator.Close()
+
+			task := &upsertTask{
+				ctx:    ctx,
+				schema: schema,
+				req: &milvuspb.UpsertRequest{
+					CollectionName: "test_empty_data_array_non_nullable",
+					FieldsData:     upsertData,
+					NumRows:        uint32(numRows),
+				},
+				upsertMsg: &msgstream.UpsertMsg{
+					InsertMsg: &msgstream.InsertMsg{
+						InsertRequest: &msgpb.InsertRequest{
+							CollectionName: "test_empty_data_array_non_nullable",
+							FieldsData:     upsertData,
+							NumRows:        uint64(numRows),
+						},
+					},
+				},
+				idAllocator: idAllocator,
+				result:      &milvuspb.MutationResult{},
+				node:        &Proxy{},
+			}
+
+			// case1: test upsert
+			err = task.PreExecute(ctx)
+			assert.Error(t, err)
+
+			// case2: test partial update
+			task.req.PartialUpdate = true
+			err = task.PreExecute(ctx)
+			assert.Error(t, err)
+		})
+	})
+}
+
+func TestInsertPreExecute_FilterBM25AndMinHashOutputFields(t *testing.T) {
+	paramtable.Init()
+
+	numRows := 2
+
+	getFieldNames := func(data []*schemapb.FieldData) []string {
+		names := make([]string, 0, len(data))
+		for _, fd := range data {
+			names = append(names, fd.GetFieldName())
+		}
+		return names
+	}
+
+	t.Run("partial update filters BM25 and MinHash output fields", func(t *testing.T) {
+		m := mockey.Mock(common.AllocAutoID).Return(int64(1000), int64(1000+numRows), nil).Build()
+		defer m.UnPatch()
+
+		schema := newSchemaInfo(&schemapb.CollectionSchema{
+			Name:   "test_filter_bm25_minhash",
+			AutoID: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, AutoID: true},
+				{FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar, TypeParams: []*commonpb.KeyValuePair{{Key: "max_length", Value: "2000"}}},
+				{FieldID: 102, Name: "vec", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "4"}}},
+				{FieldID: 103, Name: "sparse", DataType: schemapb.DataType_SparseFloatVector, IsFunctionOutput: true},
+				{FieldID: 104, Name: "mh", DataType: schemapb.DataType_BinaryVector, IsFunctionOutput: true, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "512"}}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "bm25",
+					Type:             schemapb.FunctionType_BM25,
+					InputFieldIds:    []int64{101},
+					InputFieldNames:  []string{"text"},
+					OutputFieldIds:   []int64{103},
+					OutputFieldNames: []string{"sparse"},
+				},
+				{
+					Name:             "minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldIds:    []int64{101},
+					InputFieldNames:  []string{"text"},
+					OutputFieldIds:   []int64{104},
+					OutputFieldNames: []string{"mh"},
+				},
+			},
+		})
+
+		fieldsData := []*schemapb.FieldData{
+			{
+				FieldName: "text", FieldId: 101, Type: schemapb.DataType_VarChar,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"hello", "world"}}}}},
+			},
+			{
+				FieldName: "vec", FieldId: 102, Type: schemapb.DataType_FloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: 4, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, numRows*4)}}}},
+			},
+			{
+				FieldName: "sparse", FieldId: 103, Type: schemapb.DataType_SparseFloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Data: &schemapb.VectorField_SparseFloatVector{}}},
+			},
+			{
+				FieldName: "mh", FieldId: 104, Type: schemapb.DataType_BinaryVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: 512, Data: &schemapb.VectorField_BinaryVector{BinaryVector: make([]byte, numRows*512/8)}}},
+			},
+		}
+
+		task := &upsertTask{
+			ctx:         context.Background(),
+			schema:      schema,
+			idAllocator: &allocator.IDAllocator{},
+			req: &milvuspb.UpsertRequest{
+				CollectionName: "test_filter_bm25_minhash",
+				PartialUpdate:  true,
+			},
+			upsertMsg: &msgstream.UpsertMsg{
+				InsertMsg: &msgstream.InsertMsg{
+					InsertRequest: &msgpb.InsertRequest{
+						CollectionName: "test_filter_bm25_minhash",
+						Version:        msgpb.InsertDataVersion_ColumnBased,
+						FieldsData:     fieldsData,
+						NumRows:        uint64(numRows),
+						PartitionName:  Params.CommonCfg.DefaultPartitionName.GetValue(),
+					},
+				},
+			},
+			result: &milvuspb.MutationResult{},
+		}
+
+		_ = task.insertPreExecute(context.Background())
+
+		remainingFields := getFieldNames(task.upsertMsg.InsertMsg.GetFieldsData())
+		assert.NotContains(t, remainingFields, "sparse")
+		assert.NotContains(t, remainingFields, "mh")
+		assert.Contains(t, remainingFields, "text")
+		assert.Contains(t, remainingFields, "vec")
+	})
+
+	t.Run("partial update preserves non-BM25/MinHash function output fields", func(t *testing.T) {
+		m := mockey.Mock(common.AllocAutoID).Return(int64(1000), int64(1000+numRows), nil).Build()
+		defer m.UnPatch()
+
+		// Schema with a text embedding function (non-BM25/MinHash)
+		schema := newSchemaInfo(&schemapb.CollectionSchema{
+			Name:   "test_preserve_embedding",
+			AutoID: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, AutoID: true},
+				{FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar, TypeParams: []*commonpb.KeyValuePair{{Key: "max_length", Value: "2000"}}},
+				{FieldID: 102, Name: "embedding", DataType: schemapb.DataType_FloatVector, IsFunctionOutput: true, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "4"}}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_embedding",
+					Type:             schemapb.FunctionType_TextEmbedding,
+					InputFieldIds:    []int64{101},
+					InputFieldNames:  []string{"text"},
+					OutputFieldIds:   []int64{102},
+					OutputFieldNames: []string{"embedding"},
+				},
+			},
+		})
+
+		fieldsData := []*schemapb.FieldData{
+			{
+				FieldName: "text", FieldId: 101, Type: schemapb.DataType_VarChar,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"hello", "world"}}}}},
+			},
+			{
+				FieldName: "embedding", FieldId: 102, Type: schemapb.DataType_FloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: 4, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, numRows*4)}}}},
+			},
+		}
+
+		task := &upsertTask{
+			ctx:         context.Background(),
+			schema:      schema,
+			idAllocator: &allocator.IDAllocator{},
+			req: &milvuspb.UpsertRequest{
+				CollectionName: "test_preserve_embedding",
+				PartialUpdate:  true,
+			},
+			upsertMsg: &msgstream.UpsertMsg{
+				InsertMsg: &msgstream.InsertMsg{
+					InsertRequest: &msgpb.InsertRequest{
+						CollectionName: "test_preserve_embedding",
+						Version:        msgpb.InsertDataVersion_ColumnBased,
+						FieldsData:     fieldsData,
+						NumRows:        uint64(numRows),
+						PartitionName:  Params.CommonCfg.DefaultPartitionName.GetValue(),
+					},
+				},
+			},
+			result: &milvuspb.MutationResult{},
+		}
+
+		_ = task.insertPreExecute(context.Background())
+
+		// embedding (text embedding output) should NOT be filtered
+		remainingFields := getFieldNames(task.upsertMsg.InsertMsg.GetFieldsData())
+		assert.Contains(t, remainingFields, "text")
+		assert.Contains(t, remainingFields, "embedding")
+		assert.Len(t, remainingFields, 2)
+	})
+
+	t.Run("partial update with no functions keeps all fields", func(t *testing.T) {
+		m := mockey.Mock(common.AllocAutoID).Return(int64(1000), int64(1000+numRows), nil).Build()
+		defer m.UnPatch()
+
+		noFuncSchema := newSchemaInfo(&schemapb.CollectionSchema{
+			Name:   "test_no_func",
+			AutoID: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, AutoID: true},
+				{FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar, TypeParams: []*commonpb.KeyValuePair{{Key: "max_length", Value: "2000"}}},
+				{FieldID: 102, Name: "vec", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "4"}}},
+			},
+		})
+
+		noFuncFieldsData := []*schemapb.FieldData{
+			{
+				FieldName: "text", FieldId: 101, Type: schemapb.DataType_VarChar,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"hello", "world"}}}}},
+			},
+			{
+				FieldName: "vec", FieldId: 102, Type: schemapb.DataType_FloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: 4, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, numRows*4)}}}},
+			},
+		}
+
+		task := &upsertTask{
+			ctx:         context.Background(),
+			schema:      noFuncSchema,
+			idAllocator: &allocator.IDAllocator{},
+			req: &milvuspb.UpsertRequest{
+				CollectionName: "test_no_func",
+				PartialUpdate:  true,
+			},
+			upsertMsg: &msgstream.UpsertMsg{
+				InsertMsg: &msgstream.InsertMsg{
+					InsertRequest: &msgpb.InsertRequest{
+						CollectionName: "test_no_func",
+						Version:        msgpb.InsertDataVersion_ColumnBased,
+						FieldsData:     noFuncFieldsData,
+						NumRows:        uint64(numRows),
+						PartitionName:  Params.CommonCfg.DefaultPartitionName.GetValue(),
+					},
+				},
+			},
+			result: &milvuspb.MutationResult{},
+		}
+
+		_ = task.insertPreExecute(context.Background())
+
+		remainingFields := getFieldNames(task.upsertMsg.InsertMsg.GetFieldsData())
+		assert.Contains(t, remainingFields, "text")
+		assert.Contains(t, remainingFields, "vec")
+		assert.Len(t, remainingFields, 2)
+	})
+}
+
+func TestUpsertTask_queryPreExecute_NullableFields(t *testing.T) {
+	dim := int64(4)
+
+	schema := newSchemaInfo(&schemapb.CollectionSchema{
+		Name: "test_nullable_vec",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "vector", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "4"}}},
+			{FieldID: 102, Name: "nullable_vec", DataType: schemapb.DataType_FloatVector, Nullable: true, TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "4"}}},
+		},
+	})
+
+	// Generate vector data: [pk, pk, pk, pk]
+	genVec := func(pk int64) []float32 {
+		return []float32{float32(pk), float32(pk), float32(pk), float32(pk)}
+	}
+
+	// Create all_columns upsert data (includes nullable_vec)
+	// nullable_vec = [pk+100, pk+100, pk+100, pk+100], ValidData = all true
+	createAllCols := func(pks []int64) []*schemapb.FieldData {
+		var ids []int64
+		var vecData, nullableData []float32
+		var validData []bool
+		for _, pk := range pks {
+			ids = append(ids, pk)
+			vecData = append(vecData, genVec(pk)...)
+			nullableData = append(nullableData, genVec(pk+100)...)
+			validData = append(validData, true)
+		}
+		return []*schemapb.FieldData{
+			{
+				FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: ids}}}},
+			},
+			{
+				FieldName: "vector", FieldId: 101, Type: schemapb.DataType_FloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: dim, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: vecData}}}},
+			},
+			{
+				FieldName: "nullable_vec", FieldId: 102, Type: schemapb.DataType_FloatVector, ValidData: validData,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: dim, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: nullableData}}}},
+			},
+		}
+	}
+
+	// Create partial_columns upsert data (excludes nullable_vec)
+	createPartialCols := func(pks []int64) []*schemapb.FieldData {
+		var ids []int64
+		var vecData []float32
+		for _, pk := range pks {
+			ids = append(ids, pk)
+			vecData = append(vecData, genVec(pk)...)
+		}
+		return []*schemapb.FieldData{
+			{
+				FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: ids}}}},
+			},
+			{
+				FieldName: "vector", FieldId: 101, Type: schemapb.DataType_FloatVector,
+				Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: dim, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: vecData}}}},
+			},
+		}
+	}
+
+	// Create mock query result
+	// existing nullable_vec = [pk+300, pk+300, pk+300, pk+300], ValidData = all true
+	queryResult := func(pks []int64) *milvuspb.QueryResults {
+		var ids []int64
+		var vecData, nullableData []float32
+		var validData []bool
+		for _, pk := range pks {
+			ids = append(ids, pk)
+			vecData = append(vecData, genVec(pk+200)...)
+			nullableData = append(nullableData, genVec(pk+300)...)
+			validData = append(validData, true)
+		}
+		return &milvuspb.QueryResults{
+			Status: merr.Success(),
+			FieldsData: []*schemapb.FieldData{
+				{
+					FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: ids}}}},
+				},
+				{
+					FieldName: "vector", FieldId: 101, Type: schemapb.DataType_FloatVector,
+					Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: dim, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: vecData}}}},
+				},
+				{
+					FieldName: "nullable_vec", FieldId: 102, Type: schemapb.DataType_FloatVector, ValidData: validData,
+					Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: dim, Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: nullableData}}}},
+				},
+			},
+		}
+	}
+
+	runUpsert := func(upsertData []*schemapb.FieldData, mockResult *milvuspb.QueryResults) *upsertTask {
+		numRows := uint32(len(upsertData[0].GetScalars().GetLongData().GetData()))
+		task := &upsertTask{
+			ctx:    context.Background(),
+			schema: schema,
+			req:    &milvuspb.UpsertRequest{FieldsData: upsertData, NumRows: numRows},
+			upsertMsg: &msgstream.UpsertMsg{InsertMsg: &msgstream.InsertMsg{
+				InsertRequest: &msgpb.InsertRequest{
+					FieldsData: upsertData,
+					NumRows:    uint64(numRows),
+					Version:    msgpb.InsertDataVersion_ColumnBased, // Required, otherwise NRows() returns 0
+				},
+			}},
+			node: &Proxy{},
+		}
+		mock := mockey.Mock(retrieveByPKs).Return(mockResult, segcore.StorageCost{}, nil).Build()
+		defer mock.UnPatch()
+		err := task.queryPreExecute(context.Background())
 		assert.NoError(t, err)
-		assert.NotNil(t, capturedPlan)
-		assert.NotNil(t, capturedPlan.Namespace)
-		assert.Equal(t, *task.req.Namespace, *capturedPlan.Namespace)
+		return task
+	}
+
+	// Step 1a: Empty data, upsert pk1(partial) -> insert, nullable_vec=null
+	task1a := runUpsert(createPartialCols([]int64{1}), queryResult(nil))
+	assert.Empty(t, task1a.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{1}, task1a.insertFieldData[0].GetScalars().GetLongData().GetData())
+	assert.Equal(t, []float32{1, 1, 1, 1}, task1a.insertFieldData[1].GetVectors().GetFloatVector().GetData())
+	assert.Equal(t, []bool{false}, task1a.insertFieldData[2].ValidData)
+	assert.Empty(t, task1a.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+
+	// Step 1b: Empty data, upsert pk2(all) -> insert, nullable_vec=[102,...]
+	task1b := runUpsert(createAllCols([]int64{2}), queryResult(nil))
+	assert.Empty(t, task1b.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{2}, task1b.insertFieldData[0].GetScalars().GetLongData().GetData())
+	assert.Equal(t, []float32{2, 2, 2, 2}, task1b.insertFieldData[1].GetVectors().GetFloatVector().GetData())
+	assert.Equal(t, []float32{102, 102, 102, 102}, task1b.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+
+	// Step 2a: pk1 exists, upsert pk1(all) -> update, nullable_vec=[101,...] (from upsert)
+	task2a := runUpsert(createAllCols([]int64{1}), queryResult([]int64{1}))
+	assert.Equal(t, []int64{1}, task2a.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{1}, task2a.insertFieldData[0].GetScalars().GetLongData().GetData())
+	assert.Equal(t, []float32{1, 1, 1, 1}, task2a.insertFieldData[1].GetVectors().GetFloatVector().GetData())
+	assert.Equal(t, []float32{101, 101, 101, 101}, task2a.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+
+	// Step 2b: pk2 exists, upsert pk2(partial) -> update, nullable_vec=[302,...] (from existing)
+	task2b := runUpsert(createPartialCols([]int64{2}), queryResult([]int64{2}))
+	assert.Equal(t, []int64{2}, task2b.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{2}, task2b.insertFieldData[0].GetScalars().GetLongData().GetData())
+	assert.Equal(t, []float32{2, 2, 2, 2}, task2b.insertFieldData[1].GetVectors().GetFloatVector().GetData())
+	assert.Equal(t, []float32{302, 302, 302, 302}, task2b.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+
+	// Step 3a: Empty data, upsert pk3(partial) -> insert, nullable_vec=null
+	task3a := runUpsert(createPartialCols([]int64{3}), queryResult(nil))
+	assert.Empty(t, task3a.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{3}, task3a.insertFieldData[0].GetScalars().GetLongData().GetData())
+	assert.Equal(t, []bool{false}, task3a.insertFieldData[2].ValidData)
+	assert.Empty(t, task3a.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+
+	// Step 3b: Empty data, upsert pk4(all) -> insert, nullable_vec=[104,...]
+	task3b := runUpsert(createAllCols([]int64{4}), queryResult(nil))
+	assert.Empty(t, task3b.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{4}, task3b.insertFieldData[0].GetScalars().GetLongData().GetData())
+	assert.Equal(t, []float32{104, 104, 104, 104}, task3b.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+
+	// Step 4a: pk3,pk4 exist, upsert pk3,pk4,pk5,pk6(all) -> pk3,pk4 update, pk5,pk6 insert
+	task4a := runUpsert(createAllCols([]int64{3, 4, 5, 6}), queryResult([]int64{3, 4}))
+	assert.Equal(t, []int64{3, 4}, task4a.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{3, 4, 5, 6}, task4a.insertFieldData[0].GetScalars().GetLongData().GetData())
+	assert.Equal(t, []float32{3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6}, task4a.insertFieldData[1].GetVectors().GetFloatVector().GetData())
+	assert.Equal(t, []float32{103, 103, 103, 103, 104, 104, 104, 104, 105, 105, 105, 105, 106, 106, 106, 106}, task4a.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+
+	// Step 4b: pk3,pk4 exist, upsert pk3,pk4,pk5,pk6(partial) -> pk3,pk4 update (use existing), pk5,pk6 insert (null)
+	task4b := runUpsert(createPartialCols([]int64{3, 4, 5, 6}), queryResult([]int64{3, 4}))
+	assert.Equal(t, []int64{3, 4}, task4b.deletePKs.GetIntId().GetData())
+	assert.Equal(t, []int64{3, 4, 5, 6}, task4b.insertFieldData[0].GetScalars().GetLongData().GetData())
+	// Update rows pk3,pk4: nullable_vec from existing data (ValidData=true)
+	// Insert rows pk5,pk6: nullable_vec generated by GenNullableFieldData (null, ValidData=false)
+	// ValidData has 4 elements, FloatVector only contains data for ValidData=true rows
+	assert.Equal(t, []bool{true, true, false, false}, task4b.insertFieldData[2].ValidData)
+	assert.Equal(t, []float32{303, 303, 303, 303, 304, 304, 304, 304}, task4b.insertFieldData[2].GetVectors().GetFloatVector().GetData())
+}
+
+func TestUpsertTask_GenNullableFieldData(t *testing.T) {
+	upsertIDSize := 5
+
+	t.Run("scalar_types", func(t *testing.T) {
+		testCases := []struct {
+			name     string
+			dataType schemapb.DataType
+		}{
+			{"Bool", schemapb.DataType_Bool},
+			{"Int32", schemapb.DataType_Int32},
+			{"Int64", schemapb.DataType_Int64},
+			{"Float", schemapb.DataType_Float},
+			{"Double", schemapb.DataType_Double},
+			{"VarChar", schemapb.DataType_VarChar},
+			{"JSON", schemapb.DataType_JSON},
+			{"Array", schemapb.DataType_Array},
+			{"Timestamptz", schemapb.DataType_Timestamptz},
+			{"Geometry", schemapb.DataType_Geometry},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				field := &schemapb.FieldSchema{
+					FieldID:  100,
+					Name:     "test_field",
+					DataType: tc.dataType,
+					Nullable: true,
+				}
+				result, err := GenNullableFieldData(field, upsertIDSize)
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+				assert.Equal(t, field.FieldID, result.FieldId)
+				assert.Equal(t, field.Name, result.FieldName)
+				assert.Equal(t, tc.dataType, result.Type)
+				assert.Equal(t, upsertIDSize, len(result.ValidData))
+				// All ValidData should be false (null)
+				for _, v := range result.ValidData {
+					assert.False(t, v)
+				}
+			})
+		}
+	})
+
+	t.Run("vector_types", func(t *testing.T) {
+		testCases := []struct {
+			name     string
+			dataType schemapb.DataType
+		}{
+			{"FloatVector", schemapb.DataType_FloatVector},
+			{"Float16Vector", schemapb.DataType_Float16Vector},
+			{"BFloat16Vector", schemapb.DataType_BFloat16Vector},
+			{"BinaryVector", schemapb.DataType_BinaryVector},
+			{"Int8Vector", schemapb.DataType_Int8Vector},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				field := &schemapb.FieldSchema{
+					FieldID:    100,
+					Name:       "test_vector",
+					DataType:   tc.dataType,
+					Nullable:   true,
+					TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "128"}},
+				}
+				result, err := GenNullableFieldData(field, upsertIDSize)
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+				assert.Equal(t, field.FieldID, result.FieldId)
+				assert.Equal(t, field.Name, result.FieldName)
+				assert.Equal(t, tc.dataType, result.Type)
+				assert.Equal(t, upsertIDSize, len(result.ValidData))
+				// All ValidData should be false (null)
+				for _, v := range result.ValidData {
+					assert.False(t, v)
+				}
+				assert.NotNil(t, result.GetVectors())
+			})
+		}
+	})
+
+	t.Run("sparse_float_vector", func(t *testing.T) {
+		field := &schemapb.FieldSchema{
+			FieldID:  100,
+			Name:     "test_sparse",
+			DataType: schemapb.DataType_SparseFloatVector,
+			Nullable: true,
+		}
+		result, err := GenNullableFieldData(field, upsertIDSize)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Equal(t, upsertIDSize, len(result.ValidData))
+		assert.NotNil(t, result.GetVectors().GetSparseFloatVector())
+	})
+
+	t.Run("unsupported_type", func(t *testing.T) {
+		field := &schemapb.FieldSchema{
+			FieldID:  100,
+			Name:     "test_unsupported",
+			DataType: schemapb.DataType_None,
+			Nullable: true,
+		}
+		result, err := GenNullableFieldData(field, upsertIDSize)
+		assert.Error(t, err)
+		assert.Nil(t, result)
+	})
+}
+
+func TestUpsertTask_queryPreExecute_DefaultValueWithValidData(t *testing.T) {
+	// Schema with a non-nullable field that has DefaultValue
+	schema := newSchemaInfo(&schemapb.CollectionSchema{
+		Name: "test_default_value_upsert",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "value", DataType: schemapb.DataType_Int32},
+			{
+				FieldID: 102, Name: "default_col", DataType: schemapb.DataType_VarChar,
+				DefaultValue: &schemapb.ValueField{
+					Data: &schemapb.ValueField_StringData{StringData: "default_val"},
+				},
+			},
+		},
+	})
+
+	// Upsert 3 rows; default_col in compressed format: 2 actual values, row 3 uses default
+	upsertData := []*schemapb.FieldData{
+		{
+			FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+			Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2, 3}}}}},
+		},
+		{
+			FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+			Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{100, 200, 300}}}}},
+		},
+		{
+			FieldName: "default_col", FieldId: 102, Type: schemapb.DataType_VarChar,
+			Field:     &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"a", "b"}}}}},
+			ValidData: []bool{true, true, false},
+		},
+	}
+
+	// Query result: existing records for PKs 1, 2
+	mockQueryResult := &milvuspb.QueryResults{
+		Status: merr.Success(),
+		FieldsData: []*schemapb.FieldData{
+			{
+				FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2}}}}},
+			},
+			{
+				FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{10, 20}}}}},
+			},
+			{
+				FieldName: "default_col", FieldId: 102, Type: schemapb.DataType_VarChar,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"old1", "old2"}}}}},
+			},
+		},
+	}
+
+	task := &upsertTask{
+		ctx:    context.Background(),
+		schema: schema,
+		req: &milvuspb.UpsertRequest{
+			FieldsData: upsertData,
+			NumRows:    3,
+		},
+		upsertMsg: &msgstream.UpsertMsg{
+			InsertMsg: &msgstream.InsertMsg{
+				InsertRequest: &msgpb.InsertRequest{
+					FieldsData: upsertData,
+					NumRows:    3,
+					Version:    msgpb.InsertDataVersion_ColumnBased,
+				},
+			},
+		},
+		node: &Proxy{},
+	}
+
+	mockRetrieve := mockey.Mock(retrieveByPKs).Return(mockQueryResult, segcore.StorageCost{}, nil).Build()
+	defer mockRetrieve.UnPatch()
+
+	err := task.queryPreExecute(context.Background())
+	assert.NoError(t, err)
+
+	// Verify default_col was expanded: "a", "b", "default_val"
+	var defaultColField *schemapb.FieldData
+	for _, f := range task.insertFieldData {
+		if f.GetFieldName() == "default_col" {
+			defaultColField = f
+			break
+		}
+	}
+	assert.NotNil(t, defaultColField)
+	assert.Equal(t, []string{"a", "b", "default_val"}, defaultColField.GetScalars().GetStringData().GetData())
+}
+
+func TestUpsertTask_queryPreExecute_DefaultValueError(t *testing.T) {
+	// Schema with a non-nullable field that has DefaultValue
+	schema := newSchemaInfo(&schemapb.CollectionSchema{
+		Name: "test_default_value_error",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "value", DataType: schemapb.DataType_Int32},
+			{
+				FieldID: 102, Name: "default_col", DataType: schemapb.DataType_VarChar,
+				DefaultValue: &schemapb.ValueField{
+					Data: &schemapb.ValueField_StringData{StringData: "default_val"},
+				},
+			},
+		},
+	})
+
+	// Upsert 3 rows; default_col has ValidData with wrong length (2 instead of 3)
+	upsertData := []*schemapb.FieldData{
+		{
+			FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+			Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2, 3}}}}},
+		},
+		{
+			FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+			Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{100, 200, 300}}}}},
+		},
+		{
+			// ValidData length (2) doesn't match numRows (3) → FillWithDefaultValue returns error
+			FieldName: "default_col", FieldId: 102, Type: schemapb.DataType_VarChar,
+			Field:     &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"a"}}}}},
+			ValidData: []bool{true, false},
+		},
+	}
+
+	// Query result: existing records for PKs 1, 2
+	mockQueryResult := &milvuspb.QueryResults{
+		Status: merr.Success(),
+		FieldsData: []*schemapb.FieldData{
+			{
+				FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2}}}}},
+			},
+			{
+				FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{10, 20}}}}},
+			},
+			{
+				FieldName: "default_col", FieldId: 102, Type: schemapb.DataType_VarChar,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"old1", "old2"}}}}},
+			},
+		},
+	}
+
+	task := &upsertTask{
+		ctx:    context.Background(),
+		schema: schema,
+		req: &milvuspb.UpsertRequest{
+			FieldsData: upsertData,
+			NumRows:    3,
+		},
+		upsertMsg: &msgstream.UpsertMsg{
+			InsertMsg: &msgstream.InsertMsg{
+				InsertRequest: &msgpb.InsertRequest{
+					FieldsData: upsertData,
+					NumRows:    3,
+					Version:    msgpb.InsertDataVersion_ColumnBased,
+				},
+			},
+		},
+		node: &Proxy{},
+	}
+
+	mockRetrieve := mockey.Mock(retrieveByPKs).Return(mockQueryResult, segcore.StorageCost{}, nil).Build()
+	defer mockRetrieve.UnPatch()
+
+	err := task.queryPreExecute(context.Background())
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+}
+
+func TestUpsertTask_queryPreExecute_DynamicFieldValidData(t *testing.T) {
+	// Schema with dynamic field enabled, simulating a collection with id + value + $meta
+	schema := newSchemaInfo(&schemapb.CollectionSchema{
+		Name:               "test_dynamic_validdata",
+		EnableDynamicField: true,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "value", DataType: schemapb.DataType_Int32},
+			{
+				FieldID: 102, Name: common.MetaFieldName, DataType: schemapb.DataType_JSON,
+				IsDynamic: true, Nullable: true,
+				DefaultValue: &schemapb.ValueField{
+					Data: &schemapb.ValueField_StringData{StringData: "{}"},
+				},
+			},
+		},
+	})
+
+	t.Run("dynamic field with ValidData merges correctly", func(t *testing.T) {
+		// Upsert 3 rows: IDs 1,2 (update), 3 (insert)
+		// User provides dynamic field $meta WITHOUT ValidData
+		// queryPreExecute will auto-fill ValidData with all-true before merge
+		meta1, _ := json.Marshal(map[string]interface{}{"color": "gold"})
+		meta2, _ := json.Marshal(map[string]interface{}{"color": "silver"})
+		meta3, _ := json.Marshal(map[string]interface{}{"color": "bronze"})
+
+		upsertData := []*schemapb.FieldData{
+			{
+				FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2, 3}}}}},
+			},
+			{
+				FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{100, 200, 300}}}}},
+			},
+			{
+				FieldName: common.MetaFieldName, FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+					JsonData: &schemapb.JSONArray{Data: [][]byte{meta1, meta2, meta3}},
+				}}},
+				// No ValidData — queryPreExecute auto-fills with all-true
+			},
+		}
+
+		// Query result: existing PKs 1, 2
+		existMeta1, _ := json.Marshal(map[string]interface{}{"color": "red"})
+		existMeta2, _ := json.Marshal(map[string]interface{}{"color": "blue"})
+		mockQueryResult := &milvuspb.QueryResults{
+			Status: merr.Success(),
+			FieldsData: []*schemapb.FieldData{
+				{
+					FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2}}}}},
+				},
+				{
+					FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{10, 20}}}}},
+				},
+				{
+					FieldName: common.MetaFieldName, FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+						JsonData: &schemapb.JSONArray{Data: [][]byte{existMeta1, existMeta2}},
+					}}},
+				},
+			},
+		}
+
+		task := &upsertTask{
+			ctx:    context.Background(),
+			schema: schema,
+			req: &milvuspb.UpsertRequest{
+				FieldsData: upsertData,
+				NumRows:    3,
+			},
+			upsertMsg: &msgstream.UpsertMsg{
+				InsertMsg: &msgstream.InsertMsg{
+					InsertRequest: &msgpb.InsertRequest{
+						FieldsData: upsertData,
+						NumRows:    3,
+						Version:    msgpb.InsertDataVersion_ColumnBased,
+					},
+				},
+			},
+			node: &Proxy{},
+		}
+
+		mockRetrieve := mockey.Mock(retrieveByPKs).Return(mockQueryResult, segcore.StorageCost{}, nil).Build()
+		defer mockRetrieve.UnPatch()
+
+		err := task.queryPreExecute(context.Background())
+		assert.NoError(t, err)
+
+		// Verify merged $meta has 3 entries with correct ValidData length
+		var metaField *schemapb.FieldData
+		for _, f := range task.insertFieldData {
+			if f.GetFieldName() == common.MetaFieldName {
+				metaField = f
+				break
+			}
+		}
+		assert.NotNil(t, metaField)
+		metaData := metaField.GetScalars().GetJsonData().GetData()
+		assert.Equal(t, 3, len(metaData), "merged $meta should have 3 rows")
+		// ValidData should also have 3 entries (2 from update + 1 from insert)
+		assert.Equal(t, 3, len(metaField.GetValidData()), "ValidData length should match row count")
+	})
+
+	t.Run("dynamic field without ValidData is auto-filled by queryPreExecute", func(t *testing.T) {
+		// This test verifies the fix: when $meta has NO ValidData (SDK behavior),
+		// queryPreExecute auto-fills it with all-true, so merge produces correct length
+		meta1, _ := json.Marshal(map[string]interface{}{"color": "gold"})
+		meta2, _ := json.Marshal(map[string]interface{}{"color": "silver"})
+		meta3, _ := json.Marshal(map[string]interface{}{"color": "bronze"})
+
+		upsertData := []*schemapb.FieldData{
+			{
+				FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2, 3}}}}},
+			},
+			{
+				FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{100, 200, 300}}}}},
+			},
+			{
+				FieldName: common.MetaFieldName, FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+					JsonData: &schemapb.JSONArray{Data: [][]byte{meta1, meta2, meta3}},
+				}}},
+				// NO ValidData — queryPreExecute will auto-fill
+			},
+		}
+
+		existMeta1, _ := json.Marshal(map[string]interface{}{"color": "red"})
+		existMeta2, _ := json.Marshal(map[string]interface{}{"color": "blue"})
+		mockQueryResult := &milvuspb.QueryResults{
+			Status: merr.Success(),
+			FieldsData: []*schemapb.FieldData{
+				{
+					FieldName: "id", FieldId: 100, Type: schemapb.DataType_Int64,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2}}}}},
+				},
+				{
+					FieldName: "value", FieldId: 101, Type: schemapb.DataType_Int32,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{10, 20}}}}},
+				},
+				{
+					FieldName: common.MetaFieldName, FieldId: 102, Type: schemapb.DataType_JSON, IsDynamic: true,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_JsonData{
+						JsonData: &schemapb.JSONArray{Data: [][]byte{existMeta1, existMeta2}},
+					}}},
+				},
+			},
+		}
+
+		task := &upsertTask{
+			ctx:    context.Background(),
+			schema: schema,
+			req: &milvuspb.UpsertRequest{
+				FieldsData: upsertData,
+				NumRows:    3,
+			},
+			upsertMsg: &msgstream.UpsertMsg{
+				InsertMsg: &msgstream.InsertMsg{
+					InsertRequest: &msgpb.InsertRequest{
+						FieldsData: upsertData,
+						NumRows:    3,
+						Version:    msgpb.InsertDataVersion_ColumnBased,
+					},
+				},
+			},
+			node: &Proxy{},
+		}
+
+		mockRetrieve := mockey.Mock(retrieveByPKs).Return(mockQueryResult, segcore.StorageCost{}, nil).Build()
+		defer mockRetrieve.UnPatch()
+
+		err := task.queryPreExecute(context.Background())
+		assert.NoError(t, err)
+
+		// queryPreExecute auto-fills ValidData on $meta, so merge produces correct length 3
+		var metaField *schemapb.FieldData
+		for _, f := range task.insertFieldData {
+			if f.GetFieldName() == common.MetaFieldName {
+				metaField = f
+				break
+			}
+		}
+		assert.NotNil(t, metaField)
+		metaData := metaField.GetScalars().GetJsonData().GetData()
+		assert.Equal(t, 3, len(metaData), "merged $meta should have 3 rows")
+		validData := metaField.GetValidData()
+		assert.Equal(t, 3, len(validData),
+			"queryPreExecute auto-fills ValidData, merge produces correct length 3")
 	})
 }

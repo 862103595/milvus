@@ -25,6 +25,10 @@ add_definitions(-DELPP_THREAD_SAFE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 message( STATUS "Building using CMake version: ${CMAKE_VERSION}" )
 
+if ( BUILD_UNIT_TEST STREQUAL "ON" )
+    add_definitions(-DWITHOUT_GO_LOGGING)
+endif()
+
 if ( MILVUS_GPU_VERSION )
     add_definitions(-DMILVUS_GPU_VERSION)
 endif ()
@@ -33,7 +37,7 @@ if ( USE_DYNAMIC_SIMD )
     add_definitions(-DUSE_DYNAMIC_SIMD)
 endif()
 
-if (USE_OPENDAL) 
+if (USE_OPENDAL)
     add_definitions(-DUSE_OPENDAL)
 endif()
 
@@ -57,6 +61,10 @@ if (CMAKE_COMPILER_IS_GNUCC)
         # ignore deprecated declarations for gcc>=12
         # TODO: this workaround may removed when protobuf upgraded
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations")
+    endif ()
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 12.99)
+        # gcc>=13 removed implicit includes for <cstdint>, <cstdlib>, <algorithm> etc.
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include cstdint -include cstdlib -include algorithm")
     endif ()
 endif ()
 
@@ -84,6 +92,13 @@ project( milvus VERSION "${MILVUS_VERSION}" )
 set( CMAKE_CXX_STANDARD 17 )
 set( CMAKE_CXX_STANDARD_REQUIRED on )
 
+# Use std::shared_ptr/std::string_view etc. instead of opentelemetry::nostd::
+# equivalents.  This MUST be consistent across every translation unit that
+# includes OTel headers; a mismatch causes an ODR violation / ABI break
+# because nostd::shared_ptr has a completely different memory layout (32-byte
+# PlacementBuffer) compared to std::shared_ptr (16 bytes).
+add_compile_definitions( OPENTELEMETRY_STL_VERSION=2017 )
+
 set( MILVUS_SOURCE_DIR      ${PROJECT_SOURCE_DIR} )
 set( MILVUS_BINARY_DIR      ${PROJECT_BINARY_DIR} )
 set( MILVUS_ENGINE_SRC      ${PROJECT_SOURCE_DIR}/src )
@@ -93,6 +108,11 @@ set( MILVUS_THIRDPARTY_SRC  ${PROJECT_SOURCE_DIR}/thirdparty )
 # self-installed dynamic libraries will be correctly linked by excutable
 set( CMAKE_INSTALL_RPATH "/usr/lib" "${CMAKE_INSTALL_PREFIX}/lib" "${CMAKE_INSTALL_PREFIX}/lib64" )
 set( CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE )
+# FetchContent-built shared libs (libbson, libbsoncxx, etc.) are placed in
+# ${CMAKE_BINARY_DIR}/lib. The linker needs -rpath-link to resolve transitive
+# shared library dependencies (e.g. libbsoncxx.so -> libbson-1.0.so) when
+# linking test binaries.
+set( CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/lib" )
 
 # **************************** Dependencies ****************************
 list( APPEND CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR}/conan )
@@ -129,7 +149,7 @@ if (LINUX OR MSYS)
                   "-Wno-error"
                   "-Wno-all"
                   )
-    if (USE_ASAN STREQUAL "ON") 
+    if (USE_ASAN STREQUAL "ON")
         message( STATUS "Building Milvus Core Using AddressSanitizer")
         add_compile_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
         add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
@@ -156,6 +176,21 @@ if ( APPLE )
             "-Wno-c++11-narrowing"
             "-DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED=1"
             )
+    # Fix for macOS 14+ (Sonoma) linker requiring SG_READ_ONLY flag
+    # Disable fixup chains to avoid __DATA_CONST segment issues with third-party libraries
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-no_fixup_chains")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-no_fixup_chains")
+
+    # Folly's Exception.cpp references __cxa_increment/decrement_exception_refcount
+    # from libc++abi, which lives in <llvm-root>/lib/c++/ and is not on the default
+    # linker search path. Derive the path from CMAKE_CXX_COMPILER.
+    get_filename_component(_CXX_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_LLVM_ROOT "${_CXX_BIN_DIR}" DIRECTORY)
+    set(_LLVM_CXXABI_DIR "${_LLVM_ROOT}/lib/c++")
+    if(EXISTS "${_LLVM_CXXABI_DIR}/libc++abi.dylib")
+        link_directories("${_LLVM_CXXABI_DIR}")
+        link_libraries(c++abi)
+    endif()
 endif ()
 
 # **************************** Coding style check tools ****************************
@@ -263,6 +298,15 @@ if ( BUILD_UNIT_TEST STREQUAL "ON" AND BUILD_COVERAGE STREQUAL "ON" )
                   FLAGS
                         "-fprofile-arcs"
                         "-ftest-coverage"
+                        )
+    # Also add coverage flags to linker (required on macOS with Clang)
+    append_flags( CMAKE_EXE_LINKER_FLAGS
+                  FLAGS
+                        "--coverage"
+                        )
+    append_flags( CMAKE_SHARED_LINKER_FLAGS
+                  FLAGS
+                        "--coverage"
                         )
 endif ()
 

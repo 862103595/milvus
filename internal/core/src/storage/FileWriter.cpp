@@ -14,9 +14,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <utility>
+#include <errno.h>
+#include <fcntl.h>
+#include <folly/Try.h>
+#include <folly/futures/Future.h>
+#include <folly/futures/Promise.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cassert>
 #include <cstdlib>
+#include <exception>
+#include <utility>
+
+#include "folly/ExceptionWrapper.h"
+#include "folly/Unit.h"
 #include "folly/futures/Future.h"
+#include "folly/futures/Promise.h"
 #include "storage/FileWriter.h"
 
 namespace milvus::storage {
@@ -25,7 +38,10 @@ FileWriter::FileWriter(std::string filename, io::Priority priority)
     : filename_(std::move(filename)),
       priority_(priority),
       rate_limiter_(io::WriteRateLimiter::GetInstance()) {
-    auto mode = GetMode();
+    // high priority always use buffered mode, otherwise use the global mode
+    auto mode =
+        priority_ == io::Priority::HIGH ? WriteMode::BUFFERED : GetMode();
+
     use_direct_io_ = mode == WriteMode::DIRECT;
     use_writer_pool_ = FileWriteWorkerPool::GetInstance().HasPool();
 

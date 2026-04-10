@@ -5,5 +5,5 @@ package registry
 
 func ResetRegistration() {
 	resetMessageAckCallbacks()
-	resetMessageCheckCallbacks()
+	resetMessageAckOnceCallbacks()
 }

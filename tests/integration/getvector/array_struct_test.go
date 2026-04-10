@@ -30,7 +30,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/metric"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 	"github.com/milvus-io/milvus/tests/integration"
 )
@@ -49,11 +48,6 @@ type TestArrayStructSuite struct {
 }
 
 func (s *TestArrayStructSuite) run() {
-	revertGuard := s.Cluster.MustModifyMilvusConfig(map[string]string{
-		paramtable.Get().CommonCfg.EnableStorageV2.Key: "true",
-	})
-	defer revertGuard()
-
 	ctx, cancel := context.WithCancel(s.Cluster.GetContext())
 	defer cancel()
 
@@ -249,6 +243,42 @@ func (s *TestArrayStructSuite) TestGetVector_ArrayStruct_FloatVector() {
 	s.indexType = integration.IndexHNSW
 	s.metricType = metric.MaxSim
 	s.vecType = schemapb.DataType_FloatVector
+	s.run()
+}
+
+func (s *TestArrayStructSuite) TestGetVector_ArrayStruct_Float16Vector() {
+	s.nq = 10
+	s.topK = 10
+	s.indexType = integration.IndexHNSW
+	s.metricType = metric.MaxSim
+	s.vecType = schemapb.DataType_Float16Vector
+	s.run()
+}
+
+func (s *TestArrayStructSuite) TestGetVector_ArrayStruct_BFloat16Vector() {
+	s.nq = 10
+	s.topK = 10
+	s.indexType = integration.IndexHNSW
+	s.metricType = metric.MaxSim
+	s.vecType = schemapb.DataType_BFloat16Vector
+	s.run()
+}
+
+func (s *TestArrayStructSuite) TestGetVector_ArrayStruct_Int8Vector() {
+	s.nq = 10
+	s.topK = 10
+	s.indexType = integration.IndexHNSW
+	s.metricType = metric.MaxSim
+	s.vecType = schemapb.DataType_Int8Vector
+	s.run()
+}
+
+func (s *TestArrayStructSuite) TestGetVector_ArrayStruct_BinaryVector() {
+	s.nq = 10
+	s.topK = 10
+	s.indexType = integration.IndexHNSW
+	s.metricType = metric.MaxSimHamming
+	s.vecType = schemapb.DataType_BinaryVector
 	s.run()
 }
 

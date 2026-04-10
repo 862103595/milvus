@@ -37,10 +37,12 @@ func TestCheckGeneralCapacity(t *testing.T) {
 
 	catalog := mocks.NewRootCoordCatalog(t)
 	catalog.EXPECT().ListDatabases(mock.Anything, mock.Anything).Return(nil, nil)
+	catalog.EXPECT().ListFileResource(mock.Anything).Return(nil, uint64(0), nil)
 	catalog.EXPECT().ListCollections(mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 	catalog.EXPECT().ListAliases(mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 	catalog.EXPECT().CreateDatabase(mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	catalog.EXPECT().AlterCollection(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	catalog.EXPECT().DeleteGrantByCollectionName(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	allocator := mocktso.NewAllocator(t)
 	allocator.EXPECT().GenerateTSO(mock.Anything).Return(1000, nil)

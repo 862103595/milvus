@@ -11,13 +11,21 @@
 
 #pragma once
 
+#include <boost/geometry/index/rtree.hpp>
+#include <geos_c.h>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
-#include <boost/geometry.hpp>
-#include <boost/geometry/index/rtree.hpp>
-#include <geos_c.h>
+
+#include "boost/geometry/core/cs.hpp"
+#include "boost/geometry/core/static_assert.hpp"
+#include "boost/geometry/geometries/box.hpp"
+#include "boost/geometry/geometries/point.hpp"
+#include "boost/geometry/index/parameters.hpp"
 #include "pb/plan.pb.h"
 
 // Forward declaration to avoid pulling heavy field data headers here
@@ -96,6 +104,13 @@ class RTreeIndexWrapper {
      */
     int64_t
     count() const;
+
+    /**
+     * @brief Get the estimated memory usage of the R-tree index
+     * @return Memory usage in bytes
+     */
+    int64_t
+    ByteSize() const;
 
     // Boost rtree does not use index/leaf capacities; keep only fill factor for
     // compatibility (no-op currently)

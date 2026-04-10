@@ -16,23 +16,60 @@
 
 #pragma once
 
-// Forward declaration of test accessor in global namespace for friend declaration
-class TraverseJsonForBuildStatsAccessor;
-class CollectSingleJsonStatsInfoAccessor;
-
+#include <folly/ExceptionWrapper.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <algorithm>
+#include <any>
+#include <functional>
+#include <istream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <string>
-#include <boost/filesystem.hpp>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-#include "index/InvertedIndexTantivy.h"
+#include "bitset/bitset.h"
+#include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/Utils.h"
+#include "common/EasyAssert.h"
+#include "common/FieldData.h"
+#include "common/OpContext.h"
+#include "common/Span.h"
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "common/Utils.h"
+#include "common/bson_view.h"
 #include "common/jsmn.h"
-#include "mmap/ChunkedColumnInterface.h"
-#include "arrow/api.h"
-#include "index/json_stats/utils.h"
+#include "common/protobuf_utils.h"
+#include "folly/FBVector.h"
+#include "glog/logging.h"
+#include "index/IndexStats.h"
+#include "index/Meta.h"
+#include "index/ScalarIndex.h"
+#include "index/SkipIndex.h"
 #include "index/json_stats/bson_inverted.h"
 #include "index/json_stats/parquet_writer.h"
-#include "index/json_stats/bson_builder.h"
-#include "common/bson_view.h"
-#include "index/SkipIndex.h"
+#include "index/json_stats/utils.h"
+#include "log/Log.h"
+#include "mmap/ChunkedColumnInterface.h"
+#include "pb/common.pb.h"
+#include "pb/schema.pb.h"
+#include "storage/ChunkManager.h"
+#include "storage/DiskFileManagerImpl.h"
+#include "storage/FileManager.h"
+#include "storage/MemFileManagerImpl.h"
+
+class CollectSingleJsonStatsInfoAccessor;
+// Forward declaration of test accessor in global namespace for friend declaration
+class TraverseJsonForBuildStatsAccessor;
 
 namespace milvus::index {
 class JsonKeyStats : public ScalarIndex<std::string> {
@@ -46,6 +83,8 @@ class JsonKeyStats : public ScalarIndex<std::string> {
         uint32_t tantivy_index_version = TANTIVY_INDEX_LATEST_VERSION);
 
     ~JsonKeyStats() override;
+
+    using ScalarIndex<std::string>::BuildWithFieldData;
 
  public:
     void
@@ -141,15 +180,15 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     }
 
     const TargetBitmap
-    Range(std::string value, OpType op) override {
+    Range(const std::string& value, OpType op) override {
         ThrowInfo(ErrorCode::NotImplemented,
                   "Range not supported for JsonKeyStats");
     }
 
     const TargetBitmap
-    Range(std::string lower_bound_value,
+    Range(const std::string& lower_bound_value,
           bool lb_inclusive,
-          std::string upper_bound_value,
+          const std::string& upper_bound_value,
           bool ub_inclusive) override {
         ThrowInfo(ErrorCode::NotImplemented,
                   "Range not supported for JsonKeyStats");
@@ -162,28 +201,36 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     }
 
  public:
+    PinWrapper<BsonInvertedIndex*>
+    GetBsonIndex(milvus::OpContext* op_ctx) const {
+        if (bson_index_cache_slot_ == nullptr) {
+            return PinWrapper<BsonInvertedIndex*>(nullptr);
+        }
+        auto ca = SemiInlineGet(bson_index_cache_slot_->PinCells(op_ctx, {0}));
+        auto index = ca->get_cell_of(0);
+        return PinWrapper<BsonInvertedIndex*>(ca, index);
+    }
+
     void
     ExecuteForSharedData(
         milvus::OpContext* op_ctx,
+        PinWrapper<BsonInvertedIndex*>& bson_index_cache,
         const std::string& path,
         std::function<void(BsonView bson, uint32_t row_id, uint32_t offset)>
             func) {
-        bson_inverted_index_->TermQuery(
+        if (bson_index_cache.get() == nullptr) {
+            bson_index_cache = GetBsonIndex(op_ctx);
+        }
+        if (bson_index_cache.get() == nullptr || shared_column_ == nullptr) {
+            return;
+        }
+        bson_index_cache.get()->TermQuery(
             path,
             [this, &func, op_ctx](const uint32_t* row_id_array,
                                   const uint32_t* offset_array,
                                   const int64_t array_len) {
                 shared_column_->BulkRawBsonAt(
                     op_ctx, func, row_id_array, offset_array, array_len);
-            });
-    }
-
-    void
-    ExecuteExistsPathForSharedData(const std::string& path,
-                                   TargetBitmapView bitset) {
-        bson_inverted_index_->TermQueryEach(
-            path, [&bitset](uint32_t row_id, uint32_t offset) {
-                bitset[row_id] = true;
             });
     }
 
@@ -302,53 +349,6 @@ class JsonKeyStats : public ScalarIndex<std::string> {
         return processed_size;
     }
 
-    // Whether shared columns can be skipped for this path (type-agnostic)
-    bool
-    CanSkipShared(const std::string& path) {
-        auto it = key_field_map_.find(path);
-        if (it == key_field_map_.end()) {
-            return true;
-        }
-
-        const auto& field_names = it->second;
-        for (const auto& field_name : field_names) {
-            if (field_layout_type_map_[field_name] ==
-                JsonKeyLayoutType::SHARED) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    // Whether shared columns can be skipped for this path with type filter
-    bool
-    CanSkipShared(const std::string& path,
-                  const std::set<milvus::index::JSONType>& target_types) {
-        auto it = key_field_map_.find(path);
-        if (it == key_field_map_.end()) {
-            return true;
-        }
-
-        const auto& field_names = it->second;
-        for (const auto& field_name : field_names) {
-            if (field_layout_type_map_[field_name] !=
-                JsonKeyLayoutType::SHARED) {
-                continue;
-            }
-
-            if (!target_types.empty() &&
-                target_types.find(key_data_type_map_[field_name]) ==
-                    target_types.end()) {
-                continue;
-            }
-
-            return false;
-        }
-
-        return true;
-    }
-
     std::set<std::string>
     GetShreddingFields(const std::string& pointer) {
         std::set<std::string> fields;
@@ -426,16 +426,6 @@ class JsonKeyStats : public ScalarIndex<std::string> {
         return JSONType::UNKNOWN;
     }
 
-    cachinglayer::ResourceUsage
-    CellByteSize() const {
-        return cell_size_;
-    }
-
-    void
-    SetCellSize(cachinglayer::ResourceUsage cell_size) {
-        cell_size_ = cell_size;
-    }
-
  private:
     void
     CollectSingleJsonStatsInfo(const char* json_str,
@@ -497,6 +487,15 @@ class JsonKeyStats : public ScalarIndex<std::string> {
 
     std::string
     GetSharedKeyIndexDir();
+
+    std::string
+    GetMetaFilePath();
+
+    void
+    WriteMetaFile();
+
+    void
+    LoadMetaFile(const std::string& meta_file_path);
 
     void
     AddKeyStats(const std::vector<std::string>& path,
@@ -561,7 +560,7 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     bool
     IsFloat(const std::string& str) {
         try {
-            float d = std::stof(str);
+            std::stof(str);
             return true;
         } catch (...) {
             return false;
@@ -571,7 +570,7 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     bool
     IsDouble(const std::string& str) {
         try {
-            double d = std::stod(str);
+            std::stod(str);
             return true;
         } catch (...) {
             return false;
@@ -609,7 +608,8 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     }
 
     void
-    LoadShreddingData(const std::vector<std::string>& index_files);
+    LoadShreddingData(const std::vector<std::string>& index_files,
+                      const std::string& warmup_policy = "");
 
     void
     ApplyValidData(const bool* valid_data,
@@ -647,14 +647,23 @@ class JsonKeyStats : public ScalarIndex<std::string> {
 
     void
     LoadColumnGroup(int64_t column_group_id,
-                    const std::vector<int64_t>& file_ids);
+                    const std::vector<int64_t>& file_ids,
+                    const std::string& warmup_policy = "",
+                    const std::string& override_prefix = "");
 
     void
     LoadShreddingMeta(
-        std::vector<std::pair<int64_t, std::vector<int64_t>>> sorted_files);
+        std::vector<std::pair<int64_t, std::vector<int64_t>>> sorted_files,
+        const std::string& override_prefix = "");
 
     std::string
     AddBucketName(const std::string& remote_prefix);
+
+    void
+    LoadSharedKeyIndex(const std::vector<std::string>& shared_key_index_files,
+                       bool enable_mmap,
+                       int64_t index_size,
+                       const std::string& warmup_policy = "");
 
  private:
     proto::schema::FieldSchema schema_;
@@ -676,25 +685,22 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     std::set<JsonKey> column_keys_;
     std::shared_ptr<JsonStatsParquetWriter> parquet_writer_;
     std::shared_ptr<BsonInvertedIndex> bson_inverted_index_;
+    // cache slot for bson inverted index when using translator
+    std::shared_ptr<milvus::cachinglayer::CacheSlot<BsonInvertedIndex>>
+        bson_index_cache_slot_;
 
     milvus::proto::common::LoadPriority load_priority_;
     // some meta cache for searching
-    // json_path -> [json_path_int, json_path_array, json_path_object, ...], only for all keys
+    // json_path -> [json_path_int, json_path_string, ...], only for shredding columns
     std::unordered_map<std::string, std::set<std::string>> key_field_map_;
     // field_name -> data_type, such as json_path_int -> JSONType::INT64, only for real shredding columns
     std::unordered_map<std::string, JSONType> shred_field_data_type_map_;
-    // key_name -> data_type, such as json_path_int -> JSONType::INT64, for all keys
-    std::unordered_map<std::string, JSONType> key_data_type_map_;
-    // field_name -> key_type, such as json_path_int -> JsonKeyLayoutType::TYPED, for all keys
-    std::unordered_map<std::string, JsonKeyLayoutType> field_layout_type_map_;
     // field_name -> field_id, such as json_path_int -> 1001
     std::unordered_map<std::string, int64_t> field_name_to_id_map_;
     // field_id -> field_name, such as 1001 -> json_path_int
     std::unordered_map<int64_t, std::string> field_id_to_name_map_;
     // field_name vector, the sequece is the same as the order of files
     std::vector<std::string> field_names_;
-    // column_group_id -> schema, the sequence of schemas is the same as the order of files
-    std::map<int64_t, std::shared_ptr<arrow::Schema>> column_group_schemas_;
     // field_name -> column
     mutable std::unordered_map<std::string,
                                std::shared_ptr<milvus::ChunkedColumnInterface>>
@@ -704,14 +710,14 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     std::string shared_column_field_name_;
     std::shared_ptr<milvus::ChunkedColumnInterface> shared_column_;
     SkipIndex skip_index_;
-    cachinglayer::ResourceUsage cell_size_ = {0, 0};
+
+    // Meta file for storing layout type map and other metadata
+    JsonStatsMeta json_stats_meta_;
+    int64_t meta_file_size_{0};
 
     // Friend accessor for unit tests to call private methods safely.
     friend class ::TraverseJsonForBuildStatsAccessor;
     friend class ::CollectSingleJsonStatsInfoAccessor;
 };
-
-using CacheJsonKeyStatsPtr =
-    std::shared_ptr<milvus::cachinglayer::CacheSlot<JsonKeyStats>>;
 
 }  // namespace milvus::index

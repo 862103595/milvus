@@ -532,6 +532,29 @@ func (s *SegmentInfo) getSegmentSize() int64 {
 	return s.size.Load()
 }
 
+func (s *SegmentInfo) getFieldBinlogSize(fieldID int64) int64 {
+	var size int64
+	for _, binlogs := range s.GetBinlogs() {
+		if binlogs.GetFieldID() == fieldID {
+			for _, l := range binlogs.GetBinlogs() {
+				size += l.GetMemorySize()
+			}
+		} else {
+			for _, childFieldID := range binlogs.GetChildFields() {
+				if childFieldID == fieldID {
+					for _, l := range binlogs.GetBinlogs() {
+						size += l.GetMemorySize()
+					}
+				}
+			}
+		}
+	}
+	if size <= 0 {
+		return s.getSegmentSize()
+	}
+	return size
+}
+
 // Any edits on deltalogs of flushed segments will reset deltaRowcount to -1
 func (s *SegmentInfo) getDeltaCount() int64 {
 	if s.deltaRowcount.Load() < 0 || s.GetState() != commonpb.SegmentState_Flushed {
@@ -549,3 +572,32 @@ func (s *SegmentInfo) getDeltaCount() int64 {
 
 // SegmentInfoSelector is the function type to select SegmentInfo from meta
 type SegmentInfoSelector func(*SegmentInfo) bool
+
+// ValidateManifestSegment checks that segments with manifest_path have empty
+// legacy stats fields. Returns a descriptive message if validation fails,
+// or empty string if the segment is valid.
+func ValidateManifestSegment(info *SegmentInfo) string {
+	if info.GetManifestPath() == "" {
+		return ""
+	}
+
+	var nonEmpty []string
+	if len(info.GetStatslogs()) > 0 {
+		nonEmpty = append(nonEmpty, fmt.Sprintf("statslogs(%d)", len(info.GetStatslogs())))
+	}
+	if len(info.GetBm25Statslogs()) > 0 {
+		nonEmpty = append(nonEmpty, fmt.Sprintf("bm25statslogs(%d)", len(info.GetBm25Statslogs())))
+	}
+	if len(info.GetTextStatsLogs()) > 0 {
+		nonEmpty = append(nonEmpty, fmt.Sprintf("textStatsLogs(%d)", len(info.GetTextStatsLogs())))
+	}
+	if len(info.GetJsonKeyStats()) > 0 {
+		nonEmpty = append(nonEmpty, fmt.Sprintf("jsonKeyStats(%d)", len(info.GetJsonKeyStats())))
+	}
+
+	if len(nonEmpty) > 0 {
+		return fmt.Sprintf("segment %d has manifest_path but non-empty legacy stats fields: %v",
+			info.GetID(), nonEmpty)
+	}
+	return ""
+}

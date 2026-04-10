@@ -16,13 +16,20 @@
 
 #pragma once
 
-#include <string>
+#include <ctype.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
 #include <map>
-#include <google/protobuf/text_format.h>
-#include <google/protobuf/repeated_field.h>
+#include <optional>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
-#include "pb/schema.pb.h"
 #include "common/EasyAssert.h"
+#include "pb/common.pb.h"
 
 using std::string;
 
@@ -32,7 +39,7 @@ template <typename T>
 using ProtoRepeated = google::protobuf::RepeatedPtrField<T>;
 using ProtoParams = ProtoRepeated<proto::common::KeyValuePair>;
 
-static std::map<string, string>
+[[maybe_unused]] static std::map<string, string>
 RepeatedKeyValToMap(
     const google::protobuf::RepeatedPtrField<proto::common::KeyValuePair>&
         kvs) {
@@ -45,7 +52,53 @@ RepeatedKeyValToMap(
     return mapping;
 }
 
+/**
+ * @brief Get a boolean value from repeated KeyValuePair by key.
+ *
+ * @param kvs The repeated KeyValuePair field to search.
+ * @param key The key to look for.
+ * @return std::pair<bool, bool> where:
+ *         - first: whether the key was found.
+ *         - second: the parsed boolean value (true if value is "true", case-insensitive).
+ */
+[[maybe_unused]] static std::pair<bool, bool>
+GetBoolFromRepeatedKVs(
+    const google::protobuf::RepeatedPtrField<proto::common::KeyValuePair>& kvs,
+    const std::string& key) {
+    for (auto& kv : kvs) {
+        if (kv.key() == key) {
+            std::string lower;
+            std::transform(kv.value().begin(),
+                           kv.value().end(),
+                           std::back_inserter(lower),
+                           ::tolower);
+            return {true, lower == "true"};
+        }
+    }
+    return {false, false};
+}
+
+/**
+ * @brief Get a string value from repeated KeyValuePair by key.
+ *
+ * @param kvs The repeated KeyValuePair field to search.
+ * @param key The key to look for.
+ * @return std::optional<std::string> containing the value if found, std::nullopt otherwise.
+ */
+[[maybe_unused]] static std::optional<std::string>
+GetStringFromRepeatedKVs(
+    const google::protobuf::RepeatedPtrField<proto::common::KeyValuePair>& kvs,
+    const std::string& key) {
+    for (const auto& kv : kvs) {
+        if (kv.key() == key) {
+            return kv.value();
+        }
+    }
+    return std::nullopt;
+}
+
 class ProtoLayout;
+
 using ProtoLayoutPtr = std::unique_ptr<ProtoLayout>;
 
 // ProtoLayout is a c++ type for esaier resource management at C-side.

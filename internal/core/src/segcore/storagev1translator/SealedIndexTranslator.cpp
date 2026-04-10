@@ -1,8 +1,21 @@
 #include "segcore/storagev1translator/SealedIndexTranslator.h"
-#include "index/IndexFactory.h"
-#include "segcore/load_index_c.h"
-#include "segcore/Utils.h"
+
+#include <filesystem>
 #include <utility>
+
+#include "common/EasyAssert.h"
+#include "common/common_type_c.h"
+#include "common/resource_c.h"
+#include "fmt/core.h"
+#include "glog/logging.h"
+#include "index/Index.h"
+#include "index/IndexFactory.h"
+#include "index/Meta.h"
+#include "index/Utils.h"
+#include "log/Log.h"
+#include "nlohmann/json.hpp"
+#include "segcore/Types.h"
+#include "segcore/Utils.h"
 
 namespace milvus::segcore::storagev1translator {
 
@@ -30,7 +43,8 @@ SealedIndexTranslator::SealedIndexTranslator(
                         std::to_string(load_index_info->segment_id),
                         std::to_string(load_index_info->field_id),
                         load_index_info->num_rows,
-                        load_index_info->dim}),
+                        load_index_info->dim,
+                        load_index_info->warmup_policy}),
       meta_(
           load_index_info->enable_mmap
               ? milvus::cachinglayer::StorageType::DISK
@@ -47,8 +61,9 @@ SealedIndexTranslator::SealedIndexTranslator(
                index_info_.index_type, knowhere::feature::LAZY_LOAD))
               ? CacheWarmupPolicy::CacheWarmupPolicy_Sync
               : milvus::segcore::getCacheWarmupPolicy(
-                    /* is_vector */ IsVectorDataType(
-                        load_index_info->field_type),
+                    load_index_info->warmup_policy,
+                    /* is_vector */
+                    IsVectorDataType(load_index_info->field_type),
                     /* is_index */ true),
           /* support_eviction */
           // if index data supports lazy load internally, we don't need to support eviction for index metadata
@@ -96,7 +111,10 @@ SealedIndexTranslator::key() const {
 
 std::vector<std::pair<milvus::cachinglayer::cid_t,
                       std::unique_ptr<milvus::index::IndexBase>>>
-SealedIndexTranslator::get_cells(const std::vector<cid_t>& cids) {
+SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
+                                 const std::vector<cid_t>& cids) {
+    int64_t segment_id = std::stoll(index_load_info_.segment_id);
+
     std::unique_ptr<milvus::index::IndexBase> index =
         milvus::index::IndexFactory::GetInstance().CreateIndex(
             index_info_, file_manager_context_);
@@ -132,8 +150,23 @@ SealedIndexTranslator::get_cells(const std::vector<cid_t>& cids) {
         config_[milvus::index::ENABLE_MMAP] = "false";
     }
 
-    LOG_INFO("load index with configs: {}", config_.dump());
-    index->Load(ctx_, config_);
+    // Check for cancellation before loading index data
+    CheckCancellation(ctx, segment_id, "LoadIndex");
+
+    // Check scalar index engine version for V3 routing
+    auto scalar_version =
+        milvus::index::GetValueFromConfig<int32_t>(
+            config_, milvus::index::SCALAR_INDEX_ENGINE_VERSION)
+            .value_or(1);
+    if (scalar_version >= 3 && !IsVectorDataType(index_info_.field_type)) {
+        config_[milvus::index::COLLECTION_ID] =
+            file_manager_context_.fieldDataMeta.collection_id;
+        LOG_INFO("load V3 scalar index with configs: {}", config_.dump());
+        index->LoadV3(config_);
+    } else {
+        LOG_INFO("load index with configs: {}", config_.dump());
+        index->Load(ctx_, config_);
+    }
 
     std::vector<std::pair<cid_t, std::unique_ptr<milvus::index::IndexBase>>>
         result;

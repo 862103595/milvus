@@ -21,6 +21,7 @@
 #include <folly/ConcurrentSkipList.h>
 
 #include "AckResponder.h"
+#include "common/Common.h"
 #include "common/Schema.h"
 #include "common/Types.h"
 #include "segcore/Record.h"
@@ -48,6 +49,21 @@ using SortedDeleteList =
     folly::ConcurrentSkipList<std::pair<Timestamp, Offset>, Comparator>;
 
 static int32_t DELETE_PAIR_SIZE = sizeof(std::pair<Timestamp, Offset>);
+
+// atomic snapshot for fast path query optimization
+// contains a consistent view of (max_timestamp, deleted_bitset)
+struct DeleteSnapshot {
+    Timestamp max_ts{0};
+    BitsetType bitset;
+
+    DeleteSnapshot() = default;
+    DeleteSnapshot(Timestamp ts, BitsetType&& b)
+        : max_ts(ts), bitset(std::move(b)) {
+    }
+    DeleteSnapshot(Timestamp ts, const BitsetType& b)
+        : max_ts(ts), bitset(b.clone()) {
+    }
+};
 
 template <bool is_sealed = false>
 class DeletedRecord {
@@ -103,7 +119,11 @@ class DeletedRecord {
             return;
         }
 
-        InternalPush(pks, timestamps);
+        auto max_ts = InternalPush(pks, timestamps);
+
+        if (ENABLE_LATEST_DELETE_SNAPSHOT_OPTIMIZATION.load()) {
+            UpdateLatestSnapshot(max_ts);
+        }
 
         bool can_dump = timestamps[0] >= max_load_timestamp_;
         if (can_dump) {
@@ -144,7 +164,7 @@ class DeletedRecord {
                     deleted_mask_.set(row_id);
                 } else {
                     // need to add mask size firstly for growing segment
-                    deleted_mask_.resize(insert_record_->size());
+                    deleted_mask_.resize(insert_record_->row_count());
                     deleted_mask_.set(row_id);
                 }
                 removed_num++;
@@ -170,9 +190,28 @@ class DeletedRecord {
                 }
                 estimated_memory_size_ = new_estimated_size;
             }
+        } else {
+            // The resource usage of DeletedRecord for a Growing Segment is already counted in
+            // SegmentGrowingImpl::EstimateSegmentResourceUsage(), so there is no need to count it here.
+            // The reason we don't count it here is that we treat the Growing Segment as a single unit,
+            // we do not track memory separately for each field.
+            // If you intend to add this tracking here, first consider how to count the memory usage separately
+            // within the growing segment.
         }
 
         return max_timestamp;
+    }
+
+    // update the atomic snapshot with current deleted_mask_ and max timestamp
+    // this ensures a consistent view for fast path query
+    void
+    UpdateLatestSnapshot(Timestamp new_max_ts) {
+        std::lock_guard<std::mutex> lock(snapshot_update_mutex_);
+
+        auto new_snapshot =
+            std::make_shared<const DeleteSnapshot>(new_max_ts, deleted_mask_);
+
+        std::atomic_store(&latest_snapshot_, new_snapshot);
     }
 
     void
@@ -186,7 +225,17 @@ class DeletedRecord {
             return;
         }
 
-        // try use snapshot to skip iterations
+        // fast path: use atomic snapshot when query_timestamp >= max_delete_timestamp
+        // this avoids traversing the SkipList entirely
+        auto snapshot = std::atomic_load(&latest_snapshot_);
+        if (snapshot && snapshot->max_ts > 0 &&
+            query_timestamp >= snapshot->max_ts) {
+            auto or_size = std::min({snapshot->bitset.size(), bitset.size()});
+            bitset.inplace_or_with_count(snapshot->bitset, or_size);
+            return;
+        }
+
+        // slow path: try use snapshot to skip iterations
         bool hit_snapshot = false;
         SortedDeleteList::iterator next_iter;
         {
@@ -198,7 +247,8 @@ class DeletedRecord {
                     loc--;
                 }
                 if (loc >= 0) {
-                    next_iter = snap_next_iter_[loc];
+                    // use lower_bound to relocate the iterator in current accessor
+                    next_iter = accessor.lower_bound(snap_next_pos_[loc]);
                     auto or_size =
                         std::min(snapshots_[loc].second.size(), bitset.size());
                     bitset.inplace_or_with_count(snapshots_[loc].second,
@@ -244,19 +294,19 @@ class DeletedRecord {
             if constexpr (is_sealed) {
                 bitsize = sealed_row_count_;
             } else {
-                bitsize = insert_record_->size();
+                bitsize = insert_record_->row_count();
             }
             BitsetType bitmap(bitsize, false);
 
             auto it = accessor.begin();
             Timestamp last_dump_ts = 0;
             if (!snapshots_.empty()) {
-                it = snap_next_iter_.back();
-                last_dump_ts = snapshots_.back().first;
+                it = accessor.lower_bound(snap_next_pos_.back());
                 bitmap.inplace_or_with_count(snapshots_.back().second,
                                              snapshots_.back().second.size());
             }
 
+            bool need_rebuild = false;
             while (total_size - dumped_entry_count_.load() >
                        DELETE_DUMP_BATCH_SIZE &&
                    it != accessor.end()) {
@@ -269,18 +319,28 @@ class DeletedRecord {
                     dump_ts = it->first;
                 }
 
+                if (it == accessor.end() || !it.good()) {
+                    // Iterator exhausted before expected: elements
+                    // were inserted before cursor (same timestamp,
+                    // smaller row_id), making existing snapshots
+                    // incorrect — those deletes are missing from
+                    // the bitmap. Discard all snapshots and rebuild
+                    // from scratch.
+                    need_rebuild = true;
+                    break;
+                }
+
                 {
                     std::unique_lock<std::shared_mutex> lock(snap_lock_);
                     if (dump_ts == last_dump_ts) {
                         // only update
-                        snapshots_.back().second = std::move(bitmap.clone());
-                        snap_next_iter_.back() = it;
+                        snapshots_.back().second = bitmap.clone();
+                        snap_next_pos_.back() = *it;
                     } else {
                         // add new snapshot
                         snapshots_.push_back(
                             std::make_pair(dump_ts, bitmap.clone()));
-                        Assert(it != accessor.end() && it.good());
-                        snap_next_iter_.push_back(it);
+                        snap_next_pos_.push_back(*it);
                     }
                 }
 
@@ -295,6 +355,27 @@ class DeletedRecord {
                     snapshots_.size(),
                     segment_id_);
                 last_dump_ts = dump_ts;
+            }
+
+            if (need_rebuild) {
+                {
+                    std::unique_lock<std::shared_mutex> lock(snap_lock_);
+                    auto old_size = snapshots_.size();
+                    snapshots_.clear();
+                    snap_next_pos_.clear();
+                    dumped_entry_count_.store(0);
+                    LOG_INFO(
+                        "dump delete record snapshot detected elements "
+                        "before cursor, discarded {} snapshots and "
+                        "rebuilding from scratch, total size: {} "
+                        "for segment: {}",
+                        old_size,
+                        total_size,
+                        segment_id_);
+                }
+                // Continue outer loop — next iteration rebuilds
+                // from accessor.begin() with empty snapshots.
+                continue;
             }
         }
     }
@@ -346,12 +427,19 @@ class DeletedRecord {
     // dump snapshot low frequency
     mutable std::shared_mutex snap_lock_;
     std::vector<std::pair<Timestamp, BitsetType>> snapshots_;
-    // next delete record iterator that follows every snapshot
-    std::vector<SortedDeleteList::iterator> snap_next_iter_;
+    // next delete record position that follows every snapshot
+    // store position (timestamp, offset)
+    std::vector<std::pair<Timestamp, Offset>> snap_next_pos_;
     // total number of delete entries that have been incorporated into snapshots
     std::atomic<int64_t> dumped_entry_count_{0};
     // estimated memory size of DeletedRecord, only used for sealed segment
     int64_t estimated_memory_size_{0};
+
+    // atomic snapshot for fast path query optimization
+    // when query_timestamp >= snapshot.max_ts, we can directly use the bitset
+    // without traversing the SkipList
+    std::shared_ptr<const DeleteSnapshot> latest_snapshot_;
+    mutable std::mutex snapshot_update_mutex_;
 };
 
 }  // namespace milvus::segcore

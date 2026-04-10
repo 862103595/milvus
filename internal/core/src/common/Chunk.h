@@ -11,33 +11,66 @@
 
 #pragma once
 
-#include <sys/types.h>
+#include <unistd.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
-#include "arrow/array/array_base.h"
-#include "arrow/record_batch.h"
-#include "common/Array.h"
-#include "common/File.h"
-#include "common/VectorArray.h"
-#include "common/ChunkTarget.h"
-#include "common/EasyAssert.h"
-#include "common/FieldDataInterface.h"
-#include "common/Json.h"
-#include "common/Span.h"
-#include "knowhere/sparse_utils.h"
-#include "simdjson/common_defs.h"
-#include "sys/mman.h"
-#include "common/Types.h"
+
 #include "cachinglayer/Utils.h"
+#include "common/Array.h"
+#include "common/EasyAssert.h"
+#include "common/Span.h"
+#include "common/TypeTraits.h"
+#include "common/Types.h"
+#include "common/VectorArray.h"
+#include "folly/FBVector.h"
+#include "knowhere/sparse_utils.h"
+#include "sys/mman.h"
 
 namespace milvus {
 constexpr uint64_t MMAP_STRING_PADDING = 1;
 constexpr uint64_t MMAP_GEOMETRY_PADDING = 1;
 constexpr uint64_t MMAP_ARRAY_PADDING = 1;
+
+// Shared mmap region manager for group chunks
+class ChunkMmapGuard {
+ public:
+    ChunkMmapGuard(char* mmap_ptr, size_t mmap_size, std::string file_path)
+        : mmap_ptr_(mmap_ptr), mmap_size_(mmap_size), file_path_(file_path) {
+    }
+
+    ~ChunkMmapGuard() {
+        if (mmap_ptr_ != nullptr) {
+            munmap(mmap_ptr_, mmap_size_);
+        }
+        if (!file_path_.empty()) {
+            unlink(file_path_.c_str());
+        }
+    }
+
+    char*
+    get_ptr() const {
+        return mmap_ptr_;
+    }
+
+    bool
+    is_file_backed() const {
+        return !file_path_.empty();
+    }
+
+ private:
+    char* mmap_ptr_;
+    size_t mmap_size_;
+    const std::string file_path_;
+};
+
 class Chunk {
  public:
     Chunk() = default;
@@ -45,12 +78,12 @@ class Chunk {
           char* data,
           uint64_t size,
           bool nullable,
-          std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
+          std::shared_ptr<ChunkMmapGuard> chunk_mmap_guard)
         : data_(data),
           row_nums_(row_nums),
           size_(size),
           nullable_(nullable),
-          mmap_file_raii_(std::move(mmap_file_raii)) {
+          chunk_mmap_guard_(chunk_mmap_guard) {
         if (nullable) {
             valid_.reserve(row_nums);
             for (int i = 0; i < row_nums; i++) {
@@ -59,7 +92,7 @@ class Chunk {
         }
     }
     virtual ~Chunk() {
-        munmap(data_, size_);
+        // The ChunkMmapGuard will handle the unmapping and unlinking of the file if it is file backed
     }
 
     uint64_t
@@ -69,7 +102,7 @@ class Chunk {
 
     cachinglayer::ResourceUsage
     CellByteSize() const {
-        if (mmap_file_raii_) {
+        if (chunk_mmap_guard_ && chunk_mmap_guard_->is_file_backed()) {
             return cachinglayer::ResourceUsage(0, static_cast<int64_t>(size_));
         }
         return cachinglayer::ResourceUsage(static_cast<int64_t>(size_), 0);
@@ -93,6 +126,11 @@ class Chunk {
         return data_;
     }
 
+    FixedVector<bool>&
+    Valid() {
+        return valid_;
+    }
+
     virtual bool
     isValid(int offset) const {
         if (nullable_) {
@@ -109,7 +147,7 @@ class Chunk {
     FixedVector<bool>
         valid_;  // parse null bitmap to valid_ to be compatible with SpanBase
 
-    std::unique_ptr<MmapFileRAII> mmap_file_raii_;
+    std::shared_ptr<ChunkMmapGuard> chunk_mmap_guard_{nullptr};
 };
 
 // for fixed size data, includes fixed size array
@@ -121,8 +159,8 @@ class FixedWidthChunk : public Chunk {
                     uint64_t size,
                     uint64_t element_size,
                     bool nullable,
-                    std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
-        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)),
+                    std::shared_ptr<ChunkMmapGuard> chunk_mmap_guard)
+        : Chunk(row_nums, data, size, nullable, chunk_mmap_guard),
           dim_(dim),
           element_size_(element_size) {
         auto null_bitmap_bytes_num = nullable_ ? (row_nums_ + 7) / 8 : 0;
@@ -181,8 +219,8 @@ class StringChunk : public Chunk {
                 char* data,
                 uint64_t size,
                 bool nullable,
-                std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
-        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)) {
+                std::shared_ptr<ChunkMmapGuard> chunk_mmap_guard)
+        : Chunk(row_nums, data, size, nullable, chunk_mmap_guard) {
         auto null_bitmap_bytes_num = nullable_ ? (row_nums_ + 7) / 8 : 0;
         offsets_ = reinterpret_cast<uint32_t*>(data + null_bitmap_bytes_num);
     }
@@ -314,8 +352,8 @@ class ArrayChunk : public Chunk {
                uint64_t size,
                milvus::DataType element_type,
                bool nullable,
-               std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
-        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)),
+               std::shared_ptr<ChunkMmapGuard> chunk_mmap_guard)
+        : Chunk(row_nums, data, size, nullable, chunk_mmap_guard),
           element_type_(element_type) {
         auto null_bitmap_bytes_num = 0;
         if (nullable) {
@@ -431,8 +469,8 @@ class VectorArrayChunk : public Chunk {
                      char* data,
                      uint64_t size,
                      milvus::DataType element_type,
-                     std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
-        : Chunk(row_nums, data, size, false, std::move(mmap_file_raii)),
+                     std::shared_ptr<ChunkMmapGuard> chunk_mmap_guard)
+        : Chunk(row_nums, data, size, false, chunk_mmap_guard),
           dim_(dim),
           element_type_(element_type) {
         offsets_lens_ = reinterpret_cast<uint32_t*>(data);
@@ -520,24 +558,38 @@ class VectorArrayChunk : public Chunk {
 
 class SparseFloatVectorChunk : public Chunk {
  public:
-    SparseFloatVectorChunk(
-        int32_t row_nums,
-        char* data,
-        uint64_t size,
-        bool nullable,
-        std::unique_ptr<MmapFileRAII> mmap_file_raii = nullptr)
-        : Chunk(row_nums, data, size, nullable, std::move(mmap_file_raii)) {
-        vec_.resize(row_nums);
-        auto null_bitmap_bytes_num = (row_nums + 7) / 8;
+    SparseFloatVectorChunk(int32_t row_nums,
+                           char* data,
+                           uint64_t size,
+                           bool nullable,
+                           std::shared_ptr<ChunkMmapGuard> chunk_mmap_guard)
+        : Chunk(row_nums, data, size, nullable, chunk_mmap_guard) {
+        auto null_bitmap_bytes_num = nullable ? (row_nums + 7) / 8 : 0;
         auto offsets_ptr =
             reinterpret_cast<uint64_t*>(data + null_bitmap_bytes_num);
-        for (int i = 0; i < row_nums; i++) {
-            vec_[i] = {(offsets_ptr[i + 1] - offsets_ptr[i]) /
-                           knowhere::sparse::SparseRow<
-                               SparseValueType>::element_size(),
-                       reinterpret_cast<uint8_t*>(data + offsets_ptr[i]),
-                       false};
-            dim_ = std::max(dim_, vec_[i].dim());
+
+        if (nullable_) {
+            for (int i = 0; i < row_nums; i++) {
+                if (isValid(i)) {
+                    vec_.emplace_back(
+                        (offsets_ptr[i + 1] - offsets_ptr[i]) /
+                            knowhere::sparse::SparseRow<
+                                SparseValueType>::element_size(),
+                        reinterpret_cast<uint8_t*>(data + offsets_ptr[i]),
+                        false);
+                    dim_ = std::max(dim_, vec_.back().dim());
+                }
+            }
+        } else {
+            vec_.resize(row_nums);
+            for (int i = 0; i < row_nums; i++) {
+                vec_[i] = {(offsets_ptr[i + 1] - offsets_ptr[i]) /
+                               knowhere::sparse::SparseRow<
+                                   SparseValueType>::element_size(),
+                           reinterpret_cast<uint8_t*>(data + offsets_ptr[i]),
+                           false};
+                dim_ = std::max(dim_, vec_[i].dim());
+            }
         }
     }
 

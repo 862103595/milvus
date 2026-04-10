@@ -19,6 +19,7 @@
 package embedding
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -60,6 +61,25 @@ func (s *VertexAITextEmbeddingProviderSuite) SetupTest() {
 	}
 }
 
+func createVertexAIGeminiProvider(url string, schema *schemapb.FieldSchema) (textEmbeddingProvider, error) {
+	functionSchema := &schemapb.FunctionSchema{
+		Name:             "test",
+		Type:             schemapb.FunctionType_Unknown,
+		InputFieldNames:  []string{"text"},
+		OutputFieldNames: []string{"vector"},
+		InputFieldIds:    []int64{101},
+		OutputFieldIds:   []int64{102},
+		Params: []*commonpb.KeyValuePair{
+			{Key: models.ModelNameParamKey, Value: "gemini-embedding-2-preview"},
+			{Key: models.LocationParamKey, Value: "mock_local"},
+			{Key: models.ProjectIDParamKey, Value: "mock_id"},
+			{Key: models.DimParamKey, Value: "4"},
+		},
+	}
+	mockClient := vertexai.NewVertexAIEmbedding(url, []byte{1, 2, 3}, "mock scope", "mock token")
+	return NewVertexAIEmbeddingProvider(schema, functionSchema, mockClient, map[string]string{models.URLParamKey: url}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db", BatchFactor: 5})
+}
+
 func createVertexAIProvider(url string, schema *schemapb.FieldSchema) (textEmbeddingProvider, error) {
 	functionSchema := &schemapb.FunctionSchema{
 		Name:             "test",
@@ -78,7 +98,7 @@ func createVertexAIProvider(url string, schema *schemapb.FieldSchema) (textEmbed
 		},
 	}
 	mockClient := vertexai.NewVertexAIEmbedding(url, []byte{1, 2, 3}, "mock scope", "mock token")
-	return NewVertexAIEmbeddingProvider(schema, functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}))
+	return NewVertexAIEmbeddingProvider(schema, functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db", BatchFactor: 5})
 }
 
 func (s *VertexAITextEmbeddingProviderSuite) TestEmbedding() {
@@ -89,7 +109,7 @@ func (s *VertexAITextEmbeddingProviderSuite) TestEmbedding() {
 	s.NoError(err)
 	{
 		data := []string{"sentence"}
-		r, err2 := provder.CallEmbedding(data, models.InsertMode)
+		r, err2 := provder.CallEmbedding(context.Background(), data, models.InsertMode)
 		ret := r.([][]float32)
 		s.NoError(err2)
 		s.Equal(1, len(ret))
@@ -98,7 +118,7 @@ func (s *VertexAITextEmbeddingProviderSuite) TestEmbedding() {
 	}
 	{
 		data := []string{"sentence 1", "sentence 2", "sentence 3"}
-		ret, _ := provder.CallEmbedding(data, models.SearchMode)
+		ret, _ := provder.CallEmbedding(context.Background(), data, models.SearchMode)
 		s.Equal([][]float32{{0.0, 1.0, 2.0, 3.0}, {1.0, 2.0, 3.0, 4.0}, {2.0, 3.0, 4.0, 5.0}}, ret)
 	}
 }
@@ -140,7 +160,7 @@ func (s *VertexAITextEmbeddingProviderSuite) TestEmbeddingDimNotMatch() {
 
 	// embedding dim not match
 	data := []string{"sentence", "sentence"}
-	_, err2 := provder.CallEmbedding(data, models.InsertMode)
+	_, err2 := provder.CallEmbedding(context.Background(), data, models.InsertMode)
 	s.Error(err2)
 }
 
@@ -172,7 +192,7 @@ func (s *VertexAITextEmbeddingProviderSuite) TestEmbeddingNubmerNotMatch() {
 
 	// embedding dim not match
 	data := []string{"sentence", "sentence2"}
-	_, err2 := provder.CallEmbedding(data, models.InsertMode)
+	_, err2 := provder.CallEmbedding(context.Background(), data, models.InsertMode)
 	s.Error(err2)
 }
 
@@ -200,7 +220,7 @@ func (s *VertexAITextEmbeddingProviderSuite) TestGetTaskType() {
 	mockClient := vertexai.NewVertexAIEmbedding("mock_url", []byte{1, 2, 3}, "mock scope", "mock token")
 
 	{
-		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}))
+		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db"})
 		s.NoError(err)
 		s.Equal(provider.getTaskType(models.InsertMode), "RETRIEVAL_DOCUMENT")
 		s.Equal(provider.getTaskType(models.SearchMode), "RETRIEVAL_QUERY")
@@ -208,7 +228,7 @@ func (s *VertexAITextEmbeddingProviderSuite) TestGetTaskType() {
 
 	{
 		functionSchema.Params = append(functionSchema.Params, &commonpb.KeyValuePair{Key: models.TaskTypeParamKey, Value: vertexAICodeRetrival})
-		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}))
+		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db"})
 		s.NoError(err)
 		s.Equal(provider.getTaskType(models.InsertMode), "RETRIEVAL_DOCUMENT")
 		s.Equal(provider.getTaskType(models.SearchMode), "CODE_RETRIEVAL_QUERY")
@@ -216,7 +236,7 @@ func (s *VertexAITextEmbeddingProviderSuite) TestGetTaskType() {
 
 	{
 		functionSchema.Params[3] = &commonpb.KeyValuePair{Key: models.TaskTypeParamKey, Value: vertexAISTS}
-		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}))
+		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db"})
 		s.NoError(err)
 		s.Equal(provider.getTaskType(models.InsertMode), "SEMANTIC_SIMILARITY")
 		s.Equal(provider.getTaskType(models.SearchMode), "SEMANTIC_SIMILARITY")
@@ -238,10 +258,102 @@ func (s *VertexAITextEmbeddingProviderSuite) TestNewVertexAIEmbeddingProvider() 
 		},
 	}
 	mockClient := vertexai.NewVertexAIEmbedding("mock_url", []byte{1, 2, 3}, "mock scope", "mock token")
-	provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}))
+	provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db", BatchFactor: 5})
 	s.NoError(err)
 	s.True(provider.MaxBatch() > 0)
 	s.Equal(provider.FieldDim(), int64(4))
+}
+
+func (s *VertexAITextEmbeddingProviderSuite) TestGeminiEmbedding() {
+	ts := CreateVertexAIGeminiEmbeddingServer()
+	defer ts.Close()
+	provider, err := createVertexAIGeminiProvider(ts.URL, s.schema.Fields[2])
+	s.NoError(err)
+	{
+		data := []string{"sentence"}
+		r, err2 := provider.CallEmbedding(context.Background(), data, models.InsertMode)
+		ret := r.([][]float32)
+		s.NoError(err2)
+		s.Equal(1, len(ret))
+		s.Equal(4, len(ret[0]))
+		s.Equal([]float32{0.0, 1.0, 2.0, 3.0}, ret[0])
+	}
+	{
+		// counter continues from 1 (previous call used 0)
+		data := []string{"sentence 1", "sentence 2", "sentence 3"}
+		ret, _ := provider.CallEmbedding(context.Background(), data, models.SearchMode)
+		s.Equal([][]float32{{1.0, 2.0, 3.0, 4.0}, {2.0, 3.0, 4.0, 5.0}, {3.0, 4.0, 5.0, 6.0}}, ret)
+	}
+}
+
+func (s *VertexAITextEmbeddingProviderSuite) TestGeminiEmbeddingDimNotMatch() {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		res := vertexai.GeminiEmbedContentResponse{
+			Embedding: vertexai.GeminiEmbeddingValues{
+				Values: []float32{1.0, 1.0},
+			},
+		}
+		w.WriteHeader(http.StatusOK)
+		data, _ := json.Marshal(res)
+		w.Write(data)
+	}))
+	defer ts.Close()
+	provider, err := createVertexAIGeminiProvider(ts.URL, s.schema.Fields[2])
+	s.NoError(err)
+	data := []string{"sentence"}
+	_, err2 := provider.CallEmbedding(context.Background(), data, models.InsertMode)
+	s.Error(err2)
+}
+
+func (s *VertexAITextEmbeddingProviderSuite) TestGeminiEmbeddingError() {
+	ts := CreateErrorEmbeddingServer()
+	defer ts.Close()
+	provider, err := createVertexAIGeminiProvider(ts.URL, s.schema.Fields[2])
+	s.NoError(err)
+	data := []string{"sentence"}
+	_, err2 := provider.CallEmbedding(context.Background(), data, models.InsertMode)
+	s.Error(err2)
+}
+
+func (s *VertexAITextEmbeddingProviderSuite) TestIsGeminiModel() {
+	s.True(isGeminiModel("gemini-embedding-2-preview"))
+	s.True(isGeminiModel("gemini-embedding-2-0"))
+	s.False(isGeminiModel("gemini-embedding-001"))
+	s.False(isGeminiModel("text-embedding-004"))
+	s.False(isGeminiModel("textembedding-gecko"))
+}
+
+func (s *VertexAITextEmbeddingProviderSuite) TestGeminiGetTaskType() {
+	functionSchema := &schemapb.FunctionSchema{
+		Name:             "test",
+		Type:             schemapb.FunctionType_Unknown,
+		InputFieldNames:  []string{"text"},
+		OutputFieldNames: []string{"vector"},
+		InputFieldIds:    []int64{101},
+		OutputFieldIds:   []int64{102},
+		Params: []*commonpb.KeyValuePair{
+			{Key: models.ModelNameParamKey, Value: "gemini-embedding-2-preview"},
+			{Key: models.ProjectIDParamKey, Value: "mock_id"},
+			{Key: models.DimParamKey, Value: "4"},
+		},
+	}
+	mockClient := vertexai.NewVertexAIEmbedding("mock_url", []byte{1, 2, 3}, "mock scope", "mock token")
+
+	{
+		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db"})
+		s.NoError(err)
+		s.True(provider.isGemini)
+		s.Equal("RETRIEVAL_DOCUMENT", provider.getTaskType(models.InsertMode))
+		s.Equal("RETRIEVAL_QUERY", provider.getTaskType(models.SearchMode))
+	}
+
+	{
+		functionSchema.Params = append(functionSchema.Params, &commonpb.KeyValuePair{Key: models.TaskTypeParamKey, Value: "SEMANTIC_SIMILARITY"})
+		provider, err := NewVertexAIEmbeddingProvider(s.schema.Fields[2], functionSchema, mockClient, map[string]string{}, credentials.NewCredentials(map[string]string{"mock.credential_json": "mock"}), &models.ModelExtraInfo{ClusterID: "test-cluster", DBName: "test-db"})
+		s.NoError(err)
+		s.Equal("SEMANTIC_SIMILARITY", provider.getTaskType(models.InsertMode))
+		s.Equal("SEMANTIC_SIMILARITY", provider.getTaskType(models.SearchMode))
+	}
 }
 
 func (s *VertexAITextEmbeddingProviderSuite) TestParseCredentail() {

@@ -23,7 +23,6 @@ import (
 	"io"
 	"math/rand"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -33,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/storage"
+	importcommon "github.com/milvus-io/milvus/internal/util/importutilv2/common"
 	"github.com/milvus-io/milvus/internal/util/testutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
@@ -40,16 +40,8 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
-type mockReader struct {
-	io.Reader
-	io.Closer
-	io.ReaderAt
-	io.Seeker
-	size int64
-}
-
-func (mr *mockReader) Size() (int64, error) {
-	return mr.size, nil
+func init() {
+	paramtable.Init()
 }
 
 type ReaderSuite struct {
@@ -60,17 +52,13 @@ type ReaderSuite struct {
 	vecDataType schemapb.DataType
 }
 
-func (suite *ReaderSuite) SetupSuite() {
-	paramtable.Get().Init(paramtable.NewBaseTable())
-}
-
 func (suite *ReaderSuite) SetupTest() {
 	suite.numRows = 100
 	suite.pkDataType = schemapb.DataType_Int64
 	suite.vecDataType = schemapb.DataType_FloatVector
 }
 
-func (suite *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.DataType, nullable bool) {
+func (suite *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.DataType, nullable bool, nullPercent int) {
 	schema := &schemapb.CollectionSchema{
 		Fields: []*schemapb.FieldSchema{
 			{
@@ -95,6 +83,7 @@ func (suite *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.Data
 						Value: "8",
 					},
 				},
+				Nullable: nullable,
 			},
 			{
 				FieldID:     102,
@@ -141,7 +130,7 @@ func (suite *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.Data
 	nullkey := ""
 
 	// generate csv data
-	insertData, err := testutil.CreateInsertData(schema, suite.numRows)
+	insertData, err := testutil.CreateInsertData(schema, suite.numRows, nullPercent)
 	suite.NoError(err)
 	csvData, err := testutil.CreateInsertDataForCSV(schema, insertData, nullkey)
 	suite.NoError(err)
@@ -158,7 +147,7 @@ func (suite *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.Data
 
 	// read from csv file
 	ctx := context.Background()
-	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath("/tmp/milvus_test/test_csv_reader/"))
+	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath(suite.T().TempDir()+"/"))
 	cm, err := f.NewPersistentStorageChunkManager(ctx)
 	suite.NoError(err)
 
@@ -190,65 +179,60 @@ func (suite *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.Data
 }
 
 func (suite *ReaderSuite) TestReadScalarFields() {
-	suite.run(schemapb.DataType_Bool, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_Int8, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_Int16, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_Int64, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_Float, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_Double, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_String, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_VarChar, schemapb.DataType_None, false)
-	suite.run(schemapb.DataType_JSON, schemapb.DataType_None, false)
+	elementTypes := []schemapb.DataType{
+		schemapb.DataType_Bool,
+		schemapb.DataType_Int8,
+		schemapb.DataType_Int16,
+		schemapb.DataType_Int32,
+		schemapb.DataType_Int64,
+		schemapb.DataType_Float,
+		schemapb.DataType_Double,
+		schemapb.DataType_String,
+	}
+	scalarTypes := append(elementTypes, []schemapb.DataType{schemapb.DataType_VarChar, schemapb.DataType_JSON, schemapb.DataType_Array}...)
 
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Bool, false)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int8, false)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int16, false)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int32, false)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int64, false)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Float, false)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Double, false)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_String, false)
-
-	suite.run(schemapb.DataType_Bool, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_Int8, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_Int16, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_Int64, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_Float, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_Double, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_String, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_VarChar, schemapb.DataType_None, true)
-	suite.run(schemapb.DataType_JSON, schemapb.DataType_None, true)
-
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Bool, true)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int8, true)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int16, true)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int32, true)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Int64, true)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Float, true)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_Double, true)
-	suite.run(schemapb.DataType_Array, schemapb.DataType_String, true)
+	for _, dataType := range scalarTypes {
+		if dataType == schemapb.DataType_Array {
+			for _, elementType := range elementTypes {
+				suite.run(dataType, elementType, false, 0)
+				for _, nullPercent := range []int{0, 50, 100} {
+					suite.run(dataType, elementType, true, nullPercent)
+				}
+			}
+		} else {
+			suite.run(dataType, schemapb.DataType_None, false, 0)
+			for _, nullPercent := range []int{0, 50, 100} {
+				suite.run(dataType, schemapb.DataType_None, true, nullPercent)
+			}
+		}
+	}
 }
 
 func (suite *ReaderSuite) TestStringPK() {
 	suite.pkDataType = schemapb.DataType_VarChar
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
+	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
+	for _, nullPercent := range []int{0, 50, 100} {
+		suite.run(schemapb.DataType_Int32, schemapb.DataType_None, true, nullPercent)
+	}
 }
 
 func (suite *ReaderSuite) TestVector() {
-	suite.vecDataType = schemapb.DataType_BinaryVector
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
-	suite.vecDataType = schemapb.DataType_FloatVector
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
-	suite.vecDataType = schemapb.DataType_Float16Vector
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
-	suite.vecDataType = schemapb.DataType_BFloat16Vector
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
-	suite.vecDataType = schemapb.DataType_SparseFloatVector
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
-	suite.vecDataType = schemapb.DataType_Int8Vector
-	suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false)
+	dataTypes := []schemapb.DataType{
+		schemapb.DataType_BinaryVector,
+		schemapb.DataType_FloatVector,
+		schemapb.DataType_Float16Vector,
+		schemapb.DataType_BFloat16Vector,
+		schemapb.DataType_SparseFloatVector,
+		schemapb.DataType_Int8Vector,
+	}
+
+	for _, dataType := range dataTypes {
+		suite.vecDataType = dataType
+		suite.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
+		for _, nullPercent := range []int{0, 50, 100} {
+			suite.run(schemapb.DataType_Int32, schemapb.DataType_None, true, nullPercent)
+		}
+	}
 }
 
 func (suite *ReaderSuite) TestError() {
@@ -258,7 +242,7 @@ func (suite *ReaderSuite) TestError() {
 			if ioErr != nil {
 				return nil, ioErr
 			} else {
-				r := &mockReader{Reader: strings.NewReader(content)}
+				r := importcommon.NewMockReader(content)
 				return r, nil
 			}
 		})
@@ -291,7 +275,7 @@ func (suite *ReaderSuite) TestError() {
 	testReadErr := func(schema *schemapb.CollectionSchema, content string) {
 		cm := mocks.NewChunkManager(suite.T())
 		cm.EXPECT().Reader(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, s string) (storage.FileReader, error) {
-			r := &mockReader{Reader: strings.NewReader(content)}
+			r := importcommon.NewMockReader(content)
 			return r, nil
 		})
 		cm.EXPECT().Size(mock.Anything, mock.Anything).Return(128, nil)
@@ -331,11 +315,7 @@ func (suite *ReaderSuite) TestReadLoop() {
 
 	cm := mocks.NewChunkManager(suite.T())
 	cm.EXPECT().Reader(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, s string) (storage.FileReader, error) {
-		reader := strings.NewReader(content)
-		r := &mockReader{
-			Reader: reader,
-			Closer: io.NopCloser(reader),
-		}
+		r := importcommon.NewMockReader(content)
 		return r, nil
 	})
 	cm.EXPECT().Size(mock.Anything, mock.Anything).Return(128, nil)
@@ -398,8 +378,7 @@ func (suite *ReaderSuite) TestAllowInsertAutoID_KeepUserPK() {
 	{
 		cm := mocks.NewChunkManager(suite.T())
 		cm.EXPECT().Reader(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, s string) (storage.FileReader, error) {
-			reader := strings.NewReader(content)
-			r := &mockReader{Reader: reader, Closer: io.NopCloser(reader)}
+			r := importcommon.NewMockReader(content)
 			return r, nil
 		})
 		_, err := NewReader(context.Background(), cm, schema, "dummy path", 1024, ',', "")
@@ -412,8 +391,7 @@ func (suite *ReaderSuite) TestAllowInsertAutoID_KeepUserPK() {
 		schema.Properties = []*commonpb.KeyValuePair{{Key: common.AllowInsertAutoIDKey, Value: "true"}}
 		cm := mocks.NewChunkManager(suite.T())
 		cm.EXPECT().Reader(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, s string) (storage.FileReader, error) {
-			reader := strings.NewReader(content)
-			r := &mockReader{Reader: reader, Closer: io.NopCloser(reader)}
+			r := importcommon.NewMockReader(content)
 			return r, nil
 		})
 		reader, err := NewReader(context.Background(), cm, schema, "dummy path", 1024, ',', "")
@@ -421,5 +399,90 @@ func (suite *ReaderSuite) TestAllowInsertAutoID_KeepUserPK() {
 		// call Read once to ensure parsing proceeds
 		_, err = reader.Read()
 		suite.NoError(err)
+	}
+}
+
+func (suite *ReaderSuite) TestFunctionOutputField() {
+	// Test 1: BM25 function output NOT in CSV should be excluded from result,
+	// but nullable non-function-output field not in CSV should be retained (filled with nil).
+	{
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "pk", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{
+					FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar,
+					TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxLengthKey, Value: "128"}},
+				},
+				{FieldID: 102, Name: "sparse", DataType: schemapb.DataType_SparseFloatVector, IsFunctionOutput: true},
+				{FieldID: 103, Name: "score", DataType: schemapb.DataType_Float, Nullable: true},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Id: 1000, Name: "bm25", Type: schemapb.FunctionType_BM25,
+					InputFieldIds: []int64{101}, InputFieldNames: []string{"text"},
+					OutputFieldIds: []int64{102}, OutputFieldNames: []string{"sparse"},
+				},
+			},
+		}
+		// CSV does NOT provide "sparse" (function output) or "score" (nullable)
+		content := "pk,text\n1,hello\n2,world"
+		cm := mocks.NewChunkManager(suite.T())
+		cm.EXPECT().Reader(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, s string) (storage.FileReader, error) {
+			return importcommon.NewMockReader(content), nil
+		})
+
+		reader, err := NewReader(context.Background(), cm, schema, "dummy path", 1024, ',', "")
+		suite.NoError(err)
+		res, err := reader.Read()
+		suite.NoError(err)
+		suite.Equal(2, res.GetRowNum())
+		// BM25 function output field should be removed (not populated from CSV)
+		_, hasSparse := res.Data[102]
+		suite.False(hasSparse)
+		// Nullable non-function-output field should be retained (filled with nil, not removed)
+		scoreData, hasScore := res.Data[103]
+		suite.True(hasScore)
+		suite.Equal(2, scoreData.RowNum())
+	}
+
+	// Test 2: Non-BM25 function output in CSV with property enabled should be included
+	{
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "pk", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{
+					FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar,
+					TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxLengthKey, Value: "128"}},
+				},
+				{
+					FieldID: 102, Name: "embedding", DataType: schemapb.DataType_FloatVector, IsFunctionOutput: true,
+					TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "2"}},
+				},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Id: 1000, Name: "text_embedding", Type: schemapb.FunctionType_TextEmbedding,
+					InputFieldIds: []int64{101}, InputFieldNames: []string{"text"},
+					OutputFieldIds: []int64{102}, OutputFieldNames: []string{"embedding"},
+				},
+			},
+			Properties: []*commonpb.KeyValuePair{
+				{Key: common.CollectionAllowInsertNonBM25FunctionOutputs, Value: "true"},
+			},
+		}
+		content := "pk,text,embedding\n1,hello,\"[0.1, 0.2]\"\n2,world,\"[0.3, 0.4]\""
+		cm := mocks.NewChunkManager(suite.T())
+		cm.EXPECT().Reader(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, s string) (storage.FileReader, error) {
+			return importcommon.NewMockReader(content), nil
+		})
+
+		reader, err := NewReader(context.Background(), cm, schema, "dummy path", 1024, ',', "")
+		suite.NoError(err)
+		res, err := reader.Read()
+		suite.NoError(err)
+		suite.Equal(2, res.GetRowNum())
+		// embedding field should be present with correct data
+		suite.NotNil(res.Data[102])
+		suite.Equal(2, res.Data[102].RowNum())
 	}
 }

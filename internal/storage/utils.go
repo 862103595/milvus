@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -398,7 +399,7 @@ func RowBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *schemap
 	}
 
 	for _, field := range collSchema.Fields {
-		if skipFunction && typeutil.IsBM25FunctionOutputField(field, collSchema) {
+		if skipFunction && (typeutil.IsBM25FunctionOutputField(field, collSchema) || typeutil.IsMinHashFunctionOutputField(field, collSchema)) {
 			continue
 		}
 
@@ -550,11 +551,13 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 		Data: make(map[FieldID]FieldData),
 	}
 	length := 0
+	hasMissingFields := false
 	getFieldData := func(field *schemapb.FieldSchema) (FieldData, error) {
 		srcField, ok := srcFields[field.GetFieldID()]
 		if !ok && field.GetFieldID() >= common.StartOfUserFieldID {
-			err := fillMissingFields(collSchema, idata)
-			return nil, err
+			// Field not found in incoming message, will be handled by fillMissingFields later
+			hasMissingFields = true
+			return nil, nil
 		}
 		var fieldData FieldData
 		switch field.DataType {
@@ -566,10 +569,17 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			}
 
 			srcData := srcField.GetVectors().GetFloatVector().GetData()
-			fieldData = &FloatVectorFieldData{
-				Data: srcData,
-				Dim:  dim,
+			validData := srcField.GetValidData()
+			fd := &FloatVectorFieldData{
+				Data:      srcData,
+				Dim:       dim,
+				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
+			if len(validData) > 0 {
+				fd.L2PMapping.Build(validData, 0, len(validData))
+			}
+			fieldData = fd
 
 		case schemapb.DataType_BinaryVector:
 			dim, err := GetDimFromParams(field.TypeParams)
@@ -579,11 +589,17 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			}
 
 			srcData := srcField.GetVectors().GetBinaryVector()
-
-			fieldData = &BinaryVectorFieldData{
-				Data: srcData,
-				Dim:  dim,
+			validData := srcField.GetValidData()
+			fd := &BinaryVectorFieldData{
+				Data:      srcData,
+				Dim:       dim,
+				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
+			if len(validData) > 0 {
+				fd.L2PMapping.Build(validData, 0, len(validData))
+			}
+			fieldData = fd
 
 		case schemapb.DataType_Float16Vector:
 			dim, err := GetDimFromParams(field.TypeParams)
@@ -593,11 +609,17 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			}
 
 			srcData := srcField.GetVectors().GetFloat16Vector()
-
-			fieldData = &Float16VectorFieldData{
-				Data: srcData,
-				Dim:  dim,
+			validData := srcField.GetValidData()
+			fd := &Float16VectorFieldData{
+				Data:      srcData,
+				Dim:       dim,
+				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
+			if len(validData) > 0 {
+				fd.L2PMapping.Build(validData, 0, len(validData))
+			}
+			fieldData = fd
 
 		case schemapb.DataType_BFloat16Vector:
 			dim, err := GetDimFromParams(field.TypeParams)
@@ -607,16 +629,39 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			}
 
 			srcData := srcField.GetVectors().GetBfloat16Vector()
-
-			fieldData = &BFloat16VectorFieldData{
-				Data: srcData,
-				Dim:  dim,
+			validData := srcField.GetValidData()
+			fd := &BFloat16VectorFieldData{
+				Data:      srcData,
+				Dim:       dim,
+				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
+			if len(validData) > 0 {
+				fd.L2PMapping.Build(validData, 0, len(validData))
+			}
+			fieldData = fd
 
 		case schemapb.DataType_SparseFloatVector:
-			fieldData = &SparseFloatVectorFieldData{
-				SparseFloatArray: *srcFields[field.FieldID].GetVectors().GetSparseFloatVector(),
+			sparseArray := srcFields[field.FieldID].GetVectors().GetSparseFloatVector()
+			validData := srcField.GetValidData()
+			var contents [][]byte
+			var dim int64
+			if sparseArray != nil {
+				contents = sparseArray.GetContents()
+				dim = sparseArray.GetDim()
 			}
+			fd := &SparseFloatVectorFieldData{
+				SparseFloatArray: schemapb.SparseFloatArray{
+					Contents: contents,
+					Dim:      dim,
+				},
+				ValidData: validData,
+				Nullable:  field.GetNullable(),
+			}
+			if len(validData) > 0 {
+				fd.L2PMapping.Build(validData, 0, len(validData))
+			}
+			fieldData = fd
 
 		case schemapb.DataType_Int8Vector:
 			dim, err := GetDimFromParams(field.TypeParams)
@@ -626,10 +671,17 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			}
 
 			srcData := srcField.GetVectors().GetInt8Vector()
-			fieldData = &Int8VectorFieldData{
-				Data: lo.Map(srcData, func(v byte, _ int) int8 { return int8(v) }),
-				Dim:  dim,
+			validData := srcField.GetValidData()
+			fd := &Int8VectorFieldData{
+				Data:      lo.Map(srcData, func(v byte, _ int) int8 { return int8(v) }),
+				Dim:       dim,
+				ValidData: validData,
+				Nullable:  field.GetNullable(),
 			}
+			if len(validData) > 0 {
+				fd.L2PMapping.Build(validData, 0, len(validData))
+			}
+			fieldData = fd
 
 		case schemapb.DataType_Bool:
 			srcData := srcField.GetScalars().GetBoolData().GetData()
@@ -777,7 +829,7 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 	}
 
 	handleFieldData := func(field *schemapb.FieldSchema) (FieldData, error) {
-		if typeutil.IsBM25FunctionOutputField(field, collSchema) {
+		if typeutil.IsBM25FunctionOutputField(field, collSchema) || typeutil.IsMinHashFunctionOutputField(field, collSchema) {
 			return nil, nil
 		}
 
@@ -816,6 +868,12 @@ func ColumnBasedInsertMsgToInsertData(msg *msgstream.InsertMsg, collSchema *sche
 			if fieldData != nil {
 				idata.Data[field.FieldID] = fieldData
 			}
+		}
+	}
+	if hasMissingFields {
+		// Fill missing fields after all fields are processed
+		if err := fillMissingFields(collSchema, idata); err != nil {
+			return nil, err
 		}
 	}
 
@@ -979,54 +1037,80 @@ func mergeJSONField(data *InsertData, fid FieldID, field *JSONFieldData) {
 func mergeBinaryVectorField(data *InsertData, fid FieldID, field *BinaryVectorFieldData) {
 	if _, ok := data.Data[fid]; !ok {
 		fieldData := &BinaryVectorFieldData{
-			Data: nil,
-			Dim:  field.Dim,
+			Data:      nil,
+			Dim:       field.Dim,
+			ValidData: nil,
+			Nullable:  field.Nullable,
 		}
 		data.Data[fid] = fieldData
 	}
 	fieldData := data.Data[fid].(*BinaryVectorFieldData)
 	fieldData.Data = append(fieldData.Data, field.Data...)
+	if len(field.ValidData) > 0 {
+		fieldData.L2PMapping.Build(field.ValidData, len(fieldData.ValidData), len(field.ValidData))
+	}
+	fieldData.ValidData = append(fieldData.ValidData, field.ValidData...)
 }
 
 func mergeFloatVectorField(data *InsertData, fid FieldID, field *FloatVectorFieldData) {
 	if _, ok := data.Data[fid]; !ok {
 		fieldData := &FloatVectorFieldData{
-			Data: nil,
-			Dim:  field.Dim,
+			Data:      nil,
+			Dim:       field.Dim,
+			ValidData: nil,
+			Nullable:  field.Nullable,
 		}
 		data.Data[fid] = fieldData
 	}
 	fieldData := data.Data[fid].(*FloatVectorFieldData)
 	fieldData.Data = append(fieldData.Data, field.Data...)
+	if len(field.ValidData) > 0 {
+		fieldData.L2PMapping.Build(field.ValidData, len(fieldData.ValidData), len(field.ValidData))
+	}
+	fieldData.ValidData = append(fieldData.ValidData, field.ValidData...)
 }
 
 func mergeFloat16VectorField(data *InsertData, fid FieldID, field *Float16VectorFieldData) {
 	if _, ok := data.Data[fid]; !ok {
 		fieldData := &Float16VectorFieldData{
-			Data: nil,
-			Dim:  field.Dim,
+			Data:      nil,
+			Dim:       field.Dim,
+			ValidData: nil,
+			Nullable:  field.Nullable,
 		}
 		data.Data[fid] = fieldData
 	}
 	fieldData := data.Data[fid].(*Float16VectorFieldData)
 	fieldData.Data = append(fieldData.Data, field.Data...)
+	if len(field.ValidData) > 0 {
+		fieldData.L2PMapping.Build(field.ValidData, len(fieldData.ValidData), len(field.ValidData))
+	}
+	fieldData.ValidData = append(fieldData.ValidData, field.ValidData...)
 }
 
 func mergeBFloat16VectorField(data *InsertData, fid FieldID, field *BFloat16VectorFieldData) {
 	if _, ok := data.Data[fid]; !ok {
 		fieldData := &BFloat16VectorFieldData{
-			Data: nil,
-			Dim:  field.Dim,
+			Data:      nil,
+			Dim:       field.Dim,
+			ValidData: nil,
+			Nullable:  field.Nullable,
 		}
 		data.Data[fid] = fieldData
 	}
 	fieldData := data.Data[fid].(*BFloat16VectorFieldData)
 	fieldData.Data = append(fieldData.Data, field.Data...)
+	if len(field.ValidData) > 0 {
+		fieldData.L2PMapping.Build(field.ValidData, len(fieldData.ValidData), len(field.ValidData))
+	}
+	fieldData.ValidData = append(fieldData.ValidData, field.ValidData...)
 }
 
 func mergeSparseFloatVectorField(data *InsertData, fid FieldID, field *SparseFloatVectorFieldData) {
 	if _, ok := data.Data[fid]; !ok {
-		data.Data[fid] = &SparseFloatVectorFieldData{}
+		data.Data[fid] = &SparseFloatVectorFieldData{
+			Nullable: field.Nullable,
+		}
 	}
 	fieldData := data.Data[fid].(*SparseFloatVectorFieldData)
 	fieldData.AppendAllRows(field)
@@ -1035,13 +1119,19 @@ func mergeSparseFloatVectorField(data *InsertData, fid FieldID, field *SparseFlo
 func mergeInt8VectorField(data *InsertData, fid FieldID, field *Int8VectorFieldData) {
 	if _, ok := data.Data[fid]; !ok {
 		fieldData := &Int8VectorFieldData{
-			Data: nil,
-			Dim:  field.Dim,
+			Data:      nil,
+			Dim:       field.Dim,
+			ValidData: nil,
+			Nullable:  field.Nullable,
 		}
 		data.Data[fid] = fieldData
 	}
 	fieldData := data.Data[fid].(*Int8VectorFieldData)
 	fieldData.Data = append(fieldData.Data, field.Data...)
+	if len(field.ValidData) > 0 {
+		fieldData.L2PMapping.Build(field.ValidData, len(fieldData.ValidData), len(field.ValidData))
+	}
+	fieldData.ValidData = append(fieldData.ValidData, field.ValidData...)
 }
 
 // MergeFieldData merge field into data.
@@ -1397,6 +1487,7 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 						Dim: int64(rawData.Dim),
 					},
 				},
+				ValidData: rawData.ValidData,
 			}
 		case *BinaryVectorFieldData:
 			fieldData = &schemapb.FieldData{
@@ -1410,6 +1501,7 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 						Dim: int64(rawData.Dim),
 					},
 				},
+				ValidData: rawData.ValidData,
 			}
 		case *Float16VectorFieldData:
 			fieldData = &schemapb.FieldData{
@@ -1423,6 +1515,7 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 						Dim: int64(rawData.Dim),
 					},
 				},
+				ValidData: rawData.ValidData,
 			}
 		case *BFloat16VectorFieldData:
 			fieldData = &schemapb.FieldData{
@@ -1436,6 +1529,7 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 						Dim: int64(rawData.Dim),
 					},
 				},
+				ValidData: rawData.ValidData,
 			}
 		case *SparseFloatVectorFieldData:
 			fieldData = &schemapb.FieldData{
@@ -1448,6 +1542,7 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 						},
 					},
 				},
+				ValidData: rawData.ValidData,
 			}
 		case *Int8VectorFieldData:
 			dataBytes := arrow.Int8Traits.CastToBytes(rawData.Data)
@@ -1462,6 +1557,7 @@ func TransferInsertDataToInsertRecord(insertData *InsertData) (*segcorepb.Insert
 						Dim: int64(rawData.Dim),
 					},
 				},
+				ValidData: rawData.ValidData,
 			}
 		case *VectorArrayFieldData:
 			fieldData = &schemapb.FieldData{
@@ -1670,4 +1766,67 @@ func VectorArrayToArrowType(elementType schemapb.DataType, dim int) (arrow.DataT
 	default:
 		return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("unsupported element type in VectorArray: %s", elementType.String()))
 	}
+}
+
+func getTTLFieldID(schema *schemapb.CollectionSchema) int64 {
+	ttlFieldName := ""
+	for _, pair := range schema.GetProperties() {
+		if pair.GetKey() == common.CollectionTTLFieldKey {
+			ttlFieldName = pair.GetValue()
+			break
+		}
+	}
+	if ttlFieldName == "" {
+		return -1
+	}
+	for _, field := range schema.GetFields() {
+		if field.GetName() == ttlFieldName && field.GetDataType() == schemapb.DataType_Timestamptz {
+			return field.GetFieldID()
+		}
+	}
+	return -1
+}
+
+// calculateExpirQuantiles computes TTL values at 20%, 40%, 60%, 80%, 100% percentiles.
+// Returns nil if ttlFieldID is not enabled or no rows exist.
+// Precondition: ttlFieldValues must contain only positive values (>0); the caller is responsible
+// for filtering out null/zero TTL values which represent "never expire" rows.
+func calculateExpirQuantiles(ttlFieldID int64, rowNum int64, ttlFieldValues []int64) []int64 {
+	// If ttl field is not enabled for this writer, do not emit percentile info.
+	if ttlFieldID <= 1 {
+		return nil
+	}
+
+	// If segment is empty, do not emit percentile info.
+	if rowNum <= 0 {
+		return nil
+	}
+
+	sort.Slice(ttlFieldValues, func(i, j int) bool {
+		return ttlFieldValues[i] < ttlFieldValues[j]
+	})
+
+	// Calculate percentile indices for 20%, 40%, 60%, 80%, 100%
+	percentiles := []float64{0.2, 0.4, 0.6, 0.8, 1.0}
+	result := make([]int64, len(percentiles))
+
+	// Treat rows with null/<=0 ttl as "never expire".
+	const neverExpire = int64(^uint64(0) >> 1)
+
+	for i, p := range percentiles {
+		// Calculate index: for n elements, p percentile means ceil(n * p) elements
+		// e.g., for n=5: 20%->idx 0, 40%->idx 1, 60%->idx 2, 80%->idx 3, 100%->idx 4
+		idx := int(math.Ceil(p*float64(rowNum))) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		// If idx exceeds collected ttl values, it falls into "never expire" region.
+		if idx >= len(ttlFieldValues) {
+			result[i] = neverExpire
+			continue
+		}
+		result[i] = ttlFieldValues[idx]
+	}
+
+	return result
 }

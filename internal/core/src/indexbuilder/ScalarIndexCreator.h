@@ -11,12 +11,16 @@
 
 #pragma once
 
-#include "indexbuilder/IndexCreatorBase.h"
-#include <string>
+#include <stdint.h>
 #include <memory>
-#include <common/CDataType.h>
+#include <string>
+
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
 #include "index/Index.h"
-#include "index/ScalarIndex.h"
+#include "index/IndexStats.h"
+#include "indexbuilder/IndexCreatorBase.h"
+#include "storage/FileManager.h"
 
 namespace milvus::indexbuilder {
 
@@ -27,7 +31,9 @@ class ScalarIndexCreator : public IndexCreatorBase {
                        const storage::FileManagerContext& file_manager_context);
 
     void
-    Build(const milvus::DatasetPtr& dataset) override;
+    Build(const milvus::DatasetPtr& dataset,
+          const bool* valid_data = nullptr,
+          const int64_t valid_data_len = 0) override;
 
     void
     Build() override;

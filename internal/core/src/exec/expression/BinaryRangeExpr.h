@@ -17,13 +17,35 @@
 #pragma once
 
 #include <fmt/core.h>
+#include <simdjson.h>
+#include <stdint.h>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-#include "common/EasyAssert.h"
+#include "bitset/bitset.h"
+#include "bitset/common.h"
+#include "cachinglayer/CacheSlot.h"
+#include "common/Array.h"
+#include "common/Json.h"
+#include "common/OpContext.h"
 #include "common/Types.h"
 #include "common/Vector.h"
-#include "exec/expression/Expr.h"
+#include "common/protobuf_utils.h"
 #include "exec/expression/Element.h"
+#include "exec/expression/EvalCtx.h"
+#include "exec/expression/Expr.h"
+#include "expr/ITypeExpr.h"
+#include "index/ScalarIndex.h"
+#include "index/json_stats/bson_inverted.h"
+#include "pb/plan.pb.h"
 #include "segcore/SegmentInterface.h"
+#include "simdjson/error.h"
 
 namespace milvus {
 namespace exec {
@@ -247,7 +269,8 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
         int64_t batch_size,
-        int32_t consistency_level)
+        int32_t consistency_level,
+        const query::PlanOptions& plan_options = {})
         : SegmentExpr(std::move(input),
                       name,
                       op_ctx,
@@ -257,15 +280,22 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
                       FromValCase(expr->lower_val_.val_case()),
                       active_count,
                       batch_size,
-                      consistency_level),
+                      consistency_level,
+                      false,
+                      false,
+                      plan_options),
           expr_(expr) {
+        DetermineExecPath();
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    void
+    DetermineExecPath() override;
+
     std::string
-    ToString() const {
+    ToString() const override {
         return fmt::format("{}", expr_->ToString());
     }
 
@@ -320,13 +350,17 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
     VectorPtr
     ExecRangeVisitorImplForArray(EvalCtx& context);
 
+    template <typename T>
+    VectorPtr
+    ExecRangeVisitorImplForPk(EvalCtx& context);
+
  private:
     std::shared_ptr<const milvus::expr::BinaryRangeFilterExpr> expr_;
     int64_t overflow_check_pos_{0};
     SingleElement lower_arg_;
     SingleElement upper_arg_;
     bool arg_inited_{false};
-    PinWrapper<index::JsonKeyStats*> pinned_json_stats_{nullptr};
+    PinWrapper<index::BsonInvertedIndex*> bson_index_{nullptr};
 };
 }  //namespace exec
 }  // namespace milvus

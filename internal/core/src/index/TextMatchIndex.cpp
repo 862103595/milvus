@@ -22,7 +22,7 @@
 namespace milvus::index {
 TextMatchIndex::TextMatchIndex(int64_t commit_interval_in_ms,
                                const char* unique_id,
-                               const char* tokenizer_name,
+                               const char* analyzer_name,
                                const char* analyzer_params)
     : commit_interval_in_ms_(commit_interval_in_ms),
       last_commit_time_(stdclock::now()) {
@@ -33,7 +33,7 @@ TextMatchIndex::TextMatchIndex(int64_t commit_interval_in_ms,
         "",
         TANTIVY_INDEX_LATEST_VERSION /* Growing segment has no reason to use old version index*/
         ,
-        tokenizer_name,
+        analyzer_name,
         analyzer_params);
     set_is_growing(true);
 }
@@ -41,7 +41,7 @@ TextMatchIndex::TextMatchIndex(int64_t commit_interval_in_ms,
 TextMatchIndex::TextMatchIndex(const std::string& path,
                                const char* unique_id,
                                uint32_t tantivy_index_version,
-                               const char* tokenizer_name,
+                               const char* analyzer_name,
                                const char* analyzer_params)
     : commit_interval_in_ms_(std::numeric_limits<int64_t>::max()),
       last_commit_time_(stdclock::now()) {
@@ -54,19 +54,21 @@ TextMatchIndex::TextMatchIndex(const std::string& path,
                                                      false,
                                                      path_.c_str(),
                                                      tantivy_index_version,
-                                                     tokenizer_name,
+                                                     analyzer_name,
                                                      analyzer_params);
 }
 
 TextMatchIndex::TextMatchIndex(const storage::FileManagerContext& ctx,
                                uint32_t tantivy_index_version,
-                               const char* tokenizer_name,
-                               const char* analyzer_params)
+                               const char* analyzer_name,
+                               const char* analyzer_params,
+                               const char* analyzer_extra_info)
     : commit_interval_in_ms_(std::numeric_limits<int64_t>::max()),
       last_commit_time_(stdclock::now()) {
     schema_ = ctx.fieldDataMeta.field_schema;
-    mem_file_manager_ = std::make_shared<MemFileManager>(ctx);
+    this->file_manager_ = std::make_shared<MemFileManager>(ctx);
     disk_file_manager_ = std::make_shared<DiskFileManager>(ctx);
+    is_index_file_ = false;
 
     path_ = disk_file_manager_->GetLocalTempTextIndexPrefix();
 
@@ -78,16 +80,18 @@ TextMatchIndex::TextMatchIndex(const storage::FileManagerContext& ctx,
                                                      false,
                                                      path_.c_str(),
                                                      tantivy_index_version,
-                                                     tokenizer_name,
-                                                     analyzer_params);
+                                                     analyzer_name,
+                                                     analyzer_params,
+                                                     analyzer_extra_info);
 }
 
 TextMatchIndex::TextMatchIndex(const storage::FileManagerContext& ctx)
     : commit_interval_in_ms_(std::numeric_limits<int64_t>::max()),
       last_commit_time_(stdclock::now()) {
     schema_ = ctx.fieldDataMeta.field_schema;
-    mem_file_manager_ = std::make_shared<MemFileManager>(ctx);
+    this->file_manager_ = std::make_shared<MemFileManager>(ctx);
     disk_file_manager_ = std::make_shared<DiskFileManager>(ctx);
+    is_index_file_ = false;
     d_type_ = TantivyDataType::Text;
 }
 
@@ -114,20 +118,32 @@ TextMatchIndex::Upload(const Config& config) {
     auto remote_paths_to_size = disk_file_manager_->GetRemotePathsToFileSize();
 
     auto binary_set = Serialize(config);
-    mem_file_manager_->AddTextLog(binary_set);
+    this->file_manager_->AddTextLog(binary_set);
     auto remote_mem_path_to_size =
-        mem_file_manager_->GetRemotePathsToFileSize();
+        this->file_manager_->GetRemotePathsToFileSize();
+
+    // Strip the remote basePath prefix to return relative file paths.
+    // This makes the returned paths consistent with JsonKeyStats::Upload()
+    // which also returns relative paths.
+    auto base_prefix = disk_file_manager_->GetRemoteTextLogPrefix() + "/";
+    auto strip_prefix = [&base_prefix](const std::string& path) -> std::string {
+        if (path.size() > base_prefix.size() &&
+            path.compare(0, base_prefix.size(), base_prefix) == 0) {
+            return path.substr(base_prefix.size());
+        }
+        return path;
+    };
 
     std::vector<SerializedIndexFileInfo> index_files;
     index_files.reserve(remote_paths_to_size.size() +
                         remote_mem_path_to_size.size());
     for (auto& file : remote_paths_to_size) {
-        index_files.emplace_back(file.first, file.second);
+        index_files.emplace_back(strip_prefix(file.first), file.second);
     }
     for (auto& file : remote_mem_path_to_size) {
-        index_files.emplace_back(file.first, file.second);
+        index_files.emplace_back(strip_prefix(file.first), file.second);
     }
-    return IndexStats::New(mem_file_manager_->GetAddedTotalMemSize() +
+    return IndexStats::New(this->file_manager_->GetAddedTotalMemSize() +
                                disk_file_manager_->GetAddedTotalFileSize(),
                            std::move(index_files));
 }
@@ -138,23 +154,48 @@ TextMatchIndex::Load(const Config& config) {
         GetValueFromConfig<std::vector<std::string>>(config, INDEX_FILES);
     AssertInfo(index_files.has_value(),
                "index file paths is empty when load text log index");
+
+    // Detect V3 format: single file ending with ".v3"
+    auto& files_value = index_files.value();
+    if (files_value.size() == 1) {
+        const auto& file = files_value[0];
+        auto filename = file.substr(file.find_last_of('/') + 1);
+        if (filename.size() > 3 &&
+            filename.substr(filename.size() - 3) == ".v3") {
+            LOG_INFO("TextMatchIndex::Load V3 format detected: {}", file);
+            InvertedIndexTantivy<std::string>::LoadV3(config);
+            return;
+        }
+    }
+
+    auto load_priority =
+        GetValueFromConfig<milvus::proto::common::LoadPriority>(
+            config, milvus::LOAD_PRIORITY)
+            .value_or(milvus::proto::common::LoadPriority::HIGH);
+    // V2: existing multi-file load path
     auto prefix = disk_file_manager_->GetLocalTextIndexPrefix();
-    auto files_value = index_files.value();
+    // Files are relative paths; prepend base_path to construct absolute remote paths.
+    // This must happen before extracting index_null_offset so all files have full paths.
+    auto base_path =
+        GetValueFromConfig<std::string>(config, STATS_BASE_PATH_KEY)
+            .value_or("");
+    AssertInfo(!base_path.empty(),
+               "stats_base_path is required for loading text index");
+    for (auto& f : files_value) {
+        f = base_path + "/" + f;
+    }
+
     auto it = std::find_if(
         files_value.begin(), files_value.end(), [](const std::string& file) {
             return file.substr(file.find_last_of('/') + 1) ==
                    "index_null_offset";
         });
-    auto load_priority =
-        GetValueFromConfig<milvus::proto::common::LoadPriority>(
-            config, milvus::LOAD_PRIORITY)
-            .value_or(milvus::proto::common::LoadPriority::HIGH);
     if (it != files_value.end()) {
         std::vector<std::string> file;
         file.push_back(*it);
         files_value.erase(it);
         auto index_datas =
-            mem_file_manager_->LoadIndexToMemory(file, load_priority);
+            this->file_manager_->LoadIndexToMemory(file, load_priority);
         BinarySet binary_set;
         AssembleIndexDatas(index_datas, binary_set);
         // clear index_datas to free memory early
@@ -242,12 +283,18 @@ TextMatchIndex::BuildIndexFromFieldData(
             for (int i = 0; i < n; i++) {
                 if (!data->is_valid(i)) {
                     std::unique_lock<folly::SharedMutex> lock(mutex_);
-                    null_offset_.push_back(i);
+                    null_offset_.push_back(offset);
+                    // add empty array doc to register offset in tantivy,
+                    // same as AddNullSealed
+                    std::string empty = "";
+                    wrapper_->add_array_data(&empty, 0, offset);
+                } else {
+                    wrapper_->add_data(
+                        static_cast<const std::string*>(data->RawValue(i)),
+                        1,
+                        offset);
                 }
-                wrapper_->add_data(
-                    static_cast<const std::string*>(data->RawValue(i)),
-                    data->is_valid(i) ? 1 : 0,
-                    offset++);
+                offset++;
             }
         }
     } else {
@@ -296,9 +343,9 @@ TextMatchIndex::CreateReader(SetBitsetFn set_bitset) {
 }
 
 void
-TextMatchIndex::RegisterTokenizer(const char* tokenizer_name,
-                                  const char* analyzer_params) {
-    wrapper_->register_tokenizer(tokenizer_name, analyzer_params);
+TextMatchIndex::RegisterAnalyzer(const char* analyzer_name,
+                                 const char* analyzer_params) {
+    wrapper_->register_tokenizer(analyzer_name, analyzer_params);
 }
 
 TargetBitmap

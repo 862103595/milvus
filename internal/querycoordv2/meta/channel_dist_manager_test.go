@@ -24,7 +24,6 @@ import (
 
 	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
@@ -92,6 +91,37 @@ func (suite *ChannelDistManagerSuite) SetupTest() {
 	suite.dist.Update(suite.nodes[0], suite.channels["dmc0"].Clone())
 	suite.dist.Update(suite.nodes[1], suite.channels["dmc0"].Clone(), suite.channels["dmc1"].Clone())
 	suite.dist.Update(suite.nodes[2], suite.channels["dmc1"].Clone())
+}
+
+func (suite *ChannelDistManagerSuite) TestVersion() {
+	dist := suite.dist
+	v1 := dist.GetVersion()
+
+	// Update with some new data
+	newChannel := suite.channels["dmc0"].Clone()
+	newChannel.Version = 2
+	dist.Update(suite.nodes[0], newChannel)
+	v2 := dist.GetVersion()
+	suite.Greater(v2, v1)
+}
+
+func (suite *ChannelDistManagerSuite) TestNodeOffline() {
+	dist := suite.dist
+
+	// Verify node 1 has channels (node 1 has dmc0 and dmc1)
+	channels := dist.GetByFilter(WithNodeID2Channel(suite.nodes[1]))
+	suite.Len(channels, 2)
+
+	// Simulate node offline by calling Update with empty channels
+	dist.Update(suite.nodes[1])
+
+	// Verify node 1's channels are removed
+	channels = dist.GetByFilter(WithNodeID2Channel(suite.nodes[1]))
+	suite.Len(channels, 0)
+
+	// Verify other nodes are not affected
+	channels = dist.GetByFilter(WithNodeID2Channel(suite.nodes[0]))
+	suite.Len(channels, 1)
 }
 
 func (suite *ChannelDistManagerSuite) TestGetBy() {
@@ -344,25 +374,6 @@ func (suite *ChannelDistManagerSuite) TestGetShardLeader() {
 	// Test nonexistent channel
 	leader = dist.GetShardLeader("nonexistent", replica)
 	suite.Nil(leader)
-
-	// Test streaming node
-	nodeManager.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
-		NodeID:   4,
-		Address:  "localhost:1",
-		Hostname: "localhost",
-		Labels:   map[string]string{sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1"},
-	}))
-	channel1Node4 := suite.channels["dmc0"].Clone()
-	channel1Node4.Node = 4
-	channel1Node4.Version = 3
-	channel1Node4.View.Status.Serviceable = false
-	dist.Update(4, channel1Node4)
-
-	leader = dist.GetShardLeader("dmc0", replica)
-	suite.NotNil(leader)
-	suite.Equal(int64(4), leader.Node)
-	suite.Equal(int64(3), leader.Version)
-	suite.False(leader.IsServiceable())
 }
 
 func TestGetChannelDistJSON(t *testing.T) {

@@ -51,6 +51,8 @@ const (
 
 // proxy management restful api root path
 const (
+	RouteBackupEZ = "/management/rootcoord/ez/backup"
+
 	RouteGcPause  = "/management/datacoord/garbage_collection/pause"
 	RouteGcResume = "/management/datacoord/garbage_collection/resume"
 
@@ -79,6 +81,10 @@ const (
 	StreamingNodeStatusPath       = "/management/streaming/nodes/status"
 	StreamingNodeDistributionPath = "/management/streaming/nodes/distribution"
 	StreamingTransferPath         = "/management/streaming/transfer"
+
+	WALAlterPath = "/management/wal/alter"
+
+	ConfigAlterPath = "/management/config/alter"
 
 	DataGCPath = "/management/data_gc"
 )
@@ -146,4 +152,13 @@ const (
 
 	// IndexListPath is the path to get all indexes.
 	IndexListPath = "/_index/list"
+
+	// TelemetryClientsPath is the path to get connected clients telemetry data.
+	TelemetryClientsPath = "/_telemetry/clients"
+	// TelemetryClientHistoryPath is the path to get client snapshot history.
+	TelemetryClientHistoryPath = "/_telemetry/clients/:clientId/history"
+	// TelemetryCommandsPath is the path to manage client commands.
+	TelemetryCommandsPath = "/_telemetry/commands"
+	// TelemetryUIPath is the path for telemetry management web UI.
+	TelemetryUIPath = "/telemetry"
 )

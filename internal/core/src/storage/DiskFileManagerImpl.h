@@ -52,40 +52,15 @@ class DiskFileManagerImpl : public FileManagerImpl {
     bool
     RemoveFile(const std::string& filename) noexcept override;
 
-    /**
-    * @brief Opens an output stream for provided filename
-    * 
-    *  This function utilizes the arrow file system to open an output stream for the provided filename.
-    * 
-    * @param filename the filename to open
-    * @return std::shared_ptr<OutputStream> a shared pointer to the output stream
-    * @throws milvus::SegcoreError
-    * 
-    * @note the internal `fs_` must be initialized to use this API.
-    */
-    std::shared_ptr<InputStream>
-    OpenInputStream(const std::string& filename) override;
-
-    /**
-    * @brief Opens an output stream for provided filename
-    * 
-    *  This function utilizes the arrow file system to open an output stream for the provided filename.
-    * 
-    * @param filename the filename to open
-    * @return std::shared_ptr<OutputStream> a shared pointer to the output stream
-    * @throws milvus::SegcoreError if fs_ is nullptr
-    * 
-    * @note the internal `fs_` must be initialized to use this API.
-    */
-    std::shared_ptr<OutputStream>
-    OpenOutputStream(const std::string& filename) override;
-
  public:
     bool
     AddTextLog(const std::string& filename) noexcept;
 
     bool
     AddJsonSharedIndexLog(const std::string& filename) noexcept;
+
+    bool
+    AddJsonStatsMetaLog(const std::string& filename) noexcept;
 
  public:
     std::string
@@ -143,6 +118,12 @@ class DiskFileManagerImpl : public FileManagerImpl {
                                       int64_t slice_num);
 
     std::string
+    GetRemoteJsonStatsMetaPath(const std::string& file_name);
+
+    std::string
+    GetLocalJsonStatsMetaPrefix();
+
+    std::string
     GetLocalRawDataObjectPrefix();
 
     std::map<std::string, int64_t>
@@ -174,12 +155,22 @@ class DiskFileManagerImpl : public FileManagerImpl {
     RemoveTextLogFiles();
 
     void
+    RemoveJsonStatsSharedIndexFiles();
+
+    void
     RemoveJsonStatsFiles();
 
     void
     CacheJsonStatsSharedIndexToDisk(
         const std::vector<std::string>& remote_files,
         milvus::proto::common::LoadPriority priority);
+
+    // Cache meta file to local disk
+    // Returns local file path
+    // remote_file must be an absolute remote path (basePath + relative file)
+    std::string
+    CacheJsonStatsMetaToDisk(const std::string& remote_file,
+                             milvus::proto::common::LoadPriority priority);
 
     void
     RemoveNgramIndexFiles();
@@ -209,9 +200,6 @@ class DiskFileManagerImpl : public FileManagerImpl {
 
     std::string
     GetFileName(const std::string& localfile);
-
-    std::string
-    GetRemoteIndexFilePrefixV2() const override;
 
  private:
     int64_t
@@ -262,6 +250,18 @@ class DiskFileManagerImpl : public FileManagerImpl {
         uint32_t& dim,
         int64_t& write_offset,
         std::vector<size_t>* offsets = nullptr);
+
+    inline void
+    set_bit(std::vector<uint8_t>& bitmap, int64_t bit_pos) {
+        bitmap[bit_pos >> 3] |= (1 << (bit_pos & 0x07));
+    }
+
+    void
+    write_valid_data_file(
+        const std::shared_ptr<LocalChunkManager>& local_chunk_manager,
+        const std::string& valid_data_path,
+        std::vector<uint8_t>& valid_bitmap,
+        uint64_t total_num_rows);
 
  private:
     // local file path (abs path)

@@ -266,7 +266,6 @@ func (s *Server) ReleaseCollection(ctx context.Context, req *querypb.ReleaseColl
 		metrics.QueryCoordReleaseCount.WithLabelValues(metrics.FailLabel).Inc()
 		return merr.Status(err), nil
 	}
-	job.WaitCollectionReleased(s.dist, s.checkerController, req.GetCollectionID())
 	logger.Info("release collection done")
 	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.SuccessLabel).Inc()
 	metrics.QueryCoordReleaseLatency.WithLabelValues().Observe(float64(tr.ElapseSpan().Milliseconds()))
@@ -353,12 +352,6 @@ func (s *Server) ReleasePartitions(ctx context.Context, req *querypb.ReleasePart
 		logger.Warn("failed to release partitions", zap.Error(err))
 		metrics.QueryCoordReleaseCount.WithLabelValues(metrics.FailLabel).Inc()
 		return merr.Status(err), nil
-	}
-	if collectionReleased {
-		job.WaitCollectionReleased(s.dist, s.checkerController, req.GetCollectionID())
-	} else {
-		job.WaitCurrentTargetUpdated(ctx, s.targetObserver, req.GetCollectionID())
-		job.WaitCollectionReleased(s.dist, s.checkerController, req.GetCollectionID(), req.GetPartitionIDs()...)
 	}
 	logger.Info("release partitions done", zap.Bool("collectionReleased", collectionReleased))
 	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.SuccessLabel).Inc()
@@ -515,13 +508,31 @@ func (s *Server) refreshCollection(ctx context.Context, collectionID int64) erro
 		return merr.WrapErrCollectionNotLoaded(collectionID, "collection not fully loaded")
 	}
 
-	// Pull the latest target.
-	readyCh, err := s.targetObserver.UpdateNextTarget(collectionID)
-	if err != nil {
+	// Set a placeholder notifier BEFORE updating the target to avoid a race condition.
+	// Without this, the segment checker might run between UpdateNextTarget and SetNotifierCollectionOp,
+	// see the new segments in next target, but think IsRefreshed() is true (because the notifier
+	// hasn't been set yet), and incorrectly assign LOW priority to import segments.
+	placeholderCh := make(chan struct{})
+	if err := s.meta.CollectionManager.UpdateCollection(ctx, collectionID, meta.SetNotifierCollectionOp(placeholderCh)); err != nil {
+		if errors.Is(err, merr.ErrCollectionNotFound) {
+			return nil
+		}
 		return err
 	}
 
+	// Pull the latest target.
+	readyCh, err := s.targetObserver.UpdateNextTarget(collectionID)
+	if err != nil {
+		// On failure, close the placeholder channel so IsRefreshed() returns true
+		close(placeholderCh)
+		return err
+	}
+
+	// Replace the placeholder with the real readyCh from target observer
 	err = s.meta.CollectionManager.UpdateCollection(ctx, collectionID, meta.SetNotifierCollectionOp(readyCh))
+	// Close the placeholder channel (no one is waiting on it, but good practice)
+	close(placeholderCh)
+
 	// if collection already released, treat as success
 	if errors.Is(err, merr.ErrCollectionNotFound) {
 		return nil
@@ -874,6 +885,7 @@ func (s *Server) CreateResourceGroup(ctx context.Context, req *milvuspb.CreateRe
 		log.Warn("failed to create resource group", zap.Error(err))
 		return merr.Status(err), nil
 	}
+	log.Info("create resource group done")
 	return merr.Success(), nil
 }
 
@@ -892,6 +904,7 @@ func (s *Server) UpdateResourceGroups(ctx context.Context, req *querypb.UpdateRe
 		log.Warn("failed to update resource group", zap.Error(err))
 		return merr.Status(err), nil
 	}
+	log.Info("update resource group done")
 	return merr.Success(), nil
 }
 
@@ -914,6 +927,7 @@ func (s *Server) DropResourceGroup(ctx context.Context, req *milvuspb.DropResour
 		log.Warn("failed to drop resource group", zap.Error(err))
 		return merr.Status(err), nil
 	}
+	log.Info("drop resource group done")
 	return merr.Success(), nil
 }
 
@@ -936,6 +950,7 @@ func (s *Server) TransferNode(ctx context.Context, req *milvuspb.TransferNodeReq
 		log.Warn("failed to transfer node", zap.Error(err))
 		return merr.Status(err), nil
 	}
+	log.Info("transfer node done")
 	return merr.Success(), nil
 }
 
@@ -944,6 +959,7 @@ func (s *Server) TransferReplica(ctx context.Context, req *querypb.TransferRepli
 		zap.String("source", req.GetSourceResourceGroup()),
 		zap.String("target", req.GetTargetResourceGroup()),
 		zap.Int64("collectionID", req.GetCollectionID()),
+		zap.Int64("numReplica", req.GetNumReplica()),
 	)
 
 	log.Info("transfer replica request received")
@@ -952,22 +968,12 @@ func (s *Server) TransferReplica(ctx context.Context, req *querypb.TransferRepli
 		return merr.Status(err), nil
 	}
 
-	// TODO: !!!WARNING, replica manager and resource manager doesn't protected with each other by lock.
-	if ok := s.meta.ResourceManager.ContainResourceGroup(ctx, req.GetSourceResourceGroup()); !ok {
-		err := merr.WrapErrResourceGroupNotFound(req.GetSourceResourceGroup())
-		return merr.Status(errors.Wrap(err,
-			fmt.Sprintf("the source resource group[%s] doesn't exist", req.GetSourceResourceGroup()))), nil
+	if err := s.broadcastAlterLoadConfigCollectionV2ForTransferReplica(ctx, req); err != nil {
+		log.Warn("failed to transfer replica between resource group", zap.Error(err))
+		return merr.Status(err), nil
 	}
-
-	if ok := s.meta.ResourceManager.ContainResourceGroup(ctx, req.GetTargetResourceGroup()); !ok {
-		err := merr.WrapErrResourceGroupNotFound(req.GetTargetResourceGroup())
-		return merr.Status(errors.Wrap(err,
-			fmt.Sprintf("the target resource group[%s] doesn't exist", req.GetTargetResourceGroup()))), nil
-	}
-
-	// Apply change into replica manager.
-	err := s.meta.TransferReplica(ctx, req.GetCollectionID(), req.GetSourceResourceGroup(), req.GetTargetResourceGroup(), int(req.GetNumReplica()))
-	return merr.Status(err), nil
+	log.Info("transfer replica done")
+	return merr.Success(), nil
 }
 
 func (s *Server) ListResourceGroups(ctx context.Context, req *milvuspb.ListResourceGroupsRequest) (*milvuspb.ListResourceGroupsResponse, error) {
@@ -1088,7 +1094,7 @@ func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadCo
 	return merr.Success(), nil
 }
 
-func (s *Server) updateLoadConfig(ctx context.Context, collectionIDs []int64, newReplicaNum int32, newRGs []string) error {
+func (s *Server) updateLoadConfig(ctx context.Context, collectionIDs []int64, newReplicaNum int32, newRGs []string, needWaitRGReady ...bool) error {
 	jobs := make([]job.Job, 0, len(collectionIDs))
 	for _, collectionID := range collectionIDs {
 		collection := s.meta.GetCollection(ctx, collectionID)
@@ -1123,6 +1129,7 @@ func (s *Server) updateLoadConfig(ctx context.Context, collectionIDs []int64, ne
 			continue
 		}
 
+		waitRG := len(needWaitRGReady) > 0 && needWaitRGReady[0]
 		updateJob := job.NewUpdateLoadConfigJob(
 			ctx,
 			subReq,
@@ -1130,7 +1137,9 @@ func (s *Server) updateLoadConfig(ctx context.Context, collectionIDs []int64, ne
 			s.targetMgr,
 			s.targetObserver,
 			s.collectionObserver,
+			s.proxyClientManager,
 			false,
+			waitRG,
 		)
 
 		jobs = append(jobs, updateJob)
@@ -1205,21 +1214,76 @@ func (s *Server) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerReques
 	return resp, nil
 }
 
-func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*commonpb.Status, error) {
+func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
 	if err := merr.CheckHealthy(s.State()); err != nil {
-		return merr.Status(errors.Wrap(err, "failed to validate analyzer")), nil
+		return &querypb.ValidateAnalyzerResponse{Status: merr.Status(errors.Wrap(err, "failed to validate analyzer"))}, nil
 	}
 
 	nodeIDs := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs().Collect()
 
 	if len(nodeIDs) == 0 {
-		return merr.Status(errors.New("failed to validate analyzer, no delegator")), nil
+		return &querypb.ValidateAnalyzerResponse{Status: merr.Status(errors.New("failed to validate analyzer, no delegator"))}, nil
 	}
 
 	idx := s.nodeIdx.Inc() % uint32(len(nodeIDs))
 	resp, err := s.cluster.ValidateAnalyzer(ctx, nodeIDs[idx], req)
 	if err != nil {
-		return merr.Status(err), nil
+		return &querypb.ValidateAnalyzerResponse{Status: merr.Status(err)}, nil
 	}
 	return resp, nil
+}
+
+func (s *Server) ComputePhraseMatchSlop(ctx context.Context, req *querypb.ComputePhraseMatchSlopRequest) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &querypb.ComputePhraseMatchSlopResponse{
+			Status: merr.Status(errors.Wrap(err, "failed to compute phrase match slop")),
+		}, nil
+	}
+
+	nodeIDs := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs().Collect()
+
+	if len(nodeIDs) == 0 {
+		return &querypb.ComputePhraseMatchSlopResponse{
+			Status: merr.Status(errors.New("failed to compute phrase match slop, no query node available")),
+		}, nil
+	}
+
+	idx := s.nodeIdx.Inc() % uint32(len(nodeIDs))
+	resp, err := s.cluster.ComputePhraseMatchSlop(ctx, nodeIDs[idx], req)
+	if err != nil {
+		return &querypb.ComputePhraseMatchSlopResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	return resp, nil
+}
+
+// ManualUpdateCurrentTarget is used to manually update the current target for TruncateCollection
+func (s *Server) ManualUpdateCurrentTarget(ctx context.Context, collectionID int64) error {
+	log := log.Ctx(ctx).With(
+		zap.Int64("collectionID", collectionID),
+	)
+
+	log.Info("manual update current target request received")
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		log.Warn("failed to manual update current target", zap.Error(err))
+		return err
+	}
+
+	// Check if collection is loaded
+	percentage := s.meta.CollectionManager.CalculateLoadPercentage(ctx, collectionID)
+	if percentage < 0 {
+		log.Info("collection not loaded, skip ManualUpdateCurrentTarget")
+		return nil
+	}
+
+	err := job.WaitCurrentTargetUpdated(ctx, s.targetObserver, collectionID)
+	if err != nil {
+		log.Warn("failed to wait current target updated", zap.Error(err))
+		return err
+	}
+
+	log.Info("manual update current target done")
+	return nil
 }

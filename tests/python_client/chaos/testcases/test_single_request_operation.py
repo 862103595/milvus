@@ -12,6 +12,7 @@ from chaos.checker import (CollectionCreateChecker,
                            FlushChecker,
                            SearchChecker,
                            FullTextSearchChecker,
+                           MinHashSearchChecker,
                            HybridSearchChecker,
                            QueryChecker,
                            TextMatchChecker,
@@ -24,6 +25,9 @@ from chaos.checker import (CollectionCreateChecker,
                            AlterCollectionChecker,
                            AddFieldChecker,
                            CollectionRenameChecker,
+                           TensorSearchChecker,
+                           SnapshotRestoreChecker,
+                           EntityTTLChecker,
                            Op,
                            EventRecords,
                            ResultAnalyzer
@@ -54,15 +58,26 @@ class TestBase:
 class TestOperations(TestBase):
 
     @pytest.fixture(scope="function", autouse=True)
-    def connection(self, host, port, user, password, milvus_ns, minio_host, enable_import, minio_bucket):
-        if user and password:
-            # log.info(f"connect to {host}:{port} with user {user} and password {password}")
-            connections.connect('default', host=host, port=port, user=user, password=password)
+    def connection(self, host, port, user, password, uri, token, milvus_ns, minio_host, enable_import, minio_bucket):
+        # Prioritize uri and token for connection
+        if uri:
+            actual_uri = uri
         else:
-            connections.connect('default', host=host, port=port)
+            actual_uri = f"http://{host}:{port}"
+
+        if token:
+            actual_token = token
+        else:
+            actual_token = f"{user}:{password}" if user and password else None
+
+        if actual_token:
+            connections.connect('default', uri=actual_uri, token=actual_token)
+        else:
+            connections.connect('default', uri=actual_uri)
+
         if connections.has_connection("default") is False:
             raise Exception("no connections")
-        log.info("connect to milvus successfully")
+        log.info(f"connect to milvus successfully, uri: {actual_uri}")
         pymilvus_version = pymilvus.__version__
         server_version = utility.get_server_version()
         log.info(f"server version: {server_version}")
@@ -71,6 +86,8 @@ class TestOperations(TestBase):
         self.port = port
         self.user = user
         self.password = password
+        self.uri = actual_uri
+        self.token = actual_token
         self.milvus_sys = MilvusSys(alias='default')
         self.milvus_ns = milvus_ns
         self.release_name = get_milvus_instance_name(self.milvus_ns, milvus_sys=self.milvus_sys)
@@ -83,12 +100,14 @@ class TestOperations(TestBase):
         checkers = {
             Op.create: CollectionCreateChecker(collection_name=c_name),
             Op.insert: InsertChecker(collection_name=c_name),
+            Op.tensor_search :TensorSearchChecker(collection_name=c_name),
             Op.upsert: UpsertChecker(collection_name=c_name),
-            Op.partial_update: PartialUpdateChecker(collection_name=c_name),
+            Op.partial_update: PartialUpdateChecker(collection_name=c_name), 
             Op.flush: FlushChecker(collection_name=c_name),
             Op.index: IndexCreateChecker(collection_name=c_name),
             Op.search: SearchChecker(collection_name=c_name),
             Op.full_text_search: FullTextSearchChecker(collection_name=c_name),
+            Op.minhash_search: MinHashSearchChecker(collection_name=c_name),
             Op.hybrid_search: HybridSearchChecker(collection_name=c_name),
             Op.query: QueryChecker(collection_name=c_name),
             Op.text_match: TextMatchChecker(collection_name=c_name),
@@ -99,7 +118,9 @@ class TestOperations(TestBase):
             Op.drop: CollectionDropChecker(collection_name=c_name),
             Op.alter_collection: AlterCollectionChecker(collection_name=c_name),
             Op.add_field: AddFieldChecker(collection_name=c_name),
-            Op.rename_collection: CollectionRenameChecker(collection_name=c_name)
+            Op.rename_collection: CollectionRenameChecker(collection_name=c_name),
+            Op.restore_snapshot: SnapshotRestoreChecker(collection_name=c_name),
+            Op.entity_ttl: EntityTTLChecker(),
         }
         if bool(self.enable_import):
             checkers[Op.bulk_insert] = BulkInsertChecker(collection_name=c_name,

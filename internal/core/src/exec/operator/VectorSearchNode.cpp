@@ -15,10 +15,31 @@
 // limitations under the License.
 
 #include "VectorSearchNode.h"
-#include "common/Tracer.h"
-#include "fmt/format.h"
 
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <ratio>
+#include <utility>
+#include <vector>
+
+#include "bitset/bitset.h"
+#include "common/ArrayOffsets.h"
+#include "common/BitsetView.h"
+#include "common/EasyAssert.h"
+#include "common/QueryResult.h"
+#include "common/Tracer.h"
+#include "common/Utils.h"
+#include "exec/QueryContext.h"
+#include "exec/expression/Utils.h"
+#include "exec/operator/Utils.h"
 #include "monitor/Monitor.h"
+#include "opentelemetry/trace/span.h"
+#include "plan/PlanNode.h"
+#include "prometheus/histogram.h"
+#include "query/PlanImpl.h"
+#include "segcore/SegmentInterface.h"
+
 namespace milvus {
 namespace exec {
 
@@ -56,6 +77,8 @@ PhyVectorSearchNode::AddInput(RowVectorPtr& input) {
 
 RowVectorPtr
 PhyVectorSearchNode::GetOutput() {
+    milvus::exec::checkCancellation(query_context_);
+
     if (is_finished_ || !no_more_input_) {
         return nullptr;
     }
@@ -78,13 +101,47 @@ PhyVectorSearchNode::GetOutput() {
     auto src_data = ph.get_blob();
     auto src_offsets = ph.get_offsets();
     auto num_queries = ph.num_of_queries_;
+    std::shared_ptr<const IArrayOffsets> array_offsets = nullptr;
+    if (ph.element_level_) {
+        array_offsets = segment_->GetArrayOffsets(search_info_.field_id_);
+        AssertInfo(array_offsets != nullptr, "Array offsets not available");
+        query_context_->set_array_offsets(array_offsets);
+        search_info_.array_offsets_ = array_offsets;
+    }
+
+    // There are two types of execution: pre-filter and iterative filter
+    // For **pre-filter**, we have execution path: FilterBitsNode -> MvccNode -> ElementFilterBitsNode -> VectorSearchNode -> ...
+    // For **iterative filter**, we have execution path: MvccNode -> VectorSearchNode -> ElementFilterNode -> FilterNode -> ...
+    //
+    // When embedding search embedding on embedding list is used, which means element_level_ is true, we need to transform doc-level
+    // bitset to element-level bitset. In pre-filter path, ElementFilterBitsNode already transforms the bitset. We need to transform it
+    // in iterative filter path or when ElementFilterBitsNode is not present (e.g., only doc-level filter without element-level filter).
+    //
+    // Check if bitset needs conversion: element_level search is requested but bitset hasn't been converted yet
+    if (ph.element_level_ && !query_context_->bitset_is_element_level()) {
+        auto col_input = GetColumnVector(input_);
+        TargetBitmapView view(col_input->GetRawData(), col_input->size());
+        TargetBitmapView valid_view(col_input->GetValidRawData(),
+                                    col_input->size());
+
+        auto [element_bitset, valid_element_bitset] =
+            array_offsets->RowBitsetToElementBitset(view, valid_view, 0);
+
+        query_context_->set_active_element_count(element_bitset.size());
+
+        std::vector<VectorPtr> col_res;
+        col_res.push_back(std::make_shared<ColumnVector>(
+            std::move(element_bitset), std::move(valid_element_bitset)));
+        input_ = std::make_shared<RowVector>(col_res);
+    }
+
     milvus::SearchResult search_result;
 
     auto col_input = GetColumnVector(input_);
     TargetBitmapView view(col_input->GetRawData(), col_input->size());
+
     if (view.all()) {
-        query_context_->set_search_result(
-            std::move(empty_search_result(num_queries)));
+        query_context_->set_search_result(empty_search_result(num_queries));
         return input_;
     }
 
@@ -92,6 +149,7 @@ PhyVectorSearchNode::GetOutput() {
     milvus::BitsetView final_view((uint8_t*)col_input->GetRawData(),
                                   col_input->size());
     auto op_context = query_context_->get_op_context();
+    // todo(SpadeA): need to pass element_level to make check more rigorously?
     segment_->vector_search(search_info_,
                             src_data,
                             src_offsets,
@@ -102,6 +160,7 @@ PhyVectorSearchNode::GetOutput() {
                             search_result);
 
     search_result.total_data_cnt_ = final_view.size();
+    search_result.element_level_ = ph.element_level_;
 
     span.GetSpan()->SetAttribute(
         "result_count", static_cast<int>(search_result.seg_offsets_.size()));

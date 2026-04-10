@@ -16,13 +16,20 @@
 
 #pragma once
 
-#include <fmt/core.h>
+#include <stdint.h>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "common/EasyAssert.h"
 #include "common/OpContext.h"
 #include "common/Types.h"
 #include "common/Vector.h"
+#include "common/protobuf_utils.h"
+#include "exec/expression/EvalCtx.h"
 #include "exec/expression/Expr.h"
+#include "expr/ITypeExpr.h"
 #include "segcore/SegmentInterface.h"
 
 namespace milvus {
@@ -72,6 +79,16 @@ class PhyAlwaysTrueExpr : public Expr {
     std::optional<milvus::expr::ColumnInfo>
     GetColumnInfo() const override {
         return std::nullopt;
+    }
+
+    bool
+    CanExecuteAllAtOnce() const override {
+        return true;
+    }
+
+    void
+    SetExecuteAllAtOnce() override {
+        batch_size_ = active_count_;
     }
 
  private:

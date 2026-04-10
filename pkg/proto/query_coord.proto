@@ -101,7 +101,8 @@ service QueryCoord {
 
   rpc UpdateLoadConfig(UpdateLoadConfigRequest) returns (common.Status) {}
   rpc RunAnalyzer(RunAnalyzerRequest) returns(milvus.RunAnalyzerResponse){}
-  rpc ValidateAnalyzer(ValidateAnalyzerRequest) returns(common.Status){}
+  rpc ComputePhraseMatchSlop(ComputePhraseMatchSlopRequest) returns(ComputePhraseMatchSlopResponse){}
+  rpc ValidateAnalyzer(ValidateAnalyzerRequest) returns(ValidateAnalyzerResponse){}
 }
 
 service QueryNode {
@@ -172,13 +173,34 @@ service QueryNode {
     rpc DeleteBatch(DeleteBatchRequest) returns (DeleteBatchResponse) {
     } 
     rpc UpdateSchema(UpdateSchemaRequest) returns (common.Status) {}
+    rpc UpdateIndex(UpdateIndexRequest) returns (common.Status) {}
 
     rpc RunAnalyzer(RunAnalyzerRequest) returns(milvus.RunAnalyzerResponse){}
+    rpc GetHighlight(GetHighlightRequest) returns (GetHighlightResponse){}
+    
     rpc DropIndex(DropIndexRequest) returns (common.Status) {}
-    rpc ValidateAnalyzer(ValidateAnalyzerRequest) returns(common.Status){}
+    rpc ValidateAnalyzer(ValidateAnalyzerRequest) returns(ValidateAnalyzerResponse){}
+    
+    // file resource
+    rpc SyncFileResource(internal.SyncFileResourceRequest) returns(common.Status) {}
+
+    rpc ComputePhraseMatchSlop(ComputePhraseMatchSlopRequest) returns(ComputePhraseMatchSlopResponse){}
 }
 
 // --------------------QueryCoord grpc request and response proto------------------
+
+message ComputePhraseMatchSlopRequest {
+    common.MsgBase base = 1;
+    string analyzer_params = 2;
+    string query_text = 3;
+    repeated string data_texts = 4;
+}
+
+message ComputePhraseMatchSlopResponse {
+    common.Status status = 1;
+    repeated bool is_match = 2;
+    repeated int64 slops = 3;
+}
 
 message ShowCollectionsRequest {
     common.MsgBase base = 1;
@@ -398,7 +420,8 @@ message FieldIndexInfo {
     int64 index_version = 9;
     int64 num_rows = 10;
     int32 current_index_version = 11;
-    int64 index_store_version = 12;
+    int64 index_store_version = 12 [deprecated = true];
+    int32 current_scalar_index_version = 13;
 }
 
 message JsonStatsInfo {
@@ -414,6 +437,7 @@ enum LoadScope {
     Delta = 1;
     Index = 2;
     Stats = 3;
+    Reopen = 4;
 }
 
 message LoadSegmentsRequest {
@@ -653,6 +677,7 @@ message LeaderView {
 
 message LeaderViewStatus {
     bool serviceable = 1;
+    bool catching_up_streaming_data = 2;  // true = still catching up, not ready
 }
 
 message SegmentDist {
@@ -672,6 +697,7 @@ message SegmentVersionInfo {
     bool is_sorted = 9;
     repeated int64 field_json_index_stats = 10;
     map<int64, JsonStatsInfo> json_stats_info = 11; 
+    string manifest_path = 12;
 }
 
 message ChannelVersionInfo {
@@ -988,6 +1014,24 @@ message UpdateSchemaRequest {
     uint64 version = 4;
 }
 
+message UpdateIndexRequest {
+    common.MsgBase base = 1;
+    int64 collectionID = 2;
+    message AddIndex {
+        index.IndexInfo index_info = 1;
+    }
+    message DropIndex {
+        int64 index_id = 1;
+    }
+    message Action {
+        oneof op {
+            AddIndex add_index_request = 1;
+            DropIndex drop_index_request = 2;
+        }
+    }
+    Action action = 3;
+}
+
 message RunAnalyzerRequest{
     common.MsgBase base = 1;
     string channel = 2;
@@ -1010,6 +1054,68 @@ message AnalyzerInfo{
 message ValidateAnalyzerRequest{
     common.MsgBase base = 1;
     repeated AnalyzerInfo analyzer_infos = 2;
+}
+
+message ValidateAnalyzerResponse{
+    common.Status status = 1;
+    repeated int64 resource_ids = 2;
+}
+
+message HighlightOptions{
+    int64 fragment_size = 1;
+    int64 fragment_offset = 2;
+    int64 num_of_fragments = 3;
+}
+
+enum HighlightQueryType{
+    TextMatch = 0;
+}
+
+message HighlightQuery{
+    HighlightQueryType type = 1;
+}
+
+// HighlightTask fetch highlight for all queries at one field
+// search_text_num/search_num == len(topks) == nq
+// corpus_text_num == sum(topks) == len(search_results)
+message HighlightTask{
+    string field_name = 1;
+    int64 field_id = 2;
+    // len(texts) = search_text_num + corpus_text_num + len(queries);
+    // text = search_text...corpus_text...query_text
+    repeated string texts = 3;
+    repeated string analyzer_names = 4; // used if field with multi-analyzer
+    
+    int64 search_text_num = 5;
+    int64 corpus_text_num = 6;
+    HighlightOptions options = 7;
+    repeated HighlightQuery queries = 8;
+}
+
+// Get Lexical highlight from delegator
+message GetHighlightRequest{
+    common.MsgBase base = 1;
+    string channel = 2;
+    repeated int64 topks = 3;
+    repeated HighlightTask tasks=4; // one task for one field
+}
+
+// start_offset and end_offset are fragment offset in the original text
+// number of offsets always be 2 * number of highlight terms in the fragment
+message HighlightFragment{      
+    int64 start_offset = 1;
+    int64 end_offset = 2;
+    // char offset of the highlight terms in the fragment
+    repeated int64 offsets = 3;
+}
+
+message HighlightResult{       
+    repeated HighlightFragment fragments = 2;
+}
+
+message GetHighlightResponse{
+    common.Status status = 1;
+    repeated HighlightResult results = 2;
 }
 
 message ListLoadedSegmentsRequest {

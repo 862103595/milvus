@@ -23,6 +23,7 @@ mod index_writer_text_c;
 mod index_writer_v5;
 mod index_writer_v7;
 mod log;
+mod log_c;
 mod milvus_id_collector;
 mod string_c;
 mod token_stream_c;
@@ -32,6 +33,8 @@ mod util_c;
 mod vec_collector;
 
 pub mod analyzer;
+pub mod phrase_match_slop;
+mod phrase_match_slop_c;
 
 use error::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

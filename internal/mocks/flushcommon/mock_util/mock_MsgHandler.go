@@ -69,6 +69,54 @@ func (_c *MockMsgHandler_HandleAlterCollection_Call) RunAndReturn(run func(conte
 	return _c
 }
 
+// HandleAlterWAL provides a mock function with given fields: ctx, alterWALMsg, vchannel
+func (_m *MockMsgHandler) HandleAlterWAL(ctx context.Context, alterWALMsg message.ImmutableAlterWALMessageV2, vchannel string) error {
+	ret := _m.Called(ctx, alterWALMsg, vchannel)
+
+	if len(ret) == 0 {
+		panic("no return value specified for HandleAlterWAL")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, message.ImmutableAlterWALMessageV2, string) error); ok {
+		r0 = rf(ctx, alterWALMsg, vchannel)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockMsgHandler_HandleAlterWAL_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'HandleAlterWAL'
+type MockMsgHandler_HandleAlterWAL_Call struct {
+	*mock.Call
+}
+
+// HandleAlterWAL is a helper method to define mock.On call
+//   - ctx context.Context
+//   - alterWALMsg message.ImmutableAlterWALMessageV2
+//   - vchannel string
+func (_e *MockMsgHandler_Expecter) HandleAlterWAL(ctx interface{}, alterWALMsg interface{}, vchannel interface{}) *MockMsgHandler_HandleAlterWAL_Call {
+	return &MockMsgHandler_HandleAlterWAL_Call{Call: _e.mock.On("HandleAlterWAL", ctx, alterWALMsg, vchannel)}
+}
+
+func (_c *MockMsgHandler_HandleAlterWAL_Call) Run(run func(ctx context.Context, alterWALMsg message.ImmutableAlterWALMessageV2, vchannel string)) *MockMsgHandler_HandleAlterWAL_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(message.ImmutableAlterWALMessageV2), args[2].(string))
+	})
+	return _c
+}
+
+func (_c *MockMsgHandler_HandleAlterWAL_Call) Return(_a0 error) *MockMsgHandler_HandleAlterWAL_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockMsgHandler_HandleAlterWAL_Call) RunAndReturn(run func(context.Context, message.ImmutableAlterWALMessageV2, string) error) *MockMsgHandler_HandleAlterWAL_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // HandleCreateSegment provides a mock function with given fields: ctx, createSegmentMsg
 func (_m *MockMsgHandler) HandleCreateSegment(ctx context.Context, createSegmentMsg message.ImmutableCreateSegmentMessageV2) error {
 	ret := _m.Called(ctx, createSegmentMsg)
@@ -162,6 +210,53 @@ func (_c *MockMsgHandler_HandleFlush_Call) RunAndReturn(run func(message.Immutab
 	return _c
 }
 
+// HandleFlushAll provides a mock function with given fields: vchannel, flushAllMsg
+func (_m *MockMsgHandler) HandleFlushAll(vchannel string, flushAllMsg message.ImmutableFlushAllMessageV2) error {
+	ret := _m.Called(vchannel, flushAllMsg)
+
+	if len(ret) == 0 {
+		panic("no return value specified for HandleFlushAll")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(string, message.ImmutableFlushAllMessageV2) error); ok {
+		r0 = rf(vchannel, flushAllMsg)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockMsgHandler_HandleFlushAll_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'HandleFlushAll'
+type MockMsgHandler_HandleFlushAll_Call struct {
+	*mock.Call
+}
+
+// HandleFlushAll is a helper method to define mock.On call
+//   - vchannel string
+//   - flushAllMsg message.ImmutableFlushAllMessageV2
+func (_e *MockMsgHandler_Expecter) HandleFlushAll(vchannel interface{}, flushAllMsg interface{}) *MockMsgHandler_HandleFlushAll_Call {
+	return &MockMsgHandler_HandleFlushAll_Call{Call: _e.mock.On("HandleFlushAll", vchannel, flushAllMsg)}
+}
+
+func (_c *MockMsgHandler_HandleFlushAll_Call) Run(run func(vchannel string, flushAllMsg message.ImmutableFlushAllMessageV2)) *MockMsgHandler_HandleFlushAll_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(string), args[1].(message.ImmutableFlushAllMessageV2))
+	})
+	return _c
+}
+
+func (_c *MockMsgHandler_HandleFlushAll_Call) Return(_a0 error) *MockMsgHandler_HandleFlushAll_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockMsgHandler_HandleFlushAll_Call) RunAndReturn(run func(string, message.ImmutableFlushAllMessageV2) error) *MockMsgHandler_HandleFlushAll_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // HandleManualFlush provides a mock function with given fields: flushMsg
 func (_m *MockMsgHandler) HandleManualFlush(flushMsg message.ImmutableManualFlushMessageV2) error {
 	ret := _m.Called(flushMsg)
@@ -251,6 +346,52 @@ func (_c *MockMsgHandler_HandleSchemaChange_Call) Return(_a0 error) *MockMsgHand
 }
 
 func (_c *MockMsgHandler_HandleSchemaChange_Call) RunAndReturn(run func(context.Context, message.ImmutableSchemaChangeMessageV2) error) *MockMsgHandler_HandleSchemaChange_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// HandleTruncateCollection provides a mock function with given fields: truncateCollectionMsg
+func (_m *MockMsgHandler) HandleTruncateCollection(truncateCollectionMsg message.ImmutableTruncateCollectionMessageV2) error {
+	ret := _m.Called(truncateCollectionMsg)
+
+	if len(ret) == 0 {
+		panic("no return value specified for HandleTruncateCollection")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(message.ImmutableTruncateCollectionMessageV2) error); ok {
+		r0 = rf(truncateCollectionMsg)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockMsgHandler_HandleTruncateCollection_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'HandleTruncateCollection'
+type MockMsgHandler_HandleTruncateCollection_Call struct {
+	*mock.Call
+}
+
+// HandleTruncateCollection is a helper method to define mock.On call
+//   - truncateCollectionMsg message.ImmutableTruncateCollectionMessageV2
+func (_e *MockMsgHandler_Expecter) HandleTruncateCollection(truncateCollectionMsg interface{}) *MockMsgHandler_HandleTruncateCollection_Call {
+	return &MockMsgHandler_HandleTruncateCollection_Call{Call: _e.mock.On("HandleTruncateCollection", truncateCollectionMsg)}
+}
+
+func (_c *MockMsgHandler_HandleTruncateCollection_Call) Run(run func(truncateCollectionMsg message.ImmutableTruncateCollectionMessageV2)) *MockMsgHandler_HandleTruncateCollection_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(message.ImmutableTruncateCollectionMessageV2))
+	})
+	return _c
+}
+
+func (_c *MockMsgHandler_HandleTruncateCollection_Call) Return(_a0 error) *MockMsgHandler_HandleTruncateCollection_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockMsgHandler_HandleTruncateCollection_Call) RunAndReturn(run func(message.ImmutableTruncateCollectionMessageV2) error) *MockMsgHandler_HandleTruncateCollection_Call {
 	_c.Call.Return(run)
 	return _c
 }

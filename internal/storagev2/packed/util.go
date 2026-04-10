@@ -60,6 +60,16 @@ func GetFileSize(path string, storageConfig *indexpb.StorageConfig) (int64, erro
 	}
 }
 
+// tlsMinVersionForStorage converts TLS min version config value
+// to the format expected by milvus-storage. "default" and "" map to ""
+// (empty string = system/library default).
+func tlsMinVersionForStorage(v string) string {
+	if v == "" || v == "default" {
+		return ""
+	}
+	return v
+}
+
 func GetCStorageConfig(storageConfig *indexpb.StorageConfig) C.CStorageConfig {
 	cStorageConfig := C.CStorageConfig{
 		address:                C.CString(storageConfig.GetAddress()),
@@ -79,6 +89,9 @@ func GetCStorageConfig(storageConfig *indexpb.StorageConfig) C.CStorageConfig {
 		requestTimeoutMs:       C.int64_t(storageConfig.GetRequestTimeoutMs()),
 		gcp_credential_json:    C.CString(storageConfig.GetGcpCredentialJSON()),
 		use_custom_part_upload: true,
+		max_connections:        C.uint32_t(storageConfig.GetMaxConnections()),
+		tls_min_version:        C.CString(tlsMinVersionForStorage(storageConfig.GetSslTlsMinVersion())),
+		use_crc32c_checksum:    C.bool(storageConfig.GetUseCrc32CChecksum()),
 	}
 	return cStorageConfig
 }
@@ -96,4 +109,5 @@ func DeleteCStorageConfig(cStorageConfig C.CStorageConfig) {
 	C.free(unsafe.Pointer(cStorageConfig.sslCACert))
 	C.free(unsafe.Pointer(cStorageConfig.region))
 	C.free(unsafe.Pointer(cStorageConfig.gcp_credential_json))
+	C.free(unsafe.Pointer(cStorageConfig.tls_min_version))
 }

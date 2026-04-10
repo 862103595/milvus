@@ -27,18 +27,21 @@ import (
 
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/task"
+	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type StatsInspector interface {
 	Start()
 	Stop()
-	SubmitStatsTask(originSegmentID, targetSegmentID int64, subJobType indexpb.StatsSubJob, canRecycle bool) error
+	SubmitStatsTask(originSegmentID, targetSegmentID int64, subJobType indexpb.StatsSubJob, canRecycle bool, resources []*internalpb.FileResourceInfo) error
 	GetStatsTask(originSegmentID int64, subJobType indexpb.StatsSubJob) *indexpb.StatsTask
 	DropStatsTask(originSegmentID int64, subJobType indexpb.StatsSubJob) error
 }
@@ -102,6 +105,17 @@ func (si *statsInspector) reloadFromMeta() {
 			st.GetState() != indexpb.JobState_JobStateInProgress {
 			continue
 		}
+		if si.isExternalCollection(st.GetCollectionID()) {
+			log.Info("skip reloading stats task for external collection",
+				zap.Int64("taskID", st.GetTaskID()),
+				zap.Int64("collectionID", st.GetCollectionID()))
+			if err := si.mt.statsTaskMeta.MarkTaskCanRecycle(st.GetTaskID()); err != nil {
+				log.Warn("mark stats task can recycle failed",
+					zap.Int64("taskID", st.GetTaskID()),
+					zap.Error(err))
+			}
+			continue
+		}
 		segment := si.mt.GetHealthySegment(si.ctx, st.GetSegmentID())
 		taskSlot := int64(0)
 		if segment != nil {
@@ -146,7 +160,7 @@ func (si *statsInspector) enableBM25() bool {
 
 func needDoTextIndex(segment *SegmentInfo, fieldIDs []UniqueID) bool {
 	if !isFlush(segment) || segment.GetLevel() == datapb.SegmentLevel_L0 ||
-		!segment.GetIsSorted() {
+		(!segment.GetIsSorted() && !segment.GetIsSortedByNamespace()) {
 		return false
 	}
 
@@ -163,7 +177,7 @@ func needDoTextIndex(segment *SegmentInfo, fieldIDs []UniqueID) bool {
 
 func needDoJsonKeyIndex(segment *SegmentInfo, fieldIDs []UniqueID) bool {
 	if !isFlush(segment) || segment.GetLevel() == datapb.SegmentLevel_L0 ||
-		!segment.GetIsSorted() {
+		(!segment.GetIsSorted() && !segment.GetIsSortedByNamespace()) {
 		return false
 	}
 
@@ -191,6 +205,9 @@ func needDoBM25(segment *SegmentInfo, fieldIDs []UniqueID) bool {
 func (si *statsInspector) triggerTextStatsTask() {
 	collections := si.mt.GetCollections()
 	for _, collection := range collections {
+		if collection == nil || collection.IsExternal() {
+			continue
+		}
 		needTriggerFieldIDs := make([]UniqueID, 0)
 		for _, field := range collection.Schema.GetFields() {
 			// TODO @longjiquan: please replace it to fieldSchemaHelper.EnableMath
@@ -201,11 +218,21 @@ func (si *statsInspector) triggerTextStatsTask() {
 			needTriggerFieldIDs = append(needTriggerFieldIDs, field.GetFieldID())
 		}
 		segments := si.mt.SelectSegments(si.ctx, WithCollection(collection.ID), SegmentFilterFunc(func(seg *SegmentInfo) bool {
-			return seg.GetIsSorted() && needDoTextIndex(seg, needTriggerFieldIDs)
+			return (seg.GetIsSorted() || seg.GetIsSortedByNamespace()) && needDoTextIndex(seg, needTriggerFieldIDs)
 		}))
 
+		resources := []*internalpb.FileResourceInfo{}
+		var err error
+		if fileresource.IsRefMode(paramtable.Get().CommonCfg.DNFileResourceMode.GetValue()) && len(collection.Schema.GetFileResourceIds()) > 0 {
+			resources, err = si.mt.GetFileResources(si.ctx, collection.Schema.GetFileResourceIds()...)
+			if err != nil {
+				log.Warn("get file resources for collection failed, wait for retry", zap.Int64("collectionID", collection.ID), zap.Error(err))
+				continue
+			}
+		}
+
 		for _, segment := range segments {
-			if err := si.SubmitStatsTask(segment.GetID(), segment.GetID(), indexpb.StatsSubJob_TextIndexJob, true); err != nil {
+			if err := si.SubmitStatsTask(segment.GetID(), segment.GetID(), indexpb.StatsSubJob_TextIndexJob, true, resources); err != nil {
 				log.Warn("create stats task with text index for segment failed, wait for retry",
 					zap.Int64("segmentID", segment.GetID()), zap.Error(err))
 				continue
@@ -217,6 +244,9 @@ func (si *statsInspector) triggerTextStatsTask() {
 func (si *statsInspector) triggerJsonKeyIndexStatsTask(lastJSONStatsLastTrigger int64, maxJSONStatsTaskCount int) (int64, int) {
 	collections := si.mt.GetCollections()
 	for _, collection := range collections {
+		if collection == nil || collection.IsExternal() {
+			continue
+		}
 		needTriggerFieldIDs := make([]UniqueID, 0)
 		for _, field := range collection.Schema.GetFields() {
 			h := typeutil.CreateFieldSchemaHelper(field)
@@ -235,7 +265,7 @@ func (si *statsInspector) triggerJsonKeyIndexStatsTask(lastJSONStatsLastTrigger 
 			if maxJSONStatsTaskCount >= Params.DataCoordCfg.JSONStatsTriggerCount.GetAsInt() {
 				break
 			}
-			if err := si.SubmitStatsTask(segment.GetID(), segment.GetID(), indexpb.StatsSubJob_JsonKeyIndexJob, true); err != nil {
+			if err := si.SubmitStatsTask(segment.GetID(), segment.GetID(), indexpb.StatsSubJob_JsonKeyIndexJob, true, nil); err != nil {
 				log.Warn("create stats task with json key index for segment failed, wait for retry:",
 					zap.Int64("segmentID", segment.GetID()), zap.Error(err))
 				continue
@@ -249,6 +279,9 @@ func (si *statsInspector) triggerJsonKeyIndexStatsTask(lastJSONStatsLastTrigger 
 func (si *statsInspector) triggerBM25StatsTask() {
 	collections := si.mt.GetCollections()
 	for _, collection := range collections {
+		if collection == nil || collection.IsExternal() {
+			continue
+		}
 		needTriggerFieldIDs := make([]UniqueID, 0)
 		for _, field := range collection.Schema.GetFields() {
 			// TODO: docking bm25 stats task
@@ -257,11 +290,11 @@ func (si *statsInspector) triggerBM25StatsTask() {
 			}
 		}
 		segments := si.mt.SelectSegments(si.ctx, WithCollection(collection.ID), SegmentFilterFunc(func(seg *SegmentInfo) bool {
-			return seg.GetIsSorted() && needDoBM25(seg, needTriggerFieldIDs)
+			return (seg.GetIsSorted() || seg.GetIsSortedByNamespace()) && needDoBM25(seg, needTriggerFieldIDs)
 		}))
 
 		for _, segment := range segments {
-			if err := si.SubmitStatsTask(segment.GetID(), segment.GetID(), indexpb.StatsSubJob_BM25Job, true); err != nil {
+			if err := si.SubmitStatsTask(segment.GetID(), segment.GetID(), indexpb.StatsSubJob_BM25Job, true, nil); err != nil {
 				log.Warn("create stats task with bm25 for segment failed, wait for retry",
 					zap.Int64("segmentID", segment.GetID()), zap.Error(err))
 				continue
@@ -301,10 +334,18 @@ func (si *statsInspector) cleanupStatsTasksLoop() {
 
 func (si *statsInspector) SubmitStatsTask(originSegmentID, targetSegmentID int64,
 	subJobType indexpb.StatsSubJob, canRecycle bool,
+	resources []*internalpb.FileResourceInfo,
 ) error {
 	originSegment := si.mt.GetHealthySegment(si.ctx, originSegmentID)
 	if originSegment == nil {
 		return merr.WrapErrSegmentNotFound(originSegmentID)
+	}
+	if si.isExternalCollection(originSegment.GetCollectionID()) {
+		log.Ctx(si.ctx).Info("skip submit stats task for external collection",
+			zap.Int64("collectionID", originSegment.GetCollectionID()),
+			zap.Int64("segmentID", originSegmentID),
+			zap.String("subJobType", subJobType.String()))
+		return nil
 	}
 	taskID, err := si.allocator.AllocID(context.Background())
 	if err != nil {
@@ -329,6 +370,7 @@ func (si *statsInspector) SubmitStatsTask(originSegmentID, targetSegmentID int64
 		TargetSegmentID: targetSegmentID,
 		SubJobType:      subJobType,
 		CanRecycle:      canRecycle,
+		FileResources:   resources,
 	}
 	if err = si.mt.statsTaskMeta.AddStatsTask(t); err != nil {
 		if errors.Is(err, merr.ErrTaskDuplicate) {
@@ -369,4 +411,12 @@ func (si *statsInspector) DropStatsTask(originSegmentID int64, subJobType indexp
 	log.Info("statsJobManager drop stats task success", zap.Int64("segmentID", originSegmentID),
 		zap.Int64("taskID", task.GetTaskID()), zap.String("subJobType", subJobType.String()))
 	return nil
+}
+
+func (si *statsInspector) isExternalCollection(collectionID int64) bool {
+	if si.mt == nil {
+		return false
+	}
+	coll := si.mt.GetCollection(collectionID)
+	return coll != nil && coll.IsExternal()
 }

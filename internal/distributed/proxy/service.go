@@ -49,6 +49,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	mix "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
 	"github.com/milvus-io/milvus/internal/distributed/proxy/httpserver"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
 	mhttp "github.com/milvus-io/milvus/internal/http"
 	"github.com/milvus-io/milvus/internal/proxy"
@@ -129,11 +130,12 @@ func authenticate(c *gin.Context) {
 		if proxy.PasswordVerify(c, username, password) {
 			log.Ctx(context.TODO()).Debug("auth successful", zap.String("username", username))
 			c.Set(httpserver.ContextUsername, username)
+			c.Set(httpserver.ContextToken, fmt.Sprintf("%s%s%s", username, util.CredentialSeparator, password))
 			return
 		}
 	}
 	rawToken := httpserver.GetAuthorization(c)
-	if rawToken != "" && !strings.Contains(rawToken, util.CredentialSeperator) {
+	if rawToken != "" && !strings.Contains(rawToken, util.CredentialSeparator) {
 		user, err := proxy.VerifyAPIKey(rawToken)
 		if err == nil {
 			c.Set(httpserver.ContextUsername, user)
@@ -164,6 +166,11 @@ func (s *Server) registerHTTPServer() {
 	metricsGinHandler := gin.Default()
 	apiv1 := metricsGinHandler.Group(apiPathPrefix)
 	apiv1.Use(httpserver.RequestHandlerFunc)
+	// Add authentication middleware if authorization is enabled
+	// This ensures the metrics port follows the same security policy as the main HTTP server
+	if proxy.Params.CommonCfg.AuthorizationEnabled.GetAsBool() {
+		apiv1.Use(authenticate)
+	}
 	handlers := httpserver.NewHandlers(s.proxy)
 	handlers.RegisterRoutesTo(apiv1)
 	if p, ok := s.proxy.(*proxy.Proxy); ok {
@@ -239,6 +246,7 @@ func (s *Server) startExternalGrpc(errChan chan error) {
 	var unaryServerOption grpc.ServerOption
 	if enableCustomInterceptor {
 		unaryServerOption = grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			streaming.ForwardLegacyProxyUnaryServerInterceptor(),
 			proxy.DatabaseInterceptor(),
 			UnaryRequestStatsInterceptor,
 			accesslog.UnaryAccessLogInterceptor,
@@ -319,6 +327,7 @@ func (s *Server) startExternalGrpc(errChan chan error) {
 	}
 
 	milvuspb.RegisterMilvusServiceServer(s.grpcExternalServer, s)
+	milvuspb.RegisterClientTelemetryServiceServer(s.grpcExternalServer, s)
 	grpc_health_v1.RegisterHealthServer(s.grpcExternalServer, s)
 	errChan <- nil
 
@@ -445,7 +454,8 @@ func (s *Server) init() error {
 		etcdConfig.EtcdTLSCert.GetValue(),
 		etcdConfig.EtcdTLSKey.GetValue(),
 		etcdConfig.EtcdTLSCACert.GetValue(),
-		etcdConfig.EtcdTLSMinVersion.GetValue())
+		etcdConfig.EtcdTLSMinVersion.GetValue(),
+		etcdConfig.ClientOptions()...)
 	if err != nil {
 		log.Debug("Proxy connect to etcd failed", zap.Error(err))
 		return err
@@ -623,6 +633,11 @@ func (s *Server) DropCollection(ctx context.Context, request *milvuspb.DropColle
 	return s.proxy.DropCollection(ctx, request)
 }
 
+// TruncateCollection notifies Proxy to truncate a collection
+func (s *Server) TruncateCollection(ctx context.Context, request *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	return s.proxy.TruncateCollection(ctx, request)
+}
+
 // HasCollection notifies Proxy to check a collection's existence at specified timestamp
 func (s *Server) HasCollection(ctx context.Context, request *milvuspb.HasCollectionRequest) (*milvuspb.BoolResponse, error) {
 	return s.proxy.HasCollection(ctx, request)
@@ -668,6 +683,18 @@ func (s *Server) AlterCollection(ctx context.Context, request *milvuspb.AlterCol
 
 func (s *Server) AlterCollectionField(ctx context.Context, request *milvuspb.AlterCollectionFieldRequest) (*commonpb.Status, error) {
 	return s.proxy.AlterCollectionField(ctx, request)
+}
+
+func (s *Server) AddCollectionFunction(ctx context.Context, request *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.proxy.AddCollectionFunction(ctx, request)
+}
+
+func (s *Server) AlterCollectionFunction(ctx context.Context, request *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.proxy.AlterCollectionFunction(ctx, request)
+}
+
+func (s *Server) DropCollectionFunction(ctx context.Context, request *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.proxy.DropCollectionFunction(ctx, request)
 }
 
 // CreatePartition notifies Proxy to create a partition
@@ -1163,4 +1190,78 @@ func (s *Server) GetReplicateInfo(ctx context.Context, req *milvuspb.GetReplicat
 // CreateReplicateStream establishes a replication stream on the target Milvus cluster.
 func (s *Server) CreateReplicateStream(stream milvuspb.MilvusService_CreateReplicateStreamServer) error {
 	return s.proxy.CreateReplicateStream(stream)
+}
+
+// DumpMessages streams messages from a WAL range for data salvage.
+func (s *Server) DumpMessages(req *milvuspb.DumpMessagesRequest, stream milvuspb.MilvusService_DumpMessagesServer) error {
+	return s.proxy.DumpMessages(req, stream)
+}
+
+// ComputePhraseMatchSlop computes the minimum slop required for phrase matching.
+func (s *Server) ComputePhraseMatchSlop(ctx context.Context, req *milvuspb.ComputePhraseMatchSlopRequest) (*milvuspb.ComputePhraseMatchSlopResponse, error) {
+	return s.proxy.ComputePhraseMatchSlop(ctx, req)
+}
+
+func (s *Server) CreateSnapshot(ctx context.Context, req *milvuspb.CreateSnapshotRequest) (*commonpb.Status, error) {
+	return s.proxy.CreateSnapshot(ctx, req)
+}
+
+func (s *Server) DropSnapshot(ctx context.Context, req *milvuspb.DropSnapshotRequest) (*commonpb.Status, error) {
+	return s.proxy.DropSnapshot(ctx, req)
+}
+
+func (s *Server) DescribeSnapshot(ctx context.Context, req *milvuspb.DescribeSnapshotRequest) (*milvuspb.DescribeSnapshotResponse, error) {
+	return s.proxy.DescribeSnapshot(ctx, req)
+}
+
+func (s *Server) ListSnapshots(ctx context.Context, req *milvuspb.ListSnapshotsRequest) (*milvuspb.ListSnapshotsResponse, error) {
+	return s.proxy.ListSnapshots(ctx, req)
+}
+
+func (s *Server) RestoreSnapshot(ctx context.Context, req *milvuspb.RestoreSnapshotRequest) (*milvuspb.RestoreSnapshotResponse, error) {
+	return s.proxy.RestoreSnapshot(ctx, req)
+}
+
+func (s *Server) GetRestoreSnapshotState(ctx context.Context, req *milvuspb.GetRestoreSnapshotStateRequest) (*milvuspb.GetRestoreSnapshotStateResponse, error) {
+	return s.proxy.GetRestoreSnapshotState(ctx, req)
+}
+
+func (s *Server) ListRestoreSnapshotJobs(ctx context.Context, req *milvuspb.ListRestoreSnapshotJobsRequest) (*milvuspb.ListRestoreSnapshotJobsResponse, error) {
+	return s.proxy.ListRestoreSnapshotJobs(ctx, req)
+}
+
+// ClientHeartbeat handles client telemetry heartbeat requests
+func (s *Server) ClientHeartbeat(ctx context.Context, req *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error) {
+	return s.proxy.ClientHeartbeat(ctx, req)
+}
+
+// GetClientTelemetry retrieves client telemetry data
+func (s *Server) GetClientTelemetry(ctx context.Context, req *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error) {
+	return s.proxy.GetClientTelemetry(ctx, req)
+}
+
+// PushClientCommand pushes a command to clients
+func (s *Server) PushClientCommand(ctx context.Context, req *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error) {
+	return s.proxy.PushClientCommand(ctx, req)
+}
+
+// DeleteClientCommand deletes a client command
+func (s *Server) DeleteClientCommand(ctx context.Context, req *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error) {
+	return s.proxy.DeleteClientCommand(ctx, req)
+}
+
+func (s *Server) BatchUpdateManifest(ctx context.Context, req *milvuspb.BatchUpdateManifestRequest) (*commonpb.Status, error) {
+	return s.proxy.BatchUpdateManifest(ctx, req)
+}
+
+func (s *Server) RefreshExternalCollection(ctx context.Context, req *milvuspb.RefreshExternalCollectionRequest) (*milvuspb.RefreshExternalCollectionResponse, error) {
+	return s.proxy.RefreshExternalCollection(ctx, req)
+}
+
+func (s *Server) GetRefreshExternalCollectionProgress(ctx context.Context, req *milvuspb.GetRefreshExternalCollectionProgressRequest) (*milvuspb.GetRefreshExternalCollectionProgressResponse, error) {
+	return s.proxy.GetRefreshExternalCollectionProgress(ctx, req)
+}
+
+func (s *Server) ListRefreshExternalCollectionJobs(ctx context.Context, req *milvuspb.ListRefreshExternalCollectionJobsRequest) (*milvuspb.ListRefreshExternalCollectionJobsResponse, error) {
+	return s.proxy.ListRefreshExternalCollectionJobs(ctx, req)
 }

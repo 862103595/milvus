@@ -24,6 +24,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/flushcommon/broker"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -102,13 +103,6 @@ func (ccu *ChannelCheckpointUpdater) Start() {
 	}
 }
 
-func (ccu *ChannelCheckpointUpdater) getTask(channel string) (*channelCPUpdateTask, bool) {
-	ccu.mu.RLock()
-	defer ccu.mu.RUnlock()
-	task, ok := ccu.tasks[channel]
-	return task, ok
-}
-
 func (ccu *ChannelCheckpointUpdater) trigger() {
 	select {
 	case ccu.notifyChan <- struct{}{}:
@@ -176,7 +170,8 @@ func (ccu *ChannelCheckpointUpdater) execute() {
 }
 
 func (ccu *ChannelCheckpointUpdater) AddTask(channelPos *msgpb.MsgPosition, flush bool, callback func()) {
-	if channelPos == nil || channelPos.GetMsgID() == nil || channelPos.GetChannelName() == "" {
+	// Note: Only earliest msgId of woodpecker can be empty bytes
+	if channelPos == nil || (channelPos.GetMsgID() == nil && channelPos.GetWALName() != commonpb.WALName_WoodPecker) || channelPos.GetChannelName() == "" {
 		log.Warn("illegal checkpoint", zap.Any("pos", channelPos))
 		return
 	}
@@ -185,10 +180,15 @@ func (ccu *ChannelCheckpointUpdater) AddTask(channelPos *msgpb.MsgPosition, flus
 		defer ccu.trigger()
 	}
 	channel := channelPos.GetChannelName()
-	task, ok := ccu.getTask(channelPos.GetChannelName())
+
+	// Use full lock to avoid TOCTOU race between getTask check and task addition.
+	// Without this, a task could be deleted by updateCheckpoints between the check
+	// and the add, causing duplicate callbacks.
+	ccu.mu.Lock()
+	defer ccu.mu.Unlock()
+
+	task, ok := ccu.tasks[channel]
 	if !ok {
-		ccu.mu.Lock()
-		defer ccu.mu.Unlock()
 		ccu.tasks[channel] = &channelCPUpdateTask{
 			pos:      channelPos,
 			callback: callback,
@@ -206,8 +206,6 @@ func (ccu *ChannelCheckpointUpdater) AddTask(channelPos *msgpb.MsgPosition, flus
 	// 1. `task.pos.GetTimestamp() < channelPos.GetTimestamp()`: position updated, update task position
 	// 2. `flush && !task.flush`: position not being updated, but flush is triggered, update task flush flag
 	if task.pos.GetTimestamp() < channelPos.GetTimestamp() || (flush && !task.flush) {
-		ccu.mu.Lock()
-		defer ccu.mu.Unlock()
 		ccu.tasks[channel] = &channelCPUpdateTask{
 			pos:      max(channelPos, task.pos),
 			callback: callback,

@@ -15,7 +15,6 @@
 
 #include "common/common_type_c.h"
 #include "segcore/token_stream_c.h"
-#include "common/type_c.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,7 +26,9 @@ CStatus
 set_tokenizer_option(const char* params);
 
 CStatus
-create_tokenizer(const char* params, CTokenizer* tokenizer);
+create_tokenizer(const char* params,
+                 const char* extra_info,
+                 CTokenizer* tokenizer);
 
 CStatus
 clone_tokenizer(CTokenizer* tokenizer, CTokenizer* rst);
@@ -35,8 +36,14 @@ clone_tokenizer(CTokenizer* tokenizer, CTokenizer* rst);
 void
 free_tokenizer(CTokenizer tokenizer);
 
-CStatus
-validate_tokenizer(const char* params);
+typedef struct CValidateResult {
+    int64_t* resource_ids;
+    uint64_t resource_ids_count;
+    CStatus status;
+} CValidateResult;
+
+CValidateResult
+validate_tokenizer(const char* params, const char* extra_info);
 
 CTokenStream
 create_token_stream(CTokenizer tokenizer, const char* text, uint32_t text_len);

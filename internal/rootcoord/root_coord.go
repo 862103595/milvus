@@ -43,11 +43,14 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore"
 	kvmetastore "github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/rootcoord/telemetry"
 	"github.com/milvus-io/milvus/internal/rootcoord/tombstone"
+	"github.com/milvus-io/milvus/internal/storage"
 	streamingcoord "github.com/milvus-io/milvus/internal/streamingcoord/server"
 	tso2 "github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
@@ -117,6 +120,7 @@ type Core struct {
 	mixCoord       types.MixCoord
 	streamingCoord *streamingcoord.Server
 	quotaCenter    *QuotaCenter
+	keyManager     *KeyManager
 
 	stateCode atomic.Int32
 	initOnce  sync.Once
@@ -130,6 +134,19 @@ type Core struct {
 	metricsRequest *metricsinfo.MetricsRequest
 
 	tombstoneSweeper tombstone.TombstoneSweeper
+	storage          storage.ChunkManager // used to check file resource existence
+
+	fileResourceObserver FileResourceObserver
+
+	// telemetry manager for client telemetry collection and command management
+	telemetryMgr *telemetry.TelemetryManager
+}
+
+type FileResourceObserver interface {
+	CheckAllQnReady() error
+	InitMeta(meta IMetaTable)
+	Notify()
+	Sync() error
 }
 
 // --------------------- function --------------------------
@@ -158,8 +175,20 @@ func (c *Core) UpdateStateCode(code commonpb.StateCode) {
 	log.Ctx(c.ctx).Info("update rootcoord state", zap.String("state", code.String()))
 }
 
+func (c *Core) SetFileResourceObserver(observer FileResourceObserver) {
+	c.fileResourceObserver = observer
+}
+
 func (c *Core) GetStateCode() commonpb.StateCode {
 	return commonpb.StateCode(c.stateCode.Load())
+}
+
+func (c *Core) GetMetaTable() IMetaTable {
+	return c.meta
+}
+
+func (c *Core) GetQuotaCenter() *QuotaCenter {
+	return c.quotaCenter
 }
 
 func (c *Core) sendTimeTick(t Timestamp, reason string) error {
@@ -182,9 +211,6 @@ func (c *Core) sendTimeTick(t Timestamp, reason string) error {
 }
 
 func (c *Core) sendMinDdlTsAsTt() {
-	if !paramtable.Get().CommonCfg.TTMsgEnabled.GetAsBool() {
-		return
-	}
 	log := log.Ctx(c.ctx)
 	code := c.GetStateCode()
 	if code != commonpb.StateCode_Healthy {
@@ -444,7 +470,7 @@ func (c *Core) initInternal() error {
 	c.proxyWatcher = proxyutil.NewProxyWatcher(
 		c.etcdCli,
 		c.chanTimeTick.initSessions,
-		c.proxyClientManager.AddProxyClients,
+		c.proxyClientManager.SetProxyClients,
 	)
 	c.proxyWatcher.AddSessionFunc(c.chanTimeTick.addSession, c.proxyClientManager.AddProxyClient)
 	c.proxyWatcher.DelSessionFunc(c.chanTimeTick.delSession, c.proxyClientManager.DelProxyClient)
@@ -452,8 +478,17 @@ func (c *Core) initInternal() error {
 
 	c.metricsCacheManager = metricsinfo.NewMetricsCacheManager()
 
+	// Initialize telemetry manager for client telemetry collection
+	c.telemetryMgr = telemetry.NewTelemetryManager(c.etcdCli)
+	log.Debug("init telemetry manager done")
+
 	c.quotaCenter = NewQuotaCenter(c.proxyClientManager, c.mixCoord, c.tsoAllocator, c.meta)
 	log.Debug("RootCoord init QuotaCenter done")
+
+	// Initialize KeyManager for KMS key state management
+	c.keyManager = NewKeyManager(c.ctx, c.meta)
+	c.quotaCenter.SetKeyManager(c.keyManager)
+	log.Debug("RootCoord init KeyManager done")
 
 	if err := c.initCredentials(initCtx); err != nil {
 		return err
@@ -464,6 +499,16 @@ func (c *Core) initInternal() error {
 		return err
 	}
 
+	cli, err := c.newChunkManagerFactory()
+	if err != nil {
+		return err
+	}
+	c.storage = cli
+
+	// init file resource observer
+	if c.fileResourceObserver != nil {
+		c.fileResourceObserver.InitMeta(c.meta)
+	}
 	log.Info("init rootcoord done", zap.Int64("nodeID", paramtable.GetNodeID()), zap.String("Address", c.address))
 	return nil
 }
@@ -645,6 +690,10 @@ func (c *Core) startInternal() error {
 		c.quotaCenter.Start()
 	}
 
+	if c.telemetryMgr != nil {
+		c.telemetryMgr.Start()
+	}
+
 	c.scheduler.Start()
 	go func() {
 		// refresh rbac cache
@@ -723,6 +772,9 @@ func (c *Core) Stop() error {
 	}
 	if c.quotaCenter != nil {
 		c.quotaCenter.stop()
+	}
+	if c.telemetryMgr != nil {
+		c.telemetryMgr.Stop()
 	}
 
 	c.revokeSession()
@@ -966,6 +1018,37 @@ func (c *Core) DropCollection(ctx context.Context, in *milvuspb.DropCollectionRe
 	return merr.Success(), nil
 }
 
+// TruncateCollection truncate collection
+func (c *Core) TruncateCollection(ctx context.Context, in *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.TruncateCollectionResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	metrics.RootCoordDDLReqCounter.WithLabelValues("TruncateCollection", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("TruncateCollection")
+
+	logger := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.String("name", in.GetCollectionName()))
+	logger.Info("received request to truncate collection")
+
+	if err := c.broadcastTruncateCollection(ctx, in); err != nil {
+		logger.Info("failed to truncate collection", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues("TruncateCollection", metrics.FailLabel).Inc()
+		return &milvuspb.TruncateCollectionResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("TruncateCollection", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("TruncateCollection").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	logger.Info("done to truncate collection")
+	return &milvuspb.TruncateCollectionResponse{
+		Status: merr.Success(),
+	}, nil
+}
+
 // HasCollection check collection existence
 func (c *Core) HasCollection(ctx context.Context, in *milvuspb.HasCollectionRequest) (*milvuspb.BoolResponse, error) {
 	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
@@ -1047,7 +1130,12 @@ func convertModelToDesc(collInfo *model.Collection, aliases []string, dbName str
 		StructArrayFields:  model.MarshalStructArrayFieldModels(collInfo.StructArrayFields),
 		Functions:          model.MarshalFunctionModels(collInfo.Functions),
 		EnableDynamicField: collInfo.EnableDynamicField,
+		EnableNamespace:    collInfo.EnableNamespace,
 		Properties:         collInfo.Properties,
+		FileResourceIds:    collInfo.FileResourceIds,
+		ExternalSource:     collInfo.ExternalSource,
+		ExternalSpec:       collInfo.ExternalSpec,
+		DbName:             dbName, // Use dbName parameter for consistency with resp.DbName
 	}
 	resp.CollectionID = collInfo.CollectionID
 	resp.VirtualChannelNames = collInfo.VirtualChannelNames
@@ -1070,65 +1158,6 @@ func convertModelToDesc(collInfo *model.Collection, aliases []string, dbName str
 	resp.UpdateTimestamp = collInfo.UpdateTimestamp
 	resp.UpdateTimestampStr = strconv.FormatUint(collInfo.UpdateTimestamp, 10)
 	return resp
-}
-
-// rewriteTimestampTzDefaultValueToString converts the default_value of TIMESTAMPTZ fields
-// in the DescribeCollectionResponse from the internal int64 (UTC microsecond) format
-// back to a human-readable, timezone-aware string (RFC3339Nano).
-//
-// This is necessary because TIMESTAMPTZ default values are stored internally as int64
-// after validation but must be returned to the user as a string, respecting the
-// collection's default timezone for display purposes if no explicit offset was stored.
-func rewriteTimestampTzDefaultValueToString(resp *milvuspb.DescribeCollectionResponse) error {
-	if resp.GetSchema() == nil {
-		return nil
-	}
-
-	// 1. Determine the target timezone for display.
-	// This is typically stored in the collection properties.
-	timezone, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, resp.GetSchema().GetProperties())
-	if !exist {
-		timezone = common.DefaultTimezone // Fallback to a default, like "UTC"
-	}
-
-	// 2. Iterate through all fields in the schema.
-	for _, fieldSchema := range resp.Schema.GetFields() {
-		// Only process TIMESTAMPTZ fields.
-		if fieldSchema.GetDataType() != schemapb.DataType_Timestamptz {
-			continue
-		}
-
-		defaultValue := fieldSchema.GetDefaultValue()
-		if defaultValue == nil {
-			continue
-		}
-
-		// 3. Check if the default value is stored in the internal int64 (LongData) format.
-		// If it's not LongData, we assume it's either unset or already a string (which shouldn't happen
-		// if the creation flow worked correctly).
-		utcMicro, ok := defaultValue.GetData().(*schemapb.ValueField_LongData)
-		if !ok {
-			continue // Skip if not stored as LongData (int64)
-		}
-
-		ts := utcMicro.LongData
-
-		// 4. Convert the int64 microsecond value back to a timezone-aware string.
-		tzString, err := funcutil.ConvertUnixMicroToTimezoneString(ts, timezone)
-		if err != nil {
-			// In a real system, you might log the error and use the raw int64 as a fallback string,
-			// but here we'll set a placeholder string to avoid crashing.
-			tzString = fmt.Sprintf("Error converting timestamp: %v", err)
-			return errors.Wrap(err, tzString)
-		}
-
-		// 5. Rewrite the default value field in the response schema.
-		// The protobuf oneof structure ensures setting one field clears the others.
-		fieldSchema.GetDefaultValue().Data = &schemapb.ValueField_StringData{
-			StringData: tzString,
-		}
-	}
-	return nil
 }
 
 func (c *Core) describeCollectionImpl(ctx context.Context, in *milvuspb.DescribeCollectionRequest, allowUnavailable bool) (*milvuspb.DescribeCollectionResponse, error) {
@@ -1164,7 +1193,9 @@ func (c *Core) describeCollectionImpl(ctx context.Context, in *milvuspb.Describe
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Warn("failed to describe collection", zap.Error(err))
+		if !errors.Is(err, merr.ErrCollectionNotFound) {
+			log.Warn("failed to describe collection", zap.Error(err))
+		}
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DescribeCollection", metrics.FailLabel).Inc()
 		return &milvuspb.DescribeCollectionResponse{
 			Status: merr.Status(err),
@@ -1339,6 +1370,100 @@ func (c *Core) AlterCollection(ctx context.Context, in *milvuspb.AlterCollection
 	return merr.Success(), nil
 }
 
+func (c *Core) AddCollectionFunction(ctx context.Context, in *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionFunction", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("AddCollectionFunction")
+
+	log := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.String("collectionName", in.GetCollectionName()),
+	)
+	log.Info("received request to Add collection function")
+
+	if err := c.broadcastAlterCollectionForAddFunction(ctx, in); err != nil {
+		if errors.Is(err, errIgnoredAlterCollection) {
+			log.Info("add collection function make no changes, ignore it")
+			metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionFunction", metrics.SuccessLabel).Inc()
+			return merr.Success(), nil
+		}
+		log.Warn("failed to alter collection function", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionFunction", metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AddCollectionFunction", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("AddCollectionFunction").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	log.Info("done to add collection function")
+	return merr.Success(), nil
+}
+
+func (c *Core) AlterCollectionFunction(ctx context.Context, in *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionFunction", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("AlterCollectionFunction")
+
+	log := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.String("collectionName", in.GetCollectionName()),
+	)
+	log.Info("received request to alter collection function")
+
+	if err := c.broadcastAlterCollectionForAlterFunction(ctx, in); err != nil {
+		if errors.Is(err, errIgnoredAlterCollection) {
+			log.Info("alter collection function make no changes, ignore it")
+			metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionFunction", metrics.SuccessLabel).Inc()
+			return merr.Success(), nil
+		}
+		log.Warn("failed to alter collection function", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionFunction", metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionFunction", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("AlterCollectionFunction").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	log.Info("done to alter collection function")
+	return merr.Success(), nil
+}
+
+func (c *Core) DropCollectionFunction(ctx context.Context, in *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollectionFunction", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("DropCollectionFunction")
+
+	log := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.String("collectionName", in.GetCollectionName()),
+		zap.String("functionName", in.GetFunctionName()),
+	)
+	log.Info("received request to drop collection function")
+
+	if err := c.broadcastAlterCollectionForDropFunction(ctx, in); err != nil {
+		if errors.Is(err, errIgnoredAlterCollection) {
+			log.Info("Drop collection function make no changes, ignore it")
+			metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollectionFunction", metrics.SuccessLabel).Inc()
+			return merr.Success(), nil
+		}
+		log.Warn("failed to drop collection function", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollectionFunction", metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollectionFunction", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("DropCollectionFunction").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	log.Info("done to drop collection function")
+	return merr.Success(), nil
+}
+
 func (c *Core) AlterCollectionField(ctx context.Context, in *milvuspb.AlterCollectionFieldRequest) (*commonpb.Status, error) {
 	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
 		return merr.Status(err), nil
@@ -1371,6 +1496,29 @@ func (c *Core) AlterCollectionField(ctx context.Context, in *milvuspb.AlterColle
 	metrics.RootCoordDDLReqLatency.WithLabelValues("AlterCollectionField").Observe(float64(tr.ElapseSpan().Milliseconds()))
 	log.Info("done to alter collection field")
 	return merr.Success(), nil
+}
+
+func (c *Core) AlterCollectionSchema(ctx context.Context, in *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.AlterCollectionSchemaResponse{}, nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionSchema", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("AlterCollectionSchema")
+
+	log := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.String("collectionName", in.GetCollectionName()),
+	)
+	log.Info("received request to alter collection schema")
+
+	// AlterCollectionSchema is currently a placeholder implementation
+	// The actual logic should handle schema alterations similar to AlterCollection
+	// For now, return success to satisfy the interface
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionSchema", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("AlterCollectionSchema").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	log.Info("done to alter collection schema")
+	return &milvuspb.AlterCollectionSchemaResponse{}, nil
 }
 
 func (c *Core) AlterDatabase(ctx context.Context, in *rootcoordpb.AlterDatabaseRequest) (*commonpb.Status, error) {
@@ -2863,6 +3011,113 @@ func (c *Core) OperatePrivilegeGroup(ctx context.Context, in *milvuspb.OperatePr
 	return merr.Success(), nil
 }
 
+// AddFileResource add file resource to rootcoord
+func (c *Core) AddFileResource(ctx context.Context, req *milvuspb.AddFileResourceRequest) (*commonpb.Status, error) {
+	method := "AddFileResource"
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder(method)
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", req))
+	ctxLog.Debug(method)
+
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	if exist, err := c.storage.Exist(ctx, req.GetPath()); err != nil {
+		return merr.Status(err), nil
+	} else if !exist {
+		return merr.Status(merr.WrapErrAsInputError(errors.Errorf("file resource path not exist"))), nil
+	}
+
+	id, err := c.tsoAllocator.GenerateTSO(1)
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	resource := &internalpb.FileResourceInfo{
+		Id:   int64(id),
+		Name: req.GetName(),
+		Path: req.GetPath(),
+	}
+	err = c.meta.AddFileResource(ctx, resource)
+	if err != nil {
+		return merr.Status(err), nil
+	}
+
+	if c.fileResourceObserver != nil {
+		err = c.fileResourceObserver.Sync()
+		if err != nil {
+			c.fileResourceObserver.Notify()
+			return merr.Status(errors.Wrap(err, "add file resource success but some node sync failed")), nil
+		}
+	}
+
+	ctxLog.Debug(method + " success")
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	return merr.Success(), nil
+}
+
+// RemoveFileResource remove file resource from rootcoord
+func (c *Core) RemoveFileResource(ctx context.Context, req *milvuspb.RemoveFileResourceRequest) (*commonpb.Status, error) {
+	method := "RemoveFileResource"
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder(method)
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", req))
+	ctxLog.Debug(method)
+
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+	err, exist := c.meta.RemoveFileResource(ctx, req.GetName())
+	if err != nil {
+		return merr.Status(err), nil
+	}
+
+	if exist && c.fileResourceObserver != nil {
+		err = c.fileResourceObserver.Sync()
+		if err != nil {
+			c.fileResourceObserver.Notify()
+			return merr.Status(errors.Wrap(err, "remove file resource success but some node sync failed")), nil
+		}
+	}
+
+	ctxLog.Debug(method + " success")
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	return merr.Success(), nil
+}
+
+// ListFileResources list file resources from rootcoord
+func (c *Core) ListFileResources(ctx context.Context, req *milvuspb.ListFileResourcesRequest) (*milvuspb.ListFileResourcesResponse, error) {
+	method := "ListFileResource"
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder(method)
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", req))
+	ctxLog.Debug(method)
+
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.ListFileResourcesResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	resources, _ := c.meta.ListFileResource(ctx)
+	ctxLog.Debug(method + " success")
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+
+	return &milvuspb.ListFileResourcesResponse{
+		Status: merr.Success(),
+		Resources: lo.Map(resources, func(resource *internalpb.FileResourceInfo, _ int) *milvuspb.FileResourceInfo {
+			return &milvuspb.FileResourceInfo{
+				Id:   resource.Id,
+				Name: resource.Name,
+				Path: resource.Path,
+			}
+		}),
+	}, nil
+}
+
 func (c *Core) expandPrivilegeGroups(ctx context.Context, grants []*milvuspb.GrantEntity, groups map[string][]*milvuspb.PrivilegeEntity) ([]*milvuspb.GrantEntity, error) {
 	newGrants := []*milvuspb.GrantEntity{}
 	createGrantEntity := func(grant *milvuspb.GrantEntity, privilegeName string) (*milvuspb.GrantEntity, error) {
@@ -2971,6 +3226,16 @@ func (c *Core) getCurrentUserVisibleDatabases(ctx context.Context) (typeutil.Set
 	return privilegeDatabases, nil
 }
 
+func (c *Core) newChunkManagerFactory() (storage.ChunkManager, error) {
+	chunkManagerFactory := storage.NewChunkManagerFactoryWithParam(Params)
+	cli, err := chunkManagerFactory.NewPersistentStorageChunkManager(c.ctx)
+	if err != nil {
+		log.Error("chunk manager init failed", zap.Error(err))
+		return nil, err
+	}
+	return cli, err
+}
+
 func isVisibleDatabaseForCurUser(currentDatabase string, visibleDatabases typeutil.Set[string]) bool {
 	if visibleDatabases.Contain(util.AnyWord) {
 		return true
@@ -3061,4 +3326,113 @@ func isVisibleCollectionForCurUser(collectionName string, visibleCollections typ
 
 func (c *Core) GetQuotaMetrics(ctx context.Context, req *internalpb.GetQuotaMetricsRequest) (*internalpb.GetQuotaMetricsResponse, error) {
 	return c.quotaCenter.getQuotaMetrics(), nil
+}
+
+func (c *Core) BackupEzk(ctx context.Context, req *internalpb.BackupEzkRequest) (*internalpb.BackupEzkResponse, error) {
+	method := "BackupEzk"
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder(method)
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.String("dbName", req.GetDbName()))
+	ctxLog.Debug(method)
+
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &internalpb.BackupEzkResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	db, err := c.meta.GetDatabaseByName(ctx, req.GetDbName(), 0)
+	if err != nil {
+		ctxLog.Warn("database not found", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return &internalpb.BackupEzkResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	ezkJSON, err := hookutil.BackupEZKFromDBProperties(db.Properties)
+	if err != nil {
+		ctxLog.Warn("failed to backup EZK", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return &internalpb.BackupEzkResponse{
+			Status: merr.Status(err),
+			Ezk:    "",
+		}, nil
+	}
+
+	ctxLog.Debug(method + " success")
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	return &internalpb.BackupEzkResponse{
+		Status: merr.Success(),
+		Ezk:    ezkJSON,
+	}, nil
+}
+
+// ClientHeartbeat receives client metrics from proxy and returns commands
+func (c *Core) ClientHeartbeat(ctx context.Context, req *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.ClientHeartbeatResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	if c.telemetryMgr == nil {
+		return &milvuspb.ClientHeartbeatResponse{
+			Status: merr.Status(errors.New("telemetry manager not initialized")),
+		}, nil
+	}
+
+	return c.telemetryMgr.HandleHeartbeat(req)
+}
+
+// GetClientTelemetry retrieves client telemetry metrics
+func (c *Core) GetClientTelemetry(ctx context.Context, req *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.GetClientTelemetryResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	if c.telemetryMgr == nil {
+		return &milvuspb.GetClientTelemetryResponse{
+			Status: merr.Status(errors.New("telemetry manager not initialized")),
+		}, nil
+	}
+
+	return c.telemetryMgr.GetClientTelemetry(req)
+}
+
+// PushClientCommand pushes a command to clients
+func (c *Core) PushClientCommand(ctx context.Context, req *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.PushClientCommandResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	if c.telemetryMgr == nil {
+		return &milvuspb.PushClientCommandResponse{
+			Status: merr.Status(errors.New("telemetry manager not initialized")),
+		}, nil
+	}
+
+	return c.telemetryMgr.PushCommand(ctx, req)
+}
+
+// DeleteClientCommand deletes a command for clients
+func (c *Core) DeleteClientCommand(ctx context.Context, req *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.DeleteClientCommandResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	if c.telemetryMgr == nil {
+		return &milvuspb.DeleteClientCommandResponse{
+			Status: merr.Status(errors.New("telemetry manager not initialized")),
+		}, nil
+	}
+
+	return c.telemetryMgr.DeleteCommand(ctx, req)
 }

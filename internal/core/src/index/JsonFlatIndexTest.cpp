@@ -9,34 +9,65 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <boost/filesystem/operations.hpp>
+#include <fmt/core.h>
 #include <gtest/gtest.h>
-#include <functional>
-#include <boost/filesystem.hpp>
+#include <nlohmann/json.hpp>
+#include <simdjson.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
+#include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
+#include "bitset/bitset.h"
 #include "common/Consts.h"
+#include "common/FieldData.h"
+#include "common/FieldDataInterface.h"
+#include "common/Json.h"
+#include "common/JsonCastType.h"
+#include "common/Schema.h"
 #include "common/Tracer.h"
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
 #include "expr/ITypeExpr.h"
+#include "filemanager/InputStream.h"
+#include "gtest/gtest.h"
+#include "index/Index.h"
+#include "index/IndexFactory.h"
+#include "index/IndexInfo.h"
+#include "index/IndexStats.h"
 #include "index/JsonFlatIndex.h"
+#include "index/Meta.h"
+#include "index/Utils.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "pb/common.pb.h"
 #include "pb/plan.pb.h"
+#include "pb/schema.pb.h"
 #include "plan/PlanNode.h"
 #include "query/ExecPlanNodeVisitor.h"
 #include "segcore/ChunkedSegmentSealedImpl.h"
 #include "segcore/SegmentSealed.h"
-#include "storage/RemoteChunkManagerSingleton.h"
-#include "storage/Util.h"
-#include "storage/InsertData.h"
-#include "indexbuilder/IndexFactory.h"
-#include "index/IndexFactory.h"
-#include "test_utils/cachinglayer_test_utils.h"
-#include "test_utils/indexbuilder_test_utils.h"
-#include "index/Meta.h"
-#include "index/Index.h"
-#include "common/Json.h"
+#include "segcore/Types.h"
 #include "simdjson/padded_string.h"
-#include "common/FieldData.h"
+#include "storage/ChunkManager.h"
+#include "storage/FileManager.h"
+#include "storage/InsertData.h"
+#include "storage/PayloadReader.h"
+#include "storage/RemoteChunkManagerSingleton.h"
+#include "storage/ThreadPools.h"
+#include "storage/Types.h"
+#include "storage/Util.h"
+#include "test_utils/Constants.h"
+#include "test_utils/DataGen.h"
+#include "test_utils/cachinglayer_test_utils.h"
 #include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
@@ -80,7 +111,7 @@ class JsonFlatIndexTest : public ::testing::Test {
         index_meta_ =
             gen_index_meta(segment_id, field_id, index_build_id, index_version);
 
-        std::string root_path = "/tmp/test-json-flat-index/";
+        std::string root_path = TestLocalPath;
         auto storage_config = gen_local_storage_config(root_path);
         cm_ = storage::CreateChunkManager(storage_config);
         fs_ = storage::InitArrowFileSystem(storage_config);
@@ -108,7 +139,8 @@ class JsonFlatIndexTest : public ::testing::Test {
         auto serialized_bytes = insert_data.Serialize(storage::Remote);
 
         auto get_binlog_path = [=](int64_t log_id) {
-            return fmt::format("{}/{}/{}/{}/{}",
+            return fmt::format("{}{}/{}/{}/{}/{}",
+                               TestLocalPath,
                                collection_id,
                                partition_id,
                                segment_id,
@@ -162,7 +194,7 @@ class JsonFlatIndexTest : public ::testing::Test {
     void
     TearDown() override {
         cm_w_.reset();
-        boost::filesystem::remove_all("/tmp/test-json-flat-index/");
+        // Cleanup handled by random test path in init_gtest.cpp
     }
 
     storage::FieldDataMeta field_meta_;
@@ -262,25 +294,25 @@ TEST_F(JsonFlatIndexTest, TestPrefixMatchQuery) {
     ASSERT_FALSE(result[2]);  // Charlie doesn't start with A
 }
 
-TEST_F(JsonFlatIndexTest, TestRegexQuery) {
+TEST_F(JsonFlatIndexTest, TestPatternQuery) {
     auto json_flat_index =
         dynamic_cast<index::JsonFlatIndex*>(json_index_.get());
     ASSERT_NE(json_flat_index, nullptr);
 
     std::string json_path = "/profile/name/first";
     auto executor = json_flat_index->create_executor<std::string>(json_path);
-    auto result = executor->RegexQuery("[AB].*ice");
+    auto result = executor->PatternQuery("A%ice");
     ASSERT_EQ(result.size(), json_data_.size());
-    ASSERT_TRUE(result[0]);   // Alice matches [AB].*ice
-    ASSERT_FALSE(result[1]);  // Bob doesn't match [AB].*ice
-    ASSERT_FALSE(result[2]);  // Charlie doesn't match [AB].*ice
+    ASSERT_TRUE(result[0]);   // Alice matches A%ice
+    ASSERT_FALSE(result[1]);  // Bob doesn't match A%ice
+    ASSERT_FALSE(result[2]);  // Charlie doesn't match A%ice
 
-    // Test another regex pattern
-    auto result2 = executor->RegexQuery("B.b");
+    // Test another LIKE pattern
+    auto result2 = executor->PatternQuery("B_b");
     ASSERT_EQ(result2.size(), json_data_.size());
-    ASSERT_FALSE(result2[0]);  // Alice doesn't match B.b
-    ASSERT_TRUE(result2[1]);   // Bob matches B.b
-    ASSERT_FALSE(result2[2]);  // Charlie doesn't match B.b
+    ASSERT_FALSE(result2[0]);  // Alice doesn't match B_b
+    ASSERT_TRUE(result2[1]);   // Bob matches B_b
+    ASSERT_FALSE(result2[2]);  // Charlie doesn't match B_b
 }
 
 TEST_F(JsonFlatIndexTest, TestPatternMatchQuery) {
@@ -539,7 +571,7 @@ class JsonFlatIndexExprTest : public ::testing::Test {
         auto json_index_path = "";
 
         auto schema = std::make_shared<Schema>();
-        auto vec_fid = schema->AddDebugField(
+        schema->AddDebugField(
             "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
         auto i64_fid = schema->AddDebugField("age64", DataType::INT64);
         json_fid_ = schema->AddDebugField("json", DataType::JSON, true);
@@ -555,13 +587,12 @@ class JsonFlatIndexExprTest : public ::testing::Test {
             json_fid_.get());
         file_manager_ctx.fieldDataMeta.field_schema.set_nullable(true);
         file_manager_ctx.fieldDataMeta.field_id = json_fid_.get();
+        index::CreateIndexInfo json_index_info;
+        json_index_info.index_type = index::INVERTED_INDEX_TYPE;
+        json_index_info.json_cast_type = JsonCastType::FromString("JSON");
+        json_index_info.json_path = json_index_path;
         auto index = index::IndexFactory::GetInstance().CreateJsonIndex(
-            index::CreateIndexInfo{
-                .index_type = index::INVERTED_INDEX_TYPE,
-                .json_cast_type = JsonCastType::FromString("JSON"),
-                .json_path = json_index_path,
-            },
-            file_manager_ctx);
+            json_index_info, file_manager_ctx);
 
         json_index_ = std::unique_ptr<index::JsonFlatIndex>(
             static_cast<index::JsonFlatIndex*>(index.release()));

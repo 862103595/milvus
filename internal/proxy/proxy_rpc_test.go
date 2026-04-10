@@ -2,9 +2,7 @@ package proxy
 
 import (
 	"context"
-	"os"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,18 +14,15 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func TestProxyRpcLimit(t *testing.T) {
 	var err error
-	var wg sync.WaitGroup
 
-	path := "/tmp/milvus/rocksmq" + funcutil.GenRandomStr()
+	path := t.TempDir() + "/rocksmq"
 	t.Setenv("ROCKSMQ_PATH", path)
-	defer os.RemoveAll(path)
 
 	ctx := GetContext(context.Background(), "root:123456")
 	localMsg := true
@@ -49,12 +44,11 @@ func TestProxyRpcLimit(t *testing.T) {
 	assert.NotNil(t, proxy)
 
 	testServer := newProxyTestServer(proxy)
-	testServer.Proxy.SetAddress(p.GetAddress())
-	wg.Add(1)
-	go testServer.startGrpc(ctx, &wg, &p)
+	go testServer.startGrpc(ctx, &p)
 	assert.NoError(t, testServer.waitForGrpcReady())
+	testServer.Proxy.SetAddress(testServer.lisAddr)
 	defer testServer.grpcServer.Stop()
-	client, err := grpcproxyclient.NewClient(ctx, "localhost:"+p.Port.GetValue(), 1)
+	client, err := grpcproxyclient.NewClient(ctx, testServer.lisAddr, 1)
 	assert.NoError(t, err)
 	proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 

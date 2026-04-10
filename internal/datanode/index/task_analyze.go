@@ -75,6 +75,10 @@ func (at *analyzeTask) GetSlot() int64 {
 	return at.req.GetTaskSlot()
 }
 
+func (at *analyzeTask) IsVectorIndex() bool {
+	return false
+}
+
 func (at *analyzeTask) PreExecute(ctx context.Context) error {
 	at.queueDur = at.tr.RecordSpan()
 	log := log.Ctx(ctx).With(zap.String("clusterID", at.req.GetClusterID()),
@@ -111,6 +115,8 @@ func (at *analyzeTask) Execute(ctx context.Context) error {
 		RequestTimeoutMs:  at.req.GetStorageConfig().GetRequestTimeoutMs(),
 		SslCACert:         at.req.GetStorageConfig().GetSslCACert(),
 		GcpCredentialJSON: at.req.GetStorageConfig().GetGcpCredentialJSON(),
+		SslTlsMinVersion:  at.req.GetStorageConfig().GetSslTlsMinVersion(),
+		UseCrc32CChecksum: at.req.GetStorageConfig().GetUseCrc32CChecksum(),
 	}
 
 	numRowsMap := make(map[int64]int64)

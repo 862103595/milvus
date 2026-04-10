@@ -1,20 +1,44 @@
 #include "segcore/storagev1translator/InterimSealedIndexTranslator.h"
+
+#include <algorithm>
+#include <exception>
+#include <map>
+#include <optional>
+#include <type_traits>
+
+#include "cachinglayer/CacheSlot.h"
+#include "common/Chunk.h"
+#include "common/OffsetMapping.h"
+#include "fmt/core.h"
+#include "folly/FBVector.h"
+#include "index/Index.h"
+#include "index/Utils.h"
+#include "index/VectorIndex.h"
 #include "index/VectorMemIndex.h"
+#include "knowhere/dataset.h"
+#include "knowhere/expected.h"
+#include "knowhere/object.h"
+#include "knowhere/operands.h"
+#include "knowhere/version.h"
+#include "mmap/ChunkedColumnInterface.h"
+#include "nlohmann/json.hpp"
 #include "segcore/Utils.h"
 
 namespace milvus::segcore::storagev1translator {
 
 InterimSealedIndexTranslator::InterimSealedIndexTranslator(
     std::shared_ptr<ChunkedColumnInterface> vec_data,
-    std::string segment_id,
-    std::string field_id,
+    int64_t segment_id,
+    int64_t field_id,
     knowhere::IndexType index_type,
     knowhere::MetricType metric_type,
     knowhere::Json build_config,
     int64_t dim,
     bool is_sparse,
-    DataType vec_data_type)
+    DataType vec_data_type,
+    const std::string& warmup_policy)
     : vec_data_(vec_data),
+      segment_id_(segment_id),
       index_type_(index_type),
       metric_type_(metric_type),
       build_config_(build_config),
@@ -27,9 +51,9 @@ InterimSealedIndexTranslator::InterimSealedIndexTranslator(
             milvus::segcore::getCellDataType(
                 /* is_vector */ true,
                 /* is_index */ true),
-            milvus::segcore::getCacheWarmupPolicy(
-                /* is_vector */ true,
-                /* is_index */ true),
+            milvus::segcore::getCacheWarmupPolicy(warmup_policy,
+                                                  /* is_vector */ true,
+                                                  /* is_index */ true),
             /* support_eviction */ false) {
 }
 
@@ -89,7 +113,12 @@ InterimSealedIndexTranslator::key() const {
 std::vector<std::pair<milvus::cachinglayer::cid_t,
                       std::unique_ptr<milvus::index::IndexBase>>>
 InterimSealedIndexTranslator::get_cells(
+    milvus::OpContext* ctx,
     const std::vector<milvus::cachinglayer::cid_t>& cids) {
+    // Check for cancellation before building interim index
+    CheckCancellation(
+        ctx, segment_id_, "InterimSealedIndexTranslator::get_cells()");
+
     std::unique_ptr<index::VectorIndex> vec_index = nullptr;
     if (!is_sparse_) {
         knowhere::ViewDataOp view_data = [field_raw_data_ptr =
@@ -99,7 +128,7 @@ InterimSealedIndexTranslator::get_cells(
 
             field_raw_data_ptr->BulkValueAt(
                 nullptr,
-                [&data, &data_id](const char* value, size_t i) {
+                [&data](const char* value, size_t i) {
                     data = static_cast<const void*>(value);
                 },
                 &data_id,
@@ -143,19 +172,53 @@ InterimSealedIndexTranslator::get_cells(
     }
 
     auto num_chunk = vec_data_->num_chunks();
+    const auto& offset_mapping = vec_data_->GetOffsetMapping();
+    bool nullable = offset_mapping.IsEnabled();
+    const auto& valid_count_per_chunk =
+        nullable ? vec_data_->GetValidCountPerChunk() : std::vector<int64_t>{};
+
+    int64_t total_valid_count =
+        nullable ? offset_mapping.GetValidCount() : vec_data_->NumRows();
+
+    if (total_valid_count == 0) {
+        if (nullable) {
+            const auto& valid_data = vec_data_->GetValidData();
+            vec_index->BuildValidData(valid_data.data(), valid_data.size());
+        }
+        std::vector<std::pair<cid_t, std::unique_ptr<milvus::index::IndexBase>>>
+            result;
+        result.emplace_back(std::make_pair(0, std::move(vec_index)));
+        return result;
+    }
+
+    bool first_build = true;
     for (int i = 0; i < num_chunk; ++i) {
         auto pw = vec_data_->GetChunk(nullptr, i);
         auto chunk = pw.get();
-        auto dataset = knowhere::GenDataSet(
-            vec_data_->chunk_row_nums(i), dim_, chunk->Data());
+
+        int64_t actual_row_count =
+            nullable ? valid_count_per_chunk[i] : vec_data_->chunk_row_nums(i);
+
+        if (actual_row_count == 0) {
+            continue;
+        }
+
+        auto dataset =
+            knowhere::GenDataSet(actual_row_count, dim_, chunk->Data());
         dataset->SetIsOwner(false);
         dataset->SetIsSparse(is_sparse_);
 
-        if (i == 0) {
+        if (first_build) {
             vec_index->BuildWithDataset(dataset, build_config_);
+            first_build = false;
         } else {
             vec_index->AddWithDataset(dataset, build_config_);
         }
+    }
+
+    if (nullable) {
+        const auto& valid_data = vec_data_->GetValidData();
+        vec_index->BuildValidData(valid_data.data(), valid_data.size());
     }
     std::vector<std::pair<cid_t, std::unique_ptr<milvus::index::IndexBase>>>
         result;

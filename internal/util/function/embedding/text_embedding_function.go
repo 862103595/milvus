@@ -48,6 +48,9 @@ const (
 	cohereProvider       string = "cohere"
 	siliconflowProvider  string = "siliconflow"
 	teiProvider          string = "tei"
+	ycProvider           string = "yc"
+	zillizProvider       string = "zilliz"
+	geminiProvider       string = "gemini"
 )
 
 func hasEmptyString(texts []string) bool {
@@ -80,7 +83,7 @@ func TextEmbeddingInputsCheck(name string, fields []*schemapb.FieldSchema) error
 // Text embedding for retrieval task
 type textEmbeddingProvider interface {
 	MaxBatch() int
-	CallEmbedding(texts []string, mode models.TextEmbeddingMode) (any, error)
+	CallEmbedding(ctx context.Context, texts []string, mode models.TextEmbeddingMode) (any, error)
 	FieldDim() int64
 }
 
@@ -94,7 +97,7 @@ func isValidInputDataType(dataType schemapb.DataType) bool {
 	return dataType == schemapb.DataType_VarChar || dataType == schemapb.DataType_Text
 }
 
-func NewTextEmbeddingFunction(coll *schemapb.CollectionSchema, functionSchema *schemapb.FunctionSchema) (*TextEmbeddingFunction, error) {
+func NewTextEmbeddingFunction(coll *schemapb.CollectionSchema, functionSchema *schemapb.FunctionSchema, extraInfo *models.ModelExtraInfo) (*TextEmbeddingFunction, error) {
 	if len(functionSchema.GetOutputFieldNames()) != 1 {
 		return nil, fmt.Errorf("Text function should only have one output field, but now is %d", len(functionSchema.GetOutputFieldNames()))
 	}
@@ -107,7 +110,6 @@ func NewTextEmbeddingFunction(coll *schemapb.CollectionSchema, functionSchema *s
 	if err := TextEmbeddingOutputsCheck(base.outputFields); err != nil {
 		return nil, err
 	}
-
 	var embP textEmbeddingProvider
 	var newProviderErr error
 	conf := paramtable.Get().FunctionCfg.GetTextEmbeddingProviderConfig(base.provider)
@@ -115,27 +117,36 @@ func NewTextEmbeddingFunction(coll *schemapb.CollectionSchema, functionSchema *s
 		return nil, fmt.Errorf("Text embedding model provider [%s] is disabled", base.provider)
 	}
 	credentials := credentials.NewCredentials(paramtable.Get().CredentialCfg.GetCredentials())
+	batchFactor := paramtable.Get().FunctionCfg.GetBatchFactor()
+	extraInfo.BatchFactor = batchFactor
 	switch base.provider {
 	case openAIProvider:
-		embP, newProviderErr = NewOpenAIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials)
+		embP, newProviderErr = NewOpenAIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
 	case azureOpenAIProvider:
-		embP, newProviderErr = NewAzureOpenAIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials)
+		embP, newProviderErr = NewAzureOpenAIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
 	case bedrockProvider:
-		embP, newProviderErr = NewBedrockEmbeddingProvider(base.outputFields[0], functionSchema, nil, conf, credentials)
+		embP, newProviderErr = NewBedrockEmbeddingProvider(base.outputFields[0], functionSchema, nil, conf, credentials, extraInfo)
 	case aliDashScopeProvider:
-		embP, newProviderErr = NewAliDashScopeEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials)
+		embP, newProviderErr = NewAliDashScopeEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
 	case vertexAIProvider:
-		embP, newProviderErr = NewVertexAIEmbeddingProvider(base.outputFields[0], functionSchema, nil, conf, credentials)
+		embP, newProviderErr = NewVertexAIEmbeddingProvider(base.outputFields[0], functionSchema, nil, conf, credentials, extraInfo)
 	case voyageAIProvider:
-		embP, newProviderErr = NewVoyageAIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials)
+		embP, newProviderErr = NewVoyageAIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
 	case cohereProvider:
-		embP, newProviderErr = NewCohereEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials)
+		embP, newProviderErr = NewCohereEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
 	case siliconflowProvider:
-		embP, newProviderErr = NewSiliconflowEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials)
+		embP, newProviderErr = NewSiliconflowEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
 	case teiProvider:
-		embP, newProviderErr = NewTEIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials)
+		embP, newProviderErr = NewTEIEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
+	case ycProvider:
+		embP, newProviderErr = NewYCEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
+	case zillizProvider:
+		conf := paramtable.Get().FunctionCfg.ZillizProviders.GetValue()
+		embP, newProviderErr = NewZillizEmbeddingProvider(base.outputFields[0], functionSchema, conf, extraInfo)
+	case geminiProvider:
+		embP, newProviderErr = NewGeminiEmbeddingProvider(base.outputFields[0], functionSchema, conf, credentials, extraInfo)
 	default:
-		return nil, fmt.Errorf("Unsupported text embedding service provider: [%s] , list of supported [%s, %s, %s, %s, %s, %s, %s, %s, %s]", base.provider, openAIProvider, azureOpenAIProvider, aliDashScopeProvider, bedrockProvider, vertexAIProvider, voyageAIProvider, cohereProvider, siliconflowProvider, teiProvider)
+		return nil, fmt.Errorf("Unsupported text embedding service provider: [%s] , list of supported [%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s]", base.provider, openAIProvider, azureOpenAIProvider, aliDashScopeProvider, bedrockProvider, vertexAIProvider, voyageAIProvider, cohereProvider, siliconflowProvider, teiProvider, ycProvider, zillizProvider, geminiProvider)
 	}
 
 	if newProviderErr != nil {
@@ -147,8 +158,8 @@ func NewTextEmbeddingFunction(coll *schemapb.CollectionSchema, functionSchema *s
 	}, nil
 }
 
-func (runner *TextEmbeddingFunction) Check() error {
-	embds, err := runner.embProvider.CallEmbedding([]string{"check"}, models.InsertMode)
+func (runner *TextEmbeddingFunction) Check(ctx context.Context) error {
+	embds, err := runner.embProvider.CallEmbedding(ctx, []string{"check"}, models.InsertMode)
 	if err != nil {
 		return err
 	}
@@ -156,8 +167,14 @@ func (runner *TextEmbeddingFunction) Check() error {
 	switch embds := embds.(type) {
 	case [][]float32:
 		dim = len(embds[0])
+		if runner.GetOutputFields()[0].DataType != schemapb.DataType_FloatVector {
+			return fmt.Errorf("Embedding model output and field type mismatch, model output is %s, field type is %s", schemapb.DataType_name[int32(schemapb.DataType_FloatVector)], schemapb.DataType_name[int32(runner.GetOutputFields()[0].DataType)])
+		}
 	case [][]int8:
 		dim = len(embds[0])
+		if runner.GetOutputFields()[0].DataType != schemapb.DataType_Int8Vector {
+			return fmt.Errorf("Embedding model output and field type mismatch, model output is %s, field type is %s", schemapb.DataType_name[int32(schemapb.DataType_Int8Vector)], schemapb.DataType_name[int32(runner.GetOutputFields()[0].DataType)])
+		}
 	default:
 		return fmt.Errorf("Unsupport embedding type: %s", reflect.TypeOf(embds).String())
 	}
@@ -253,7 +270,7 @@ func (runner *TextEmbeddingFunction) ProcessInsert(ctx context.Context, inputs [
 		return nil, fmt.Errorf("Embedding supports up to [%d] pieces of data at a time, got [%d]", runner.MaxBatch(), numRows)
 	}
 
-	embds, err := runner.embProvider.CallEmbedding(texts, models.InsertMode)
+	embds, err := runner.embProvider.CallEmbedding(ctx, texts, models.InsertMode)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +288,7 @@ func (runner *TextEmbeddingFunction) ProcessSearch(ctx context.Context, placehol
 	if hasEmptyString(texts) {
 		return nil, errors.New("There is an empty string in the queries, TextEmbedding function does not support empty text")
 	}
-	embds, err := runner.embProvider.CallEmbedding(texts, models.SearchMode)
+	embds, err := runner.embProvider.CallEmbedding(ctx, texts, models.SearchMode)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +300,7 @@ func (runner *TextEmbeddingFunction) ProcessSearch(ctx context.Context, placehol
 	return nil, fmt.Errorf("Text embedding function doesn't support % vector", schemapb.DataType_name[int32(runner.GetOutputFields()[0].DataType)])
 }
 
-func (runner *TextEmbeddingFunction) ProcessBulkInsert(inputs []storage.FieldData) (map[storage.FieldID]storage.FieldData, error) {
+func (runner *TextEmbeddingFunction) ProcessBulkInsert(ctx context.Context, inputs []storage.FieldData) (map[storage.FieldID]storage.FieldData, error) {
 	if len(inputs) != 1 {
 		return nil, fmt.Errorf("TextEmbedding function only receives one input, bug got [%d]", len(inputs))
 	}
@@ -302,7 +319,7 @@ func (runner *TextEmbeddingFunction) ProcessBulkInsert(inputs []storage.FieldDat
 	if hasEmptyString(texts) {
 		return nil, errors.New("There is an empty string in the input data, TextEmbedding function does not support empty text")
 	}
-	embds, err := runner.embProvider.CallEmbedding(texts, models.InsertMode)
+	embds, err := runner.embProvider.CallEmbedding(ctx, texts, models.InsertMode)
 	if err != nil {
 		return nil, err
 	}

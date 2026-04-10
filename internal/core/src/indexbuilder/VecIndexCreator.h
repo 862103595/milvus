@@ -11,15 +11,20 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <memory>
-#include <optional>
 #include <string>
-#include <vector>
 
+#include "common/BitsetView.h"
+#include "common/OpContext.h"
+#include "common/QueryInfo.h"
+#include "common/QueryResult.h"
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
+#include "index/Index.h"
+#include "index/IndexStats.h"
 #include "indexbuilder/IndexCreatorBase.h"
-#include "index/VectorIndex.h"
-#include "index/IndexInfo.h"
-#include "storage/Types.h"
+#include "storage/FileManager.h"
 
 namespace milvus::indexbuilder {
 
@@ -39,7 +44,9 @@ class VecIndexCreator : public IndexCreatorBase {
                     const storage::FileManagerContext& file_manager_context);
 
     void
-    Build(const milvus::DatasetPtr& dataset) override;
+    Build(const milvus::DatasetPtr& dataset,
+          const bool* valid_data = nullptr,
+          const int64_t valid_data_len = 0) override;
 
     void
     Build() override;

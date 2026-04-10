@@ -260,14 +260,14 @@ func TestPayloadWriter_Failed(t *testing.T) {
 		err = w.FinishPayloadWriter()
 		require.NoError(t, err)
 
-		err = w.AddBinaryVectorToPayload(data, 8)
+		err = w.AddBinaryVectorToPayload(data, 8, nil)
 		require.Error(t, err)
 
 		w, err = NewPayloadWriter(schemapb.DataType_Int64)
 		require.Nil(t, err)
 		require.NotNil(t, w)
 
-		err = w.AddBinaryVectorToPayload(data, 8)
+		err = w.AddBinaryVectorToPayload(data, 8, nil)
 		require.Error(t, err)
 	})
 
@@ -622,6 +622,57 @@ func TestPayloadWriter_ArrayOfVector(t *testing.T) {
 			schemapb.DataType_ArrayOfVector,
 			WithDim(dim),
 			WithElementType(schemapb.DataType_BFloat16Vector),
+		)
+		require.NoError(t, err)
+		require.NotNil(t, w)
+
+		err = w.AddVectorArrayFieldDataToPayload(vectorArrayData)
+		require.NoError(t, err)
+
+		err = w.FinishPayloadWriter()
+		require.NoError(t, err)
+
+		// Verify results
+		buffer, err := w.GetPayloadBufferFromWriter()
+		require.NoError(t, err)
+		require.NotEmpty(t, buffer)
+
+		length, err := w.GetPayloadLengthFromWriter()
+		require.NoError(t, err)
+		require.Equal(t, numRows, length)
+	})
+
+	t.Run("Test ArrayOfInt8Vector - Basic", func(t *testing.T) {
+		dim := 64
+		numRows := 50
+		vectorsPerRow := 4
+
+		// Create test data
+		vectorArrayData := &VectorArrayFieldData{
+			Data:        make([]*schemapb.VectorField, numRows),
+			ElementType: schemapb.DataType_Int8Vector,
+			Dim:         int64(dim),
+		}
+
+		for i := 0; i < numRows; i++ {
+			// Int8 vectors are stored as bytes (1 byte per element)
+			byteData := make([]byte, vectorsPerRow*dim)
+			for j := 0; j < len(byteData); j++ {
+				byteData[j] = byte((i*50 + j) % 256)
+			}
+
+			vectorArrayData.Data[i] = &schemapb.VectorField{
+				Dim: int64(dim),
+				Data: &schemapb.VectorField_Int8Vector{
+					Int8Vector: byteData,
+				},
+			}
+		}
+
+		w, err := NewPayloadWriter(
+			schemapb.DataType_ArrayOfVector,
+			WithDim(dim),
+			WithElementType(schemapb.DataType_Int8Vector),
 		)
 		require.NoError(t, err)
 		require.NotNil(t, w)

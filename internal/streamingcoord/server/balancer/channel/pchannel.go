@@ -7,10 +7,17 @@ import (
 
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v2/util/replicateutil"
 )
 
 // NewPChannelMeta creates a new PChannelMeta.
+// By default, the channel is available in replication.
 func NewPChannelMeta(name string, accessMode types.AccessMode) *PChannelMeta {
+	return newPChannelMetaWithAvailability(name, accessMode, true)
+}
+
+// newPChannelMetaWithAvailability creates a new PChannelMeta with explicit availability in replication.
+func newPChannelMetaWithAvailability(name string, accessMode types.AccessMode, availableInReplication bool) *PChannelMeta {
 	return &PChannelMeta{
 		inner: &streamingpb.PChannelMeta{
 			Channel: &streamingpb.PChannelInfo{
@@ -22,20 +29,30 @@ func NewPChannelMeta(name string, accessMode types.AccessMode) *PChannelMeta {
 			State:     streamingpb.PChannelMetaState_PCHANNEL_META_STATE_UNINITIALIZED,
 			Histories: make([]*streamingpb.PChannelAssignmentLog, 0),
 		},
+		availableInReplication: availableInReplication,
 	}
 }
 
 // newPChannelMetaFromProto creates a new PChannelMeta from proto.
-func newPChannelMetaFromProto(channel *streamingpb.PChannelMeta) *PChannelMeta {
+// The availableInReplication flag is computed from the given replicateConfig.
+func newPChannelMetaFromProto(channel *streamingpb.PChannelMeta, replicateConfig *replicateutil.ConfigHelper) *PChannelMeta {
 	return &PChannelMeta{
-		inner: channel,
+		inner:                  channel,
+		availableInReplication: isChannelAvailableInReplication(channel.GetChannel().GetName(), replicateConfig),
 	}
 }
 
 // PChannelMeta is the read only version of PChannelInfo, to be used in balancer,
 // If you need to update PChannelMeta, please use CopyForWrite to get mutablePChannel.
 type PChannelMeta struct {
-	inner *streamingpb.PChannelMeta
+	inner                  *streamingpb.PChannelMeta
+	availableInReplication bool
+}
+
+// AvailableInReplication returns whether the channel is available for VChannel allocation
+// and DDL broadcasts. Dynamically-added PChannels are gated until they appear in ReplicateConfig.
+func (c *PChannelMeta) AvailableInReplication() bool {
+	return c.availableInReplication
 }
 
 // Name returns the name of the channel.
@@ -93,6 +110,11 @@ func (c *PChannelMeta) IsAssigned() bool {
 	return c.inner.State == streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNED
 }
 
+// IsAssignedOrAssigning returns if the channel is assigned or assigning to a server.
+func (c *PChannelMeta) IsAssignedOrAssigning() bool {
+	return c.inner.State == streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNED || c.inner.State == streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNING
+}
+
 // LastAssignTimestamp returns the last assigned timestamp.
 func (c *PChannelMeta) LastAssignTimestamp() time.Time {
 	return time.Unix(int64(c.inner.LastAssignTimestampSeconds), 0)
@@ -108,7 +130,8 @@ func (c *PChannelMeta) State() streamingpb.PChannelMetaState {
 func (c *PChannelMeta) CopyForWrite() *mutablePChannel {
 	return &mutablePChannel{
 		PChannelMeta: &PChannelMeta{
-			inner: proto.Clone(c.inner).(*streamingpb.PChannelMeta),
+			inner:                  proto.Clone(c.inner).(*streamingpb.PChannelMeta),
+			availableInReplication: c.availableInReplication,
 		},
 	}
 }
@@ -126,12 +149,7 @@ func (m *mutablePChannel) TryAssignToServerID(accessMode types.AccessMode, strea
 		return false
 	}
 	if m.inner.State != streamingpb.PChannelMetaState_PCHANNEL_META_STATE_UNINITIALIZED {
-		// if the channel is already initialized, add the history.
-		m.inner.Histories = append(m.inner.Histories, &streamingpb.PChannelAssignmentLog{
-			Term:       m.inner.Channel.Term,
-			Node:       m.inner.Node,
-			AccessMode: m.inner.Channel.AccessMode,
-		})
+		m.updateOrAppendAssignHistory()
 	}
 
 	// otherwise update the channel into assgining state.
@@ -140,6 +158,33 @@ func (m *mutablePChannel) TryAssignToServerID(accessMode types.AccessMode, strea
 	m.inner.Node = types.NewProtoFromStreamingNodeInfo(streamingNode)
 	m.inner.State = streamingpb.PChannelMetaState_PCHANNEL_META_STATE_ASSIGNING
 	return true
+}
+
+// updateOrAppendAssignHistory updates the assign history of the channel if channel is assigned at previous term at target node,
+// otherwise, append the history directly.
+func (m *mutablePChannel) updateOrAppendAssignHistory() {
+	// if the node has been assigned to, update the history directly.
+	// e.g. the node 10 is assigned to the channel at term 1 but open failed,
+	// we have history record like:
+	// (term 1, node 10, access mode RW)
+	// (term 2, node 11, access mode RW)
+	// the the node is reassigned to the channel at term 3.
+	// the the history can be compacted into
+	// (term 3, node 10, access mode RW)
+	// (term 2, node 11, access mode RW)
+	// to make the history smaller.
+	for _, h := range m.inner.Histories {
+		if h.Node.ServerId == m.inner.Node.ServerId && h.AccessMode == m.inner.Channel.AccessMode {
+			h.Term = m.inner.Channel.Term
+			return
+		}
+	}
+	// otherwise, append the history directly.
+	m.inner.Histories = append(m.inner.Histories, &streamingpb.PChannelAssignmentLog{
+		Term:       m.inner.Channel.Term,
+		Node:       m.inner.Node,
+		AccessMode: m.inner.Channel.AccessMode,
+	})
 }
 
 // AssignToServerDone assigns the channel to the server done.

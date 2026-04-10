@@ -14,18 +14,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <folly/FBVector.h>
 #include <gtest/gtest.h>
+#include <simdjson.h>
+#include <string.h>
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "common/Array.h"
+#include "common/EasyAssert.h"
+#include "common/FieldData.h"
+#include "common/FieldDataInterface.h"
 #include "common/Geometry.h"
-#include "storage/DataCodec.h"
-#include "storage/InsertData.h"
-#include "storage/IndexData.h"
-#include "storage/Util.h"
-#include "common/Consts.h"
 #include "common/Json.h"
-#include <cstddef>
+#include "common/TypeTraits.h"
+#include "common/Types.h"
+#include "common/VectorTrait.h"
+#include "common/protobuf_utils.h"
+#include "geos_c.h"
+#include "gtest/gtest.h"
+#include "knowhere/object.h"
+#include "knowhere/operands.h"
+#include "knowhere/sparse_utils.h"
+#include "pb/schema.pb.h"
+#include "simdjson/padded_string.h"
+#include "storage/DataCodec.h"
+#include "storage/IndexData.h"
+#include "storage/InsertData.h"
+#include "storage/PayloadReader.h"
+#include "storage/Types.h"
+#include "storage/Util.h"
 #include "test_utils/Constants.h"
 #include "test_utils/DataGen.h"
 
@@ -65,7 +91,8 @@ TEST(storage, InsertDataBoolNullable) {
     FixedVector<bool> data = {true, false, false, false, true};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::BOOL, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
 
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
@@ -95,7 +122,6 @@ TEST(storage, InsertDataBoolNullable) {
     ASSERT_EQ(data[1], new_data[1]);
     ASSERT_EQ(data[4], new_data[4]);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataInt8) {
@@ -132,7 +158,8 @@ TEST(storage, InsertDataInt8Nullable) {
     FixedVector<int8_t> data = {1, 2, 3, 4, 5};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::INT8, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -159,7 +186,6 @@ TEST(storage, InsertDataInt8Nullable) {
     ASSERT_EQ(data, new_data);
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataInt16) {
@@ -196,7 +222,8 @@ TEST(storage, InsertDataInt16Nullable) {
     FixedVector<int16_t> data = {1, 2, 3, 4, 5};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::INT16, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -223,7 +250,6 @@ TEST(storage, InsertDataInt16Nullable) {
     ASSERT_EQ(data, new_data);
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataInt32) {
@@ -260,7 +286,8 @@ TEST(storage, InsertDataInt32Nullable) {
     FixedVector<int32_t> data = {1, 2, 3, 4, 5};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::INT32, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -287,7 +314,6 @@ TEST(storage, InsertDataInt32Nullable) {
     ASSERT_EQ(data, new_data);
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataInt64) {
@@ -324,7 +350,8 @@ TEST(storage, InsertDataInt64Nullable) {
     FixedVector<int64_t> data = {1, 2, 3, 4, 5};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::INT64, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -351,7 +378,6 @@ TEST(storage, InsertDataInt64Nullable) {
     ASSERT_EQ(data, new_data);
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataGeometry) {
@@ -426,7 +452,8 @@ TEST(storage, InsertDataGeometryNullable) {
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::GEOMETRY, storage::DataType::NONE, true);
     // valid_data bitmap: 0xF3 (11110011 b) – rows 0,1,4 valid; rows 2,3 null
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     // Round-trip the payload through InsertData serialization pipeline
@@ -461,8 +488,6 @@ TEST(storage, InsertDataGeometryNullable) {
         ASSERT_EQ(new_payload->DataSize(i), data[i].size());
     }
     ASSERT_EQ(data, new_data);
-
-    delete[] valid_data;
 }
 TEST(storage, InsertDataString) {
     FixedVector<std::string> data = {
@@ -504,7 +529,8 @@ TEST(storage, InsertDataStringNullable) {
         "test1", "test2", "test3", "test4", "test5"};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::STRING, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -534,7 +560,6 @@ TEST(storage, InsertDataStringNullable) {
     }
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataFloat) {
@@ -634,7 +659,8 @@ TEST(storage, InsertDataDoubleNullable) {
     FixedVector<double> data = {1, 2, 3, 4, 5};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::DOUBLE, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -661,7 +687,6 @@ TEST(storage, InsertDataDoubleNullable) {
     ASSERT_EQ(data, new_data);
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataTimestamptz) {
@@ -700,7 +725,8 @@ TEST(storage, InsertDataTimestamptzNullable) {
         1000000000, 2000000000, 3000000000, 400000, 5000};
     auto field_data = milvus::storage::CreateFieldData(
         DataType::TIMESTAMPTZ, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xF3};
+    uint8_t valid_data_storage[1] = {0xF3};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -727,7 +753,6 @@ TEST(storage, InsertDataTimestamptzNullable) {
     ASSERT_EQ(data, new_data);
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataFloatVector) {
@@ -763,7 +788,80 @@ TEST(storage, InsertDataFloatVector) {
     ASSERT_EQ(data, new_data);
 }
 
-TEST(storage, InsertDataSparseFloat) {
+TEST(storage, InsertDataFloatVectorNullable) {
+    int DIM = 4;
+    int num_rows = 100;
+
+    for (int null_percent : {0, 20, 100}) {
+        int valid_count = num_rows * (100 - null_percent) / 100;
+        bool is_nullable = true;
+
+        std::vector<float> data(valid_count * DIM);
+        for (int i = 0; i < valid_count * DIM; ++i) {
+            data[i] = static_cast<float>(i) * 0.5f;
+        }
+
+        FieldDataPtr field_data;
+        std::vector<uint8_t> valid_data((num_rows + 7) / 8, 0);
+        for (int i = 0; i < valid_count; ++i) {
+            valid_data[i >> 3] |= (1 << (i & 0x07));
+        }
+
+        field_data = milvus::storage::CreateFieldData(
+            storage::DataType::VECTOR_FLOAT, DataType::NONE, true, DIM);
+        auto field_data_impl =
+            std::dynamic_pointer_cast<milvus::FieldData<milvus::FloatVector>>(
+                field_data);
+        field_data_impl->FillFieldData(
+            data.data(), valid_data.data(), num_rows, 0);
+
+        ASSERT_EQ(field_data->get_num_rows(), num_rows);
+        ASSERT_EQ(field_data->get_valid_rows(), valid_count);
+        ASSERT_EQ(field_data->get_null_count(), num_rows - valid_count);
+        ASSERT_EQ(field_data->IsNullable(), is_nullable);
+
+        auto payload_reader =
+            std::make_shared<milvus::storage::PayloadReader>(field_data);
+        storage::InsertData insert_data(payload_reader);
+        storage::FieldDataMeta field_data_meta{100, 101, 102, 103};
+        insert_data.SetFieldDataMeta(field_data_meta);
+        insert_data.SetTimestamps(0, 100);
+
+        auto serialized_bytes =
+            insert_data.Serialize(storage::StorageType::Remote);
+        std::shared_ptr<uint8_t[]> serialized_data_ptr(serialized_bytes.data(),
+                                                       [&](uint8_t*) {});
+        auto new_insert_data = storage::DeserializeFileData(
+            serialized_data_ptr, serialized_bytes.size());
+        ASSERT_EQ(new_insert_data->GetCodecType(), storage::InsertDataType);
+        ASSERT_EQ(new_insert_data->GetTimeRage(),
+                  std::make_pair(Timestamp(0), Timestamp(100)));
+
+        auto new_payload = new_insert_data->GetFieldData();
+
+        ASSERT_EQ(new_payload->get_data_type(),
+                  storage::DataType::VECTOR_FLOAT);
+        ASSERT_EQ(new_payload->get_num_rows(), num_rows);
+        ASSERT_EQ(new_payload->get_valid_rows(), valid_count);
+        ASSERT_EQ(new_payload->get_null_count(), num_rows - valid_count);
+        ASSERT_EQ(new_payload->IsNullable(), is_nullable);
+
+        int valid_idx = 0;
+        for (int i = 0; i < num_rows; ++i) {
+            if (new_payload->is_valid(i)) {
+                // RawValue takes logical offset, internally converts to physical
+                auto vec_ptr =
+                    static_cast<const float*>(new_payload->RawValue(i));
+                for (int j = 0; j < DIM; ++j) {
+                    ASSERT_FLOAT_EQ(vec_ptr[j], data[valid_idx * DIM + j]);
+                }
+                valid_idx++;
+            }
+        }
+    }
+}
+
+TEST(storage, InsertDataSparseFloatVector) {
     auto n_rows = 100;
     auto vecs = milvus::segcore::GenerateRandomSparseFloatVector(
         n_rows, kTestSparseDim, kTestSparseVectorDensity);
@@ -810,6 +908,75 @@ TEST(storage, InsertDataSparseFloat) {
     }
 }
 
+TEST(storage, InsertDataSparseFloatVectorNullable) {
+    int num_rows = 100;
+
+    for (int null_percent : {0, 20, 100}) {
+        int valid_count = num_rows * (100 - null_percent) / 100;
+        bool is_nullable = true;
+        auto vecs = milvus::segcore::GenerateRandomSparseFloatVector(
+            valid_count, kTestSparseDim, kTestSparseVectorDensity);
+
+        FieldDataPtr field_data;
+        std::vector<uint8_t> valid_data((num_rows + 7) / 8, 0);
+        for (int i = 0; i < valid_count; ++i) {
+            valid_data[i >> 3] |= (1 << (i & 0x07));
+        }
+
+        field_data =
+            milvus::storage::CreateFieldData(DataType::VECTOR_SPARSE_U32_F32,
+                                             DataType::NONE,
+                                             true,
+                                             kTestSparseDim,
+                                             num_rows);
+
+        auto field_data_impl = std::dynamic_pointer_cast<
+            milvus::FieldData<milvus::SparseFloatVector>>(field_data);
+        field_data_impl->FillFieldData(
+            vecs.get(), valid_data.data(), num_rows, 0);
+
+        ASSERT_EQ(field_data->get_num_rows(), num_rows);
+        ASSERT_EQ(field_data->get_valid_rows(), valid_count);
+        ASSERT_EQ(field_data->IsNullable(), is_nullable);
+
+        auto payload_reader =
+            std::make_shared<milvus::storage::PayloadReader>(field_data);
+        storage::InsertData insert_data(payload_reader);
+        storage::FieldDataMeta field_data_meta{100, 101, 102, 103};
+        insert_data.SetFieldDataMeta(field_data_meta);
+        insert_data.SetTimestamps(0, 100);
+
+        auto serialized_bytes =
+            insert_data.Serialize(storage::StorageType::Remote);
+        std::shared_ptr<uint8_t[]> serialized_data_ptr(serialized_bytes.data(),
+                                                       [&](uint8_t*) {});
+        auto new_insert_data = storage::DeserializeFileData(
+            serialized_data_ptr, serialized_bytes.size());
+        ASSERT_EQ(new_insert_data->GetCodecType(), storage::InsertDataType);
+
+        auto new_payload = new_insert_data->GetFieldData();
+        ASSERT_TRUE(new_payload->get_data_type() ==
+                    storage::DataType::VECTOR_SPARSE_U32_F32);
+        ASSERT_EQ(new_payload->get_num_rows(), num_rows);
+        ASSERT_EQ(new_payload->IsNullable(), is_nullable);
+
+        int valid_idx = 0;
+        for (int i = 0; i < num_rows; ++i) {
+            if (new_payload->is_valid(i)) {
+                auto& original = vecs[valid_idx];
+                auto new_vec = static_cast<const knowhere::sparse::SparseRow<
+                    milvus::SparseValueType>*>(new_payload->RawValue(i));
+                ASSERT_EQ(original.size(), new_vec->size());
+                for (size_t j = 0; j < original.size(); ++j) {
+                    ASSERT_EQ(original[j].id, (*new_vec)[j].id);
+                    ASSERT_EQ(original[j].val, (*new_vec)[j].val);
+                }
+                valid_idx++;
+            }
+        }
+    }
+}
+
 TEST(storage, InsertDataBinaryVector) {
     std::vector<uint8_t> data = {1, 2, 3, 4, 5, 6, 7, 8};
     int DIM = 16;
@@ -839,6 +1006,72 @@ TEST(storage, InsertDataBinaryVector) {
     std::vector<uint8_t> new_data(data.size());
     memcpy(new_data.data(), new_payload->Data(), new_payload->DataSize());
     ASSERT_EQ(data, new_data);
+}
+
+TEST(storage, InsertDataBinaryVectorNullable) {
+    int DIM = 128;
+    int num_rows = 100;
+
+    for (int null_percent : {0, 20, 100}) {
+        int valid_count = num_rows * (100 - null_percent) / 100;
+        bool is_nullable = true;
+
+        std::vector<uint8_t> data(valid_count * DIM / 8);
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<uint8_t>(i % 256);
+        }
+
+        FieldDataPtr field_data;
+        std::vector<uint8_t> valid_data((num_rows + 7) / 8, 0);
+        for (int i = 0; i < valid_count; ++i) {
+            valid_data[i >> 3] |= (1 << (i & 0x07));
+        }
+
+        field_data = milvus::storage::CreateFieldData(
+            storage::DataType::VECTOR_BINARY, DataType::NONE, true, DIM);
+        auto field_data_impl =
+            std::dynamic_pointer_cast<milvus::FieldData<milvus::BinaryVector>>(
+                field_data);
+        field_data_impl->FillFieldData(
+            data.data(), valid_data.data(), num_rows, 0);
+
+        ASSERT_EQ(field_data->get_num_rows(), num_rows);
+        ASSERT_EQ(field_data->get_valid_rows(), valid_count);
+        ASSERT_EQ(field_data->IsNullable(), is_nullable);
+
+        auto payload_reader =
+            std::make_shared<milvus::storage::PayloadReader>(field_data);
+        storage::InsertData insert_data(payload_reader);
+        storage::FieldDataMeta field_data_meta{100, 101, 102, 103};
+        insert_data.SetFieldDataMeta(field_data_meta);
+        insert_data.SetTimestamps(0, 100);
+
+        auto serialized_bytes =
+            insert_data.Serialize(storage::StorageType::Remote);
+        std::shared_ptr<uint8_t[]> serialized_data_ptr(serialized_bytes.data(),
+                                                       [&](uint8_t*) {});
+        auto new_insert_data = storage::DeserializeFileData(
+            serialized_data_ptr, serialized_bytes.size());
+        ASSERT_EQ(new_insert_data->GetCodecType(), storage::InsertDataType);
+
+        auto new_payload = new_insert_data->GetFieldData();
+        ASSERT_EQ(new_payload->get_data_type(),
+                  storage::DataType::VECTOR_BINARY);
+        ASSERT_EQ(new_payload->get_num_rows(), num_rows);
+        ASSERT_EQ(new_payload->IsNullable(), is_nullable);
+
+        int valid_idx = 0;
+        for (int i = 0; i < num_rows; ++i) {
+            if (new_payload->is_valid(i)) {
+                auto vec_ptr =
+                    static_cast<const uint8_t*>(new_payload->RawValue(i));
+                for (int j = 0; j < DIM / 8; ++j) {
+                    ASSERT_EQ(vec_ptr[j], data[valid_idx * DIM / 8 + j]);
+                }
+                valid_idx++;
+            }
+        }
+    }
 }
 
 TEST(storage, InsertDataFloat16Vector) {
@@ -872,6 +1105,72 @@ TEST(storage, InsertDataFloat16Vector) {
            new_payload->Data(),
            new_payload->get_num_rows() * sizeof(float16) * DIM);
     ASSERT_EQ(data, new_data);
+}
+
+TEST(storage, InsertDataFloat16VectorNullable) {
+    int DIM = 4;
+    int num_rows = 100;
+
+    for (int null_percent : {0, 20, 100}) {
+        int valid_count = num_rows * (100 - null_percent) / 100;
+        bool is_nullable = true;
+
+        std::vector<float16> data(valid_count * DIM);
+        for (int i = 0; i < valid_count * DIM; ++i) {
+            data[i] = static_cast<float16>(i * 0.5f);
+        }
+
+        FieldDataPtr field_data;
+        std::vector<uint8_t> valid_data((num_rows + 7) / 8, 0);
+        for (int i = 0; i < valid_count; ++i) {
+            valid_data[i >> 3] |= (1 << (i & 0x07));
+        }
+
+        field_data = milvus::storage::CreateFieldData(
+            storage::DataType::VECTOR_FLOAT16, DataType::NONE, true, DIM);
+        auto field_data_impl =
+            std::dynamic_pointer_cast<milvus::FieldData<milvus::Float16Vector>>(
+                field_data);
+        field_data_impl->FillFieldData(
+            data.data(), valid_data.data(), num_rows, 0);
+
+        ASSERT_EQ(field_data->get_num_rows(), num_rows);
+        ASSERT_EQ(field_data->get_valid_rows(), valid_count);
+        ASSERT_EQ(field_data->IsNullable(), is_nullable);
+
+        auto payload_reader =
+            std::make_shared<milvus::storage::PayloadReader>(field_data);
+        storage::InsertData insert_data(payload_reader);
+        storage::FieldDataMeta field_data_meta{100, 101, 102, 103};
+        insert_data.SetFieldDataMeta(field_data_meta);
+        insert_data.SetTimestamps(0, 100);
+
+        auto serialized_bytes =
+            insert_data.Serialize(storage::StorageType::Remote);
+        std::shared_ptr<uint8_t[]> serialized_data_ptr(serialized_bytes.data(),
+                                                       [&](uint8_t*) {});
+        auto new_insert_data = storage::DeserializeFileData(
+            serialized_data_ptr, serialized_bytes.size());
+        ASSERT_EQ(new_insert_data->GetCodecType(), storage::InsertDataType);
+
+        auto new_payload = new_insert_data->GetFieldData();
+        ASSERT_EQ(new_payload->get_data_type(),
+                  storage::DataType::VECTOR_FLOAT16);
+        ASSERT_EQ(new_payload->get_num_rows(), num_rows);
+        ASSERT_EQ(new_payload->IsNullable(), is_nullable);
+
+        int valid_idx = 0;
+        for (int i = 0; i < num_rows; ++i) {
+            if (new_payload->is_valid(i)) {
+                auto vec_ptr =
+                    static_cast<const float16*>(new_payload->RawValue(i));
+                for (int j = 0; j < DIM; ++j) {
+                    ASSERT_EQ(vec_ptr[j], data[valid_idx * DIM + j]);
+                }
+                valid_idx++;
+            }
+        }
+    }
 }
 
 TEST(storage, IndexData) {
@@ -956,7 +1255,8 @@ TEST(storage, InsertDataStringArrayNullable) {
     FixedVector<Array> data = {string_array, int_array};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::ARRAY, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xFD};
+    uint8_t valid_data_storage[1] = {0xFD};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -986,7 +1286,6 @@ TEST(storage, InsertDataStringArrayNullable) {
         ASSERT_TRUE(expected_data[i].operator==(new_data[i]));
     }
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataJsonNullable) {
@@ -994,7 +1293,8 @@ TEST(storage, InsertDataJsonNullable) {
                               Json(simdjson::padded_string(std::string("A")))};
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::JSON, DataType::NONE, true);
-    uint8_t* valid_data = new uint8_t[1]{0xFC};
+    uint8_t valid_data_storage[1] = {0xFC};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(data.data(), valid_data, data.size(), 0);
 
     auto payload_reader =
@@ -1017,14 +1317,14 @@ TEST(storage, InsertDataJsonNullable) {
     ASSERT_EQ(new_payload->get_num_rows(), data.size());
     ASSERT_EQ(new_payload->get_null_count(), 2);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }
 
 TEST(storage, InsertDataJsonFillWithNull) {
     auto field_data = milvus::storage::CreateFieldData(
         storage::DataType::JSON, DataType::NONE, true);
     int64_t size = 2;
-    uint8_t* valid_data = new uint8_t[1]{0xFC};
+    uint8_t valid_data_storage[1] = {0xFC};
+    uint8_t* valid_data = valid_data_storage;
     field_data->FillFieldData(std::nullopt, size);
 
     auto payload_reader =
@@ -1047,5 +1347,4 @@ TEST(storage, InsertDataJsonFillWithNull) {
     ASSERT_EQ(new_payload->get_num_rows(), size);
     ASSERT_EQ(new_payload->get_null_count(), size);
     ASSERT_EQ(*new_payload->ValidData(), *valid_data);
-    delete[] valid_data;
 }

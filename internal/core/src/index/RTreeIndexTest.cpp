@@ -9,32 +9,70 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include <gtest/gtest.h>
-#include <boost/filesystem.hpp>
-#include <vector>
+#include <boost/core/enable_if.hpp>
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
+#include <stddef.h>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <initializer_list>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <optional>
 #include <string>
-#include <fstream>
+#include <utility>
+#include <vector>
 
+#include "NamedType/named_type_impl.hpp"
 #include "RTreeIndex.h"
-#include "storage/Util.h"
-#include "storage/FileManager.h"
-#include "common/Types.h"
-#include "test_utils/TmpPath.h"
-#include "pb/schema.pb.h"
-#include "pb/plan.pb.h"
-#include "common/Geometry.h"
+#include "Utils.h"
+#include "bitset/bitset.h"
+#include "bitset/detail/element_vectorized.h"
+#include "common/Consts.h"
 #include "common/EasyAssert.h"
-#include "IndexFactory.h"
+#include "common/FieldData.h"
+#include "common/FieldDataInterface.h"
+#include "common/Geometry.h"
+#include "common/Schema.h"
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
+#include "expr/ITypeExpr.h"
+#include "geos_c.h"
+#include "gtest/gtest.h"
+#include "index/Index.h"
+#include "index/IndexStats.h"
+#include "index/Meta.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
+#include "milvus-storage/filesystem/fs.h"
+#include "pb/common.pb.h"
+#include "pb/plan.pb.h"
+#include "pb/schema.pb.h"
+#include "plan/PlanNode.h"
+#include "query/ExecPlanNodeVisitor.h"
+#include "query/Utils.h"
+#include "segcore/SegcoreConfig.h"
+#include "segcore/SegmentSealed.h"
+#include "segcore/Types.h"
+#include "storage/ChunkManager.h"
+#include "storage/DiskFileManagerImpl.h"
+#include "storage/FileManager.h"
 #include "storage/InsertData.h"
 #include "storage/PayloadReader.h"
-#include "storage/DiskFileManagerImpl.h"
-#include "test_utils/DataGen.h"
-#include "query/ExecPlanNodeVisitor.h"
-#include "common/Consts.h"
-#include "test_utils/storage_test_utils.h"
-#include "Utils.h"
+#include "storage/RemoteChunkManagerSingleton.h"
 #include "storage/ThreadPools.h"
+#include "storage/Types.h"
+#include "storage/Util.h"
+#include "test_utils/DataGen.h"
+#include "test_utils/TmpPath.h"
 #include "test_utils/cachinglayer_test_utils.h"
+#include "test_utils/storage_test_utils.h"
 
 // Helper: create simple POINT(x,y) WKB (little-endian)
 static std::string
@@ -118,10 +156,7 @@ class RTreeIndexTest : public ::testing::Test {
         // set geometry data type in field schema for index schema checks
         field_meta_.field_schema.set_data_type(
             ::milvus::proto::schema::DataType::Geometry);
-        index_meta_ = milvus::storage::IndexMeta{.segment_id = 1,
-                                                 .field_id = 100,
-                                                 .build_id = 1,
-                                                 .index_version = 1};
+        index_meta_ = milvus::storage::IndexMeta{1, 100, 1, 1};
     }
 
     void
@@ -142,7 +177,7 @@ class RTreeIndexTest : public ::testing::Test {
                     }
                 }
             }
-            boost::filesystem::remove_all("/tmp/milvus/rtree-index/");
+            // TmpPath cleanup handles the test directory
         } catch (const std::exception& e) {
             // Log error but don't fail the test
             std::cout << "Warning: Failed to clean up test files: " << e.what()
@@ -224,9 +259,13 @@ TEST_F(RTreeIndexTest, Load_WithFileNamesOnly) {
     for (const auto& path : stats->GetIndexFiles()) {
         filenames.emplace_back(
             boost::filesystem::path(path).filename().string());
-        // make sure file exists in remote storage
-        ASSERT_TRUE(chunk_manager_->Exist(path));
-        ASSERT_GT(chunk_manager_->Size(path), 0);
+        // In V2 mode, files are stored via chunk_manager.
+        // In V3 mode, files are stored via ArrowFileSystem (fs_),
+        // so chunk_manager won't find them.
+        if (!milvus::index::kScalarIndexUseV3) {
+            ASSERT_TRUE(chunk_manager_->Exist(path));
+            ASSERT_GT(chunk_manager_->Size(path), 0);
+        }
     }
 
     // Load using filename only list
@@ -328,6 +367,24 @@ TEST_F(RTreeIndexTest, Build_ConfigAndMetaJson) {
 
     rtree.Build(build_cfg);
     auto stats = rtree.Upload({});
+
+    if (milvus::index::kScalarIndexUseV3) {
+        // V3 mode: verify upload produced a single packed file and can be loaded
+        auto index_files = stats->GetIndexFiles();
+        ASSERT_EQ(index_files.size(), 1);
+
+        milvus::storage::FileManagerContext ctx_load(
+            field_meta_, index_meta_, chunk_manager_, fs_);
+        ctx_load.set_for_loading_index(true);
+        milvus::index::RTreeIndex<std::string> rtree_load(ctx_load);
+
+        nlohmann::json cfg;
+        cfg["index_files"] = index_files;
+        milvus::tracer::TraceContext trace_ctx;
+        rtree_load.Load(trace_ctx, cfg);
+        ASSERT_EQ(rtree_load.Count(), 2);
+        return;
+    }
 
     // Cache remote index files locally
     milvus::storage::DiskFileManagerImpl diskfm(
@@ -707,7 +764,7 @@ TEST_F(RTreeIndexTest, GIS_Index_Exact_Filtering) {
     auto schema = std::make_shared<Schema>();
     auto pk_id = schema->AddDebugField("id", DataType::INT64);
     auto dim = 16;
-    auto vec_id = schema->AddDebugField(
+    schema->AddDebugField(
         "vec", DataType::VECTOR_FLOAT, dim, knowhere::metric::L2);
     auto geo_id = schema->AddDebugField("geo", DataType::GEOMETRY);
     schema->set_primary_field_id(pk_id);

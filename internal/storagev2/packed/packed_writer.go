@@ -26,6 +26,7 @@ package packed
 import "C"
 
 import (
+	"strings"
 	"unsafe"
 
 	"github.com/apache/arrow/go/v17/arrow"
@@ -38,6 +39,15 @@ import (
 )
 
 func NewPackedWriter(filePaths []string, schema *arrow.Schema, bufferSize int64, multiPartUploadSize int64, columnGroups []storagecommon.ColumnGroup, storageConfig *indexpb.StorageConfig, storagePluginContext *indexcgopb.StoragePluginContext) (*PackedWriter, error) {
+	// The C++ packed writer prepends root_path from storageConfig to file paths.
+	// Stored binlog paths already include root_path, so strip it to avoid double-append.
+	if storageConfig != nil && storageConfig.GetRootPath() != "" {
+		prefix := storageConfig.GetRootPath() + "/"
+		for i, p := range filePaths {
+			filePaths[i] = strings.TrimPrefix(p, prefix)
+		}
+	}
+
 	cFilePaths := make([]*C.char, len(filePaths))
 	for i, path := range filePaths {
 		cFilePaths[i] = C.CString(path)
@@ -55,7 +65,7 @@ func NewPackedWriter(filePaths []string, schema *arrow.Schema, bufferSize int64,
 
 	cMultiPartUploadSize := C.int64_t(multiPartUploadSize)
 
-	cColumnGroups := C.NewCColumnGroups()
+	cColumnSplits := C.NewCColumnSplits()
 	for _, group := range columnGroups {
 		cGroup := C.malloc(C.size_t(len(group.Columns)) * C.size_t(unsafe.Sizeof(C.int(0))))
 		if cGroup == nil {
@@ -65,7 +75,7 @@ func NewPackedWriter(filePaths []string, schema *arrow.Schema, bufferSize int64,
 		for i, val := range group.Columns {
 			cGroupSlice[i] = C.int(val)
 		}
-		C.AddCColumnGroup(cColumnGroups, (*C.int)(cGroup), C.int(len(group.Columns)))
+		C.AddCColumnSplit(cColumnSplits, (*C.int)(cGroup), C.int(len(group.Columns)))
 		C.free(cGroup)
 	}
 
@@ -103,6 +113,9 @@ func NewPackedWriter(filePaths []string, schema *arrow.Schema, bufferSize int64,
 			requestTimeoutMs:       C.int64_t(storageConfig.GetRequestTimeoutMs()),
 			gcp_credential_json:    C.CString(storageConfig.GetGcpCredentialJSON()),
 			use_custom_part_upload: true,
+			max_connections:        C.uint32_t(storageConfig.GetMaxConnections()),
+			tls_min_version:        C.CString(tlsMinVersionForStorage(storageConfig.GetSslTlsMinVersion())),
+			use_crc32c_checksum:    C.bool(storageConfig.GetUseCrc32CChecksum()),
 		}
 		defer C.free(unsafe.Pointer(cStorageConfig.address))
 		defer C.free(unsafe.Pointer(cStorageConfig.bucket_name))
@@ -116,9 +129,10 @@ func NewPackedWriter(filePaths []string, schema *arrow.Schema, bufferSize int64,
 		defer C.free(unsafe.Pointer(cStorageConfig.sslCACert))
 		defer C.free(unsafe.Pointer(cStorageConfig.region))
 		defer C.free(unsafe.Pointer(cStorageConfig.gcp_credential_json))
-		status = C.NewPackedWriterWithStorageConfig(cSchema, cBufferSize, cFilePathsArray, cNumPaths, cMultiPartUploadSize, cColumnGroups, cStorageConfig, &cPackedWriter, pluginContextPtr)
+		defer C.free(unsafe.Pointer(cStorageConfig.tls_min_version))
+		status = C.NewPackedWriterWithStorageConfig(cSchema, cBufferSize, cFilePathsArray, cNumPaths, cMultiPartUploadSize, cColumnSplits, cStorageConfig, &cPackedWriter, pluginContextPtr)
 	} else {
-		status = C.NewPackedWriter(cSchema, cBufferSize, cFilePathsArray, cNumPaths, cMultiPartUploadSize, cColumnGroups, &cPackedWriter, pluginContextPtr)
+		status = C.NewPackedWriter(cSchema, cBufferSize, cFilePathsArray, cNumPaths, cMultiPartUploadSize, cColumnSplits, &cPackedWriter, pluginContextPtr)
 	}
 	if err := ConsumeCStatusIntoError(&status); err != nil {
 		return nil, err
@@ -127,6 +141,10 @@ func NewPackedWriter(filePaths []string, schema *arrow.Schema, bufferSize int64,
 }
 
 func (pw *PackedWriter) WriteRecordBatch(recordBatch arrow.Record) error {
+	if recordBatch == nil || recordBatch.NumCols() == 0 {
+		return nil
+	}
+
 	cArrays := make([]CArrowArray, recordBatch.NumCols())
 	cSchemas := make([]CArrowSchema, recordBatch.NumCols())
 

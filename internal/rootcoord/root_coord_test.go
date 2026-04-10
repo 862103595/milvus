@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -37,7 +39,9 @@ import (
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
+	"github.com/milvus-io/milvus/internal/mocks/mock_storage"
 	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_balancer"
 	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_broadcaster"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
@@ -46,6 +50,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/broadcast"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
+	mocktso "github.com/milvus-io/milvus/internal/tso/mocks"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -75,13 +80,15 @@ func TestMain(m *testing.M) {
 
 func initStreamingSystemAndCore(t *testing.T) *Core {
 	kv, _ := kvfactory.GetEtcdAndPath()
-	path := funcutil.RandomString(10)
+	path := funcutil.RandomString(10) + "/meta"
 	catalogKV := etcdkv.NewEtcdKV(kv, path)
 
 	ss, err := rootcoord.NewSuffixSnapshot(catalogKV, rootcoord.SnapshotsSep, path, rootcoord.SnapshotPrefix)
 	require.NoError(t, err)
 	testDB := newNameDb()
 	collID2Meta := make(map[typeutil.UniqueID]*model.Collection)
+	tso := mocktso.NewAllocator(t)
+	tso.EXPECT().GenerateTSO(mock.Anything).Return(uint64(1), nil).Maybe()
 	core := newTestCore(withHealthyCode(),
 		withMeta(&MetaTable{
 			catalog:     rootcoord.NewCatalog(catalogKV, ss),
@@ -93,6 +100,7 @@ func initStreamingSystemAndCore(t *testing.T) *Core {
 		withValidMixCoord(),
 		withValidProxyManager(),
 		withValidIDAllocator(),
+		withTsoAllocator(tso),
 		withBroker(newValidMockBroker()),
 	)
 	registry.ResetRegistration()
@@ -112,6 +120,7 @@ func initStreamingSystemAndCore(t *testing.T) *Core {
 
 	bapi := mock_broadcaster.NewMockBroadcastAPI(t)
 	bapi.EXPECT().Broadcast(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, msg message.BroadcastMutableMessage) (*types.BroadcastAppendResult, error) {
+		msg = msg.WithBroadcastID(1)
 		results := make(map[string]*message.AppendResult)
 		for _, vchannel := range msg.BroadcastHeader().VChannels {
 			results[vchannel] = &message.AppendResult{
@@ -120,6 +129,20 @@ func initStreamingSystemAndCore(t *testing.T) *Core {
 				LastConfirmedMessageID: rmq.NewRmqID(1),
 			}
 		}
+		wg := sync.WaitGroup{}
+		for _, mutableMsg := range msg.SplitIntoMutableMessage() {
+			result := results[mutableMsg.VChannel()]
+			immutableMsg := mutableMsg.WithTimeTick(result.TimeTick).WithLastConfirmed(result.LastConfirmedMessageID).IntoImmutableMessage(result.MessageID)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				retry.Do(context.Background(), func() error {
+					return registry.CallMessageAckOnceCallbacks(context.Background(), immutableMsg)
+				}, retry.AttemptAlways())
+			}()
+		}
+		wg.Wait()
+
 		retry.Do(context.Background(), func() error {
 			log.Info("broadcast message", log.FieldMessage(msg))
 			return registry.CallMessageAckCallback(context.Background(), msg, results)
@@ -244,6 +267,16 @@ func TestRootCoord_DropCollection(t *testing.T) {
 		resp, err := c.DropCollection(ctx, &milvuspb.DropCollectionRequest{})
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_TruncateCollection(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		c := newTestCore(withAbnormalCode())
+		ctx := context.Background()
+		resp, err := c.TruncateCollection(ctx, &milvuspb.TruncateCollectionRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 }
 
@@ -1148,10 +1181,6 @@ func TestCore_sendMinDdlTsAsTt(t *testing.T) {
 
 	c.UpdateStateCode(commonpb.StateCode_Healthy)
 
-	_ = paramtable.Get().Save(paramtable.Get().CommonCfg.TTMsgEnabled.Key, "false")
-	c.sendMinDdlTsAsTt() // disable ts msg
-	_ = paramtable.Get().Save(paramtable.Get().CommonCfg.TTMsgEnabled.Key, "true")
-
 	c.sendMinDdlTsAsTt() // no session.
 	ticker.addSession(&sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: TestRootCoordID}})
 	c.sendMinDdlTsAsTt()
@@ -1263,6 +1292,102 @@ func TestRootCoord_AlterCollection(t *testing.T) {
 		resp, err := c.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{})
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_AddCollectionFunction(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		ctx := context.Background()
+		c := newTestCore(withAbnormalCode())
+		resp, err := c.AddCollectionFunction(ctx, &milvuspb.AddCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run ok", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAddFunction).Return(nil).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AddCollectionFunction(ctx, &milvuspb.AddCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run failed", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAddFunction).Return(fmt.Errorf("")).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AddCollectionFunction(ctx, &milvuspb.AddCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_DropCollectionFunction(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		ctx := context.Background()
+		c := newTestCore(withAbnormalCode())
+		resp, err := c.DropCollectionFunction(ctx, &milvuspb.DropCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run ok", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForDropFunction).Return(nil).Build()
+		defer mocker.UnPatch()
+		resp, err := c.DropCollectionFunction(ctx, &milvuspb.DropCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run failed", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForDropFunction).Return(fmt.Errorf("")).Build()
+		defer mocker.UnPatch()
+		resp, err := c.DropCollectionFunction(ctx, &milvuspb.DropCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_AlterCollectionFunction(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		ctx := context.Background()
+		c := newTestCore(withAbnormalCode())
+		resp, err := c.AlterCollectionFunction(ctx, &milvuspb.AlterCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run ok", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAlterFunction).Return(nil).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AlterCollectionFunction(ctx, &milvuspb.AlterCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("run failed", func(t *testing.T) {
+		ctx := context.Background()
+		c := initStreamingSystemAndCore(t)
+		defer c.Stop()
+		mocker := mockey.Mock((*Core).broadcastAlterCollectionForAlterFunction).Return(fmt.Errorf("")).Build()
+		defer mocker.UnPatch()
+		resp, err := c.AlterCollectionFunction(ctx, &milvuspb.AlterCollectionFunctionRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetErrorCode())
 	})
 }
 
@@ -1656,6 +1781,195 @@ func (s *RootCoordSuite) TestRestore() {
 		withTsoAllocator(tsoAllocator),
 		withMeta(meta))
 	core.restore(context.Background())
+}
+
+func TestRootCoord_AddFileResource(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		c := newTestCore(withAbnormalCode())
+		ctx := context.Background()
+		resp, err := c.AddFileResource(ctx, &milvuspb.AddFileResourceRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_NotReadyServe, resp.GetErrorCode())
+	})
+
+	t.Run("storage check error", func(t *testing.T) {
+		storageMock := mock_storage.NewMockChunkManager(t)
+		storageMock.EXPECT().Exist(mock.Anything, mock.Anything).Return(false, errors.New("storage error"))
+
+		c := newTestCore(withHealthyCode(), withStorage(storageMock))
+		ctx := context.Background()
+		resp, err := c.AddFileResource(ctx, &milvuspb.AddFileResourceRequest{
+			Name: "test_resource",
+			Path: "/path/to/file",
+		})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("file not exist", func(t *testing.T) {
+		storageMock := mock_storage.NewMockChunkManager(t)
+		storageMock.EXPECT().Exist(mock.Anything, mock.Anything).Return(false, nil)
+
+		c := newTestCore(withHealthyCode(), withStorage(storageMock))
+		ctx := context.Background()
+		resp, err := c.AddFileResource(ctx, &milvuspb.AddFileResourceRequest{
+			Name: "test_resource",
+			Path: "/path/to/file",
+		})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("tso allocator error", func(t *testing.T) {
+		storageMock := mock_storage.NewMockChunkManager(t)
+		storageMock.EXPECT().Exist(mock.Anything, mock.Anything).Return(true, nil)
+
+		tsoAllocator := newMockTsoAllocator()
+		tsoAllocator.GenerateTSOF = func(count uint32) (uint64, error) {
+			return 0, errors.New("tso error")
+		}
+
+		c := newTestCore(withHealthyCode(), withStorage(storageMock), withTsoAllocator(tsoAllocator))
+		ctx := context.Background()
+		resp, err := c.AddFileResource(ctx, &milvuspb.AddFileResourceRequest{
+			Name: "test_resource",
+			Path: "/path/to/file",
+		})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("meta add file resource error", func(t *testing.T) {
+		storageMock := mock_storage.NewMockChunkManager(t)
+		storageMock.EXPECT().Exist(mock.Anything, mock.Anything).Return(true, nil)
+
+		tsoAllocator := newMockTsoAllocator()
+		tsoAllocator.GenerateTSOF = func(count uint32) (uint64, error) {
+			return 100, nil
+		}
+
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().AddFileResource(mock.Anything, mock.Anything).Return(errors.New("meta error"))
+
+		c := newTestCore(withHealthyCode(), withStorage(storageMock), withTsoAllocator(tsoAllocator), withMeta(meta))
+		ctx := context.Background()
+		resp, err := c.AddFileResource(ctx, &milvuspb.AddFileResourceRequest{
+			Name: "test_resource",
+			Path: "/path/to/file",
+		})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("success", func(t *testing.T) {
+		storageMock := mock_storage.NewMockChunkManager(t)
+		storageMock.EXPECT().Exist(mock.Anything, mock.Anything).Return(true, nil)
+
+		tsoAllocator := newMockTsoAllocator()
+		tsoAllocator.GenerateTSOF = func(count uint32) (uint64, error) {
+			return 100, nil
+		}
+
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().AddFileResource(mock.Anything, mock.Anything).Return(nil)
+
+		observer := NewMockFileResourceObserver(t)
+		observer.EXPECT().Sync().Return(nil)
+		mixc := &mocks.MixCoord{}
+
+		c := newTestCore(withHealthyCode(), withStorage(storageMock), withTsoAllocator(tsoAllocator), withMeta(meta), withMixCoord(mixc))
+		c.SetFileResourceObserver(observer)
+		ctx := context.Background()
+		resp, err := c.AddFileResource(ctx, &milvuspb.AddFileResourceRequest{
+			Name: "test_resource",
+			Path: "/path/to/file",
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_RemoveFileResource(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		c := newTestCore(withAbnormalCode())
+		ctx := context.Background()
+		resp, err := c.RemoveFileResource(ctx, &milvuspb.RemoveFileResourceRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_NotReadyServe, resp.GetErrorCode())
+	})
+
+	t.Run("meta remove file resource error", func(t *testing.T) {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().RemoveFileResource(mock.Anything, mock.Anything).Return(errors.New("meta error"), false)
+
+		c := newTestCore(withHealthyCode(), withMeta(meta))
+		ctx := context.Background()
+		resp, err := c.RemoveFileResource(ctx, &milvuspb.RemoveFileResourceRequest{
+			Name: "test_resource",
+		})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("success with resource not exist", func(t *testing.T) {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().RemoveFileResource(mock.Anything, mock.Anything).Return(nil, false)
+
+		observer := NewMockFileResourceObserver(t)
+
+		c := newTestCore(withHealthyCode(), withMeta(meta))
+		c.SetFileResourceObserver(observer)
+		ctx := context.Background()
+		resp, err := c.RemoveFileResource(ctx, &milvuspb.RemoveFileResourceRequest{
+			Name: "test_resource",
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("success with resource exist", func(t *testing.T) {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().RemoveFileResource(mock.Anything, mock.Anything).Return(nil, true)
+
+		observer := NewMockFileResourceObserver(t)
+		observer.EXPECT().Sync().Return(nil)
+		mixc := &mocks.MixCoord{}
+
+		c := newTestCore(withHealthyCode(), withMeta(meta), withMixCoord(mixc))
+		c.SetFileResourceObserver(observer)
+		ctx := context.Background()
+		resp, err := c.RemoveFileResource(ctx, &milvuspb.RemoveFileResourceRequest{
+			Name: "test_resource",
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+}
+
+func TestRootCoord_ListFileResources(t *testing.T) {
+	t.Run("not healthy", func(t *testing.T) {
+		c := newTestCore(withAbnormalCode())
+		ctx := context.Background()
+		resp, err := c.ListFileResources(ctx, &milvuspb.ListFileResourcesRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_NotReadyServe, resp.GetStatus().GetErrorCode())
+	})
+
+	t.Run("success", func(t *testing.T) {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().ListFileResource(mock.Anything).Return([]*internalpb.FileResourceInfo{{
+			Id:   0,
+			Name: "test",
+			Path: "test_path",
+		}}, 0)
+
+		c := newTestCore(withHealthyCode(), withMeta(meta))
+		ctx := context.Background()
+		resp, err := c.ListFileResources(ctx, &milvuspb.ListFileResourcesRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		assert.NotNil(t, resp.GetResources())
+	})
 }
 
 func TestRootCoordSuite(t *testing.T) {

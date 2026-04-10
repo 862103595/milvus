@@ -9,6 +9,7 @@ import "schema.proto";
 import "data_coord.proto";
 import "index_coord.proto";
 import "milvus.proto";
+import "internal.proto";
 
 
 service IndexNode {
@@ -110,6 +111,7 @@ message CreateJobRequest {
   int64 lack_binlog_rows = 30;
   repeated data.FieldBinlog insert_logs = 31;
   repeated common.KeyValuePair plugin_context = 32;
+  string manifest = 33;
 }
 
 message QueryJobsRequest {
@@ -201,6 +203,8 @@ message CreateStatsRequest {
   int64 json_stats_max_shredding_columns = 28;
   double json_stats_shredding_ratio_threshold = 29;
   int64 json_stats_write_batch_size = 30;
+  string manifest_path = 31;
+  repeated internal.FileResourceInfo file_resources = 32;
 }
 
 message CreateJobV2Request {
@@ -227,7 +231,7 @@ message IndexTaskInfo {
   uint64 serialized_size = 4;
   string fail_reason = 5;
   int32 current_index_version = 6;
-  int64 index_store_version = 7;
+  int64 index_store_version = 7 [deprecated = true];
   uint64 mem_size = 8;
   int32 current_scalar_index_version = 9;
 }
@@ -261,6 +265,7 @@ message StatsResult {
   int64 num_rows = 11;
   repeated data.FieldBinlog bm25_logs = 12;
   map<int64, data.JsonKeyStats> json_key_stats_logs = 13;
+  string manifest = 14;
 }
 
 message StatsResults {

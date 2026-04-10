@@ -1,5 +1,8 @@
 # CLion generated files
 
+# Git worktrees
+.worktrees/
+
 # This can ignore
 #   cmake-build-debug/
 #   proxy/cmake-build-debug/
@@ -47,6 +50,7 @@ proxy/suvlim/*
 proxy-go/proxy-go
 
 # Compiled source
+target/
 bin/
 lib/
 *.a
@@ -90,6 +94,9 @@ cpp_coverage/
 venv/
 .venv/
 
+# Python egg-info
+*.egg-info/
+
 # gopls generated
 go.work
 go.work.sum
@@ -114,6 +121,16 @@ pkg/streaming/proto/**/*.pb.go
 
 #AI rules
 WARP.md
+.claude/
 
 # Antlr
 .antlr
+
+# Gocache
+**/.gocache/
+docs/plans/
+
+.worktrees/
+
+# agent context
+.context/

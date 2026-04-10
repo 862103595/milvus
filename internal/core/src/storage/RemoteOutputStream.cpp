@@ -1,6 +1,15 @@
 #include "RemoteOutputStream.h"
-#include <cstddef>
+
 #include <unistd.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+#include "arrow/io/interfaces.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 
@@ -9,6 +18,9 @@ namespace milvus::storage {
 RemoteOutputStream::RemoteOutputStream(
     std::shared_ptr<arrow::io::OutputStream>&& output_stream)
     : output_stream_(std::move(output_stream)) {
+}
+
+RemoteOutputStream::~RemoteOutputStream() {
 }
 
 size_t
@@ -43,5 +55,11 @@ RemoteOutputStream::Write(int fd, size_t size) {
     }
 
     return size;
+}
+
+void
+RemoteOutputStream::Close() {
+    auto status = output_stream_->Close();
+    AssertInfo(status.ok(), "Failed to close output stream");
 }
 }  // namespace milvus::storage

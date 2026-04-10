@@ -25,6 +25,7 @@ type walImpl struct {
 	p                  *syncutil.Future[pulsar.Producer]
 	notifier           *syncutil.AsyncTaskNotifier[struct{}]
 	backlogClearHelper *backlogClearHelper
+	tenant             tenant
 }
 
 // initProducerAtBackground initializes the producer at background.
@@ -56,8 +57,9 @@ func (w *walImpl) initProducerAtBackground() {
 
 // initProducer initializes the producer.
 func (w *walImpl) initProducer() error {
+	topic := w.tenant.MustGetFullTopicName(w.Channel().Name)
 	p, err := w.c.CreateProducer(pulsar.ProducerOptions{
-		Topic: w.Channel().Name,
+		Topic: topic,
 		// TODO: current go pulsar client does not support fencing, we should enable it after go pulsar client supports it.
 		// ProducerAccessMode: pulsar.ProducerAccessModeExclusiveWithFencing,
 	})
@@ -87,11 +89,9 @@ func (w *walImpl) Append(ctx context.Context, msg message.MutableMessage) (messa
 		Payload:    pb.Payload,
 		Properties: pb.Properties,
 	})
-	if w.backlogClearHelper != nil {
-		// Observe the append traffic even if the message is not sent successfully.
-		// Because if the write is failed, the message may be already written to the pulsar topic.
-		w.backlogClearHelper.ObserveAppend(msg.EstimateSize())
-	}
+	// Observe the append traffic even if the message is not sent successfully.
+	// Because if the write is failed, the message may be already written to the pulsar topic.
+	w.backlogClearHelper.ObserveAppend(msg.EstimateSize())
 	if err != nil {
 		w.Log().RatedWarn(1, "send message to pulsar failed", zap.Error(err))
 		return nil, err
@@ -100,9 +100,10 @@ func (w *walImpl) Append(ctx context.Context, msg message.MutableMessage) (messa
 }
 
 func (w *walImpl) Read(ctx context.Context, opt walimpls.ReadOption) (s walimpls.ScannerImpls, err error) {
+	topic := w.tenant.MustGetFullTopicName(w.Channel().Name)
 	ch := make(chan pulsar.ReaderMessage, 1)
 	readerOpt := pulsar.ReaderOptions{
-		Topic:             w.Channel().Name,
+		Topic:             topic,
 		Name:              opt.Name,
 		MessageChannel:    ch,
 		ReceiverQueueSize: opt.ReadAheadBufferSize,
@@ -140,11 +141,12 @@ func (w *walImpl) Truncate(ctx context.Context, id message.MessageID) error {
 		panic("truncate on a wal that is not in read-write mode")
 	}
 	if w.backlogClearHelper != nil {
-		// if the backlog clear helper is enabled, the truncate make no sense, skip it.
+		// The backlogClearHelper is always non-nil currently, so we can determine the truncate position
 		return nil
 	}
+	topic := w.tenant.MustGetFullTopicName(w.Channel().Name)
 	cursor, err := w.c.Subscribe(pulsar.ConsumerOptions{
-		Topic:                    w.Channel().Name,
+		Topic:                    topic,
 		SubscriptionName:         truncateCursorSubscriptionName,
 		Type:                     pulsar.Exclusive,
 		MaxPendingChunkedMessage: 1, // We cannot set it to 0, because the 0 means 100.

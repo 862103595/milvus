@@ -27,6 +27,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/util"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -225,6 +226,9 @@ func CloneSegmentWithExcludeBinlogs(segment *datapb.SegmentInfo) (*datapb.Segmen
 }
 
 func marshalSegmentInfo(segment *datapb.SegmentInfo) (string, error) {
+	// Compress TextStatsLogs paths to filenames before marshaling to save etcd space
+	metautil.ExtractTextLogFilenames(segment.GetTextStatsLogs())
+
 	segBytes, err := proto.Marshal(segment)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal segment: %d, err: %w", segment.ID, err)
@@ -297,15 +301,15 @@ func buildFieldBM25StatslogPath(collectionID typeutil.UniqueID, partitionID type
 }
 
 func buildFieldBinlogPathPrefix(collectionID typeutil.UniqueID, partitionID typeutil.UniqueID, segmentID typeutil.UniqueID) string {
-	return fmt.Sprintf("%s/%d/%d/%d", SegmentBinlogPathPrefix, collectionID, partitionID, segmentID)
+	return fmt.Sprintf("%s/%d/%d/%d/", SegmentBinlogPathPrefix, collectionID, partitionID, segmentID)
 }
 
 func buildFieldDeltalogPathPrefix(collectionID typeutil.UniqueID, partitionID typeutil.UniqueID, segmentID typeutil.UniqueID) string {
-	return fmt.Sprintf("%s/%d/%d/%d", SegmentDeltalogPathPrefix, collectionID, partitionID, segmentID)
+	return fmt.Sprintf("%s/%d/%d/%d/", SegmentDeltalogPathPrefix, collectionID, partitionID, segmentID)
 }
 
 func buildFieldStatslogPathPrefix(collectionID typeutil.UniqueID, partitionID typeutil.UniqueID, segmentID typeutil.UniqueID) string {
-	return fmt.Sprintf("%s/%d/%d/%d", SegmentStatslogPathPrefix, collectionID, partitionID, segmentID)
+	return fmt.Sprintf("%s/%d/%d/%d/", SegmentStatslogPathPrefix, collectionID, partitionID, segmentID)
 }
 
 // buildChannelRemovePath builds vchannel remove flag path
@@ -325,12 +329,16 @@ func BuildSegmentIndexKey(collectionID, partitionID, segmentID, buildID int64) s
 	return fmt.Sprintf("%s/%d/%d/%d/%d", util.SegmentIndexPrefix, collectionID, partitionID, segmentID, buildID)
 }
 
+func buildSegmentIndexCollectionPrefix(collectionID typeutil.UniqueID) string {
+	return fmt.Sprintf("%s/%d/", util.SegmentIndexPrefix, collectionID)
+}
+
 func buildCollectionPrefix(collectionID typeutil.UniqueID) string {
-	return fmt.Sprintf("%s/%d", SegmentPrefix, collectionID)
+	return fmt.Sprintf("%s/%d/", SegmentPrefix, collectionID)
 }
 
 func buildPartitionPrefix(collectionID, partitionID typeutil.UniqueID) string {
-	return fmt.Sprintf("%s/%d/%d", SegmentPrefix, collectionID, partitionID)
+	return fmt.Sprintf("%s/%d/%d/", SegmentPrefix, collectionID, partitionID)
 }
 
 func buildImportJobKey(jobID int64) string {
@@ -345,10 +353,34 @@ func buildPreImportTaskKey(taskID int64) string {
 	return fmt.Sprintf("%s/%d", PreImportTaskPrefix, taskID)
 }
 
+func buildCopySegmentJobKey(jobID int64) string {
+	return fmt.Sprintf("%s/%d", CopySegmentJobPrefix, jobID)
+}
+
+func buildCopySegmentTaskKey(taskID int64) string {
+	return fmt.Sprintf("%s/%d", CopySegmentTaskPrefix, taskID)
+}
+
 func buildAnalyzeTaskKey(taskID int64) string {
 	return fmt.Sprintf("%s/%d", AnalyzeTaskPrefix, taskID)
 }
 
 func buildStatsTaskKey(taskID int64) string {
 	return fmt.Sprintf("%s/%d", StatsTaskPrefix, taskID)
+}
+
+func buildUpdateExternalCollectionTaskKey(taskID int64) string {
+	return fmt.Sprintf("%s/%d", UpdateExternalCollectionTaskPrefix, taskID)
+}
+
+func buildExternalCollectionRefreshJobKey(jobID int64) string {
+	return fmt.Sprintf("%s/%d", ExternalCollectionRefreshJobPrefix, jobID)
+}
+
+func buildExternalCollectionRefreshTaskKey(taskID int64) string {
+	return fmt.Sprintf("%s/%d", ExternalCollectionRefreshTaskPrefix, taskID)
+}
+
+func buildSnapshotKey(collectionID int64, snapshotID int64) string {
+	return fmt.Sprintf("%s/%d/%d", SnapshotPrefix, collectionID, snapshotID)
 }

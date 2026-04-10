@@ -67,6 +67,11 @@ type BasicMessage interface {
 	// IsPersisted returns true if the message is persisted into underlying log storage.
 	IsPersisted() bool
 
+	// IsPChannelLevel returns true if the message is a pchannel-level message.
+	// A pchannel-level message is broadcast to all pchannels and should be handled
+	// at pchannel scope rather than vchannel scope.
+	IsPChannelLevel() bool
+
 	// IntoMessageProto converts the message to a protobuf message.
 	IntoMessageProto() *messagespb.Message
 }
@@ -80,6 +85,10 @@ type MutableMessage interface {
 	// Available only when the message's version greater than 0.
 	// Return "" or Pchannel if message is can be seen by all vchannels on the pchannel.
 	VChannel() string
+
+	// PChannel returns the physical channel derived from VChannel.
+	// It strips the virtual channel suffix to return the underlying physical channel name.
+	PChannel() string
 
 	// WithBarrierTimeTick sets the barrier time tick of current message.
 	// these time tick is used to promised the message will be sent after that time tick.
@@ -157,12 +166,16 @@ type ImmutableMessage interface {
 	// Return "" if message is can be seen by all vchannels on the pchannel.
 	VChannel() string
 
+	// PChannel returns the physical channel derived from VChannel.
+	// It strips the virtual channel suffix to return the underlying physical channel name.
+	PChannel() string
+
 	// MessageID returns the message id of current message.
 	MessageID() MessageID
 
 	// LastConfirmedMessageID returns the last confirmed message id of current message.
-	// last confirmed message is always a timetick message.
-	// Read from this message id will guarantee the time tick greater than this message is consumed.
+	// Read from this message id will guarantee the time tick greater than this message's time tick,
+	// also promise for the txn message.
 	// Available only when the message's version greater than 0.
 	// Otherwise, it will panic.
 	LastConfirmedMessageID() MessageID

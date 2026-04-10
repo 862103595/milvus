@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
@@ -45,6 +46,9 @@ import (
 const (
 	ControlChannelSuffix = "vcchan" // is the suffix of the virtual control channel
 )
+
+// PreferIPv6LocalIP controls whether IPv6 addresses are preferred when selecting local IPs.
+var PreferIPv6LocalIP atomic.Bool
 
 // CheckGrpcReady wait for context timeout, or wait 100ms then send nil to targetCh
 func CheckGrpcReady(ctx context.Context, targetCh chan error) {
@@ -98,32 +102,112 @@ func GetIP(ip string) string {
 // GetLocalIP return the local ip address
 func GetLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
-	if err == nil {
-		ip := GetValidLocalIP(addrs)
-		if len(ip) != 0 {
-			return ip
-		}
+	if err != nil {
+		log.Warn("Failed to get interface addresses", zap.Error(err))
+		return "127.0.0.1"
 	}
+
+	preferIPv6 := PreferIPv6LocalIP.Load()
+
+	ip := getValidLocalIP(addrs, preferIPv6)
+	if len(ip) != 0 {
+		return ip
+	}
+
+	log.Warn("No valid local IP found, falling back to loopback")
 	return "127.0.0.1"
 }
 
 // GetValidLocalIP return the first valid local ip address
 func GetValidLocalIP(addrs []net.Addr) string {
-	// Search for valid ipv4 addresses
+	return getValidLocalIP(addrs, PreferIPv6LocalIP.Load())
+}
+
+type ipCategory int
+
+const (
+	ipCategoryIPv4Public ipCategory = iota
+	ipCategoryIPv4Private
+	ipCategoryIPv6Public
+	ipCategoryIPv6Private
+	ipCategoryIPv6LinkLocal
+)
+
+var (
+	// Default priority: private first, IPv4 first
+	defaultIPPriority = []ipCategory{
+		ipCategoryIPv4Private,
+		ipCategoryIPv4Public,
+		ipCategoryIPv6Private,
+		ipCategoryIPv6Public,
+		ipCategoryIPv6LinkLocal,
+	}
+	// When IPv6 is preferred: private first, IPv6 first
+	preferIPv6Priority = []ipCategory{
+		ipCategoryIPv6Private,
+		ipCategoryIPv6Public,
+		ipCategoryIPv4Private,
+		ipCategoryIPv4Public,
+		ipCategoryIPv6LinkLocal,
+	}
+)
+
+func getValidLocalIP(addrs []net.Addr, preferIPv6 bool) string {
+	candidates := make(map[ipCategory]net.IP, 5)
+
 	for _, addr := range addrs {
-		ipaddr, ok := addr.(*net.IPNet)
-		if ok && ipaddr.IP.IsGlobalUnicast() && ipaddr.IP.To4() != nil {
-			return ipaddr.IP.String()
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+
+		category, valid := categorizeLocalIP(ipNet.IP)
+		if !valid {
+			continue
+		}
+
+		if _, exists := candidates[category]; !exists {
+			ipCopy := make(net.IP, len(ipNet.IP))
+			copy(ipCopy, ipNet.IP)
+			candidates[category] = ipCopy
 		}
 	}
-	// Search for valid ipv6 addresses
-	for _, addr := range addrs {
-		ipaddr, ok := addr.(*net.IPNet)
-		if ok && ipaddr.IP.IsGlobalUnicast() && ipaddr.IP.To16() != nil && ipaddr.IP.To4() == nil {
-			return "[" + ipaddr.IP.String() + "]"
+
+	priorities := defaultIPPriority
+	if preferIPv6 {
+		priorities = preferIPv6Priority
+	}
+
+	for _, category := range priorities {
+		if ip, exists := candidates[category]; exists {
+			result := formatLocalIP(ip)
+			log.Debug("Selected IP by priority",
+				zap.String("ip", result),
+				zap.String("categoryName", getCategoryName(category)))
+			return result
 		}
 	}
+
+	log.Warn("No valid IP found in candidates")
 	return ""
+}
+
+// getCategoryName returns human-readable name for IP category (for debugging)
+func getCategoryName(category ipCategory) string {
+	switch category {
+	case ipCategoryIPv4Private:
+		return "IPv4Private"
+	case ipCategoryIPv4Public:
+		return "IPv4Public"
+	case ipCategoryIPv6Private:
+		return "IPv6Private"
+	case ipCategoryIPv6Public:
+		return "IPv6Public"
+	case ipCategoryIPv6LinkLocal:
+		return "IPv6LinkLocal"
+	default:
+		return "Unknown"
+	}
 }
 
 // JSONToMap parse the jsonic index parameters to map
@@ -300,9 +384,9 @@ func IsControlChannel(channel string) bool {
 	return strings.HasSuffix(channel, ControlChannelSuffix)
 }
 
-// IsOnPhysicalChannel checks if the channel is on the physical channel
+// IsOnPhysicalChannel checks if the channel is on the physical channel.
 func IsOnPhysicalChannel(channel string, physicalChannel string) bool {
-	return strings.HasPrefix(channel, physicalChannel)
+	return ToPhysicalChannel(channel) == physicalChannel
 }
 
 // ToPhysicalChannel get physical channel name from virtual channel name
@@ -438,6 +522,9 @@ func GetNumRowOfFieldDataWithSchema(fieldData *schemapb.FieldData, helper *typeu
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetDoubleData().GetData())
 	case schemapb.DataType_Timestamptz:
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetTimestamptzData().GetData())
+		if fieldNumRows == 0 {
+			fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetStringData().GetData())
+		}
 	case schemapb.DataType_String, schemapb.DataType_VarChar, schemapb.DataType_Text:
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetStringData().GetData())
 	case schemapb.DataType_Array:
@@ -446,40 +533,71 @@ func GetNumRowOfFieldDataWithSchema(fieldData *schemapb.FieldData, helper *typeu
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetJsonData().GetData())
 	case schemapb.DataType_Geometry:
 		fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetGeometryData().GetData())
+		if fieldNumRows == 0 {
+			fieldNumRows = getNumRowsOfScalarField(fieldData.GetScalars().GetGeometryWktData().GetData())
+		}
 	case schemapb.DataType_FloatVector:
-		dim := fieldData.GetVectors().GetDim()
-		fieldNumRows, err = GetNumRowsOfFloatVectorField(fieldData.GetVectors().GetFloatVector().GetData(), dim)
-		if err != nil {
-			return 0, err
+		if len(fieldData.GetValidData()) > 0 {
+			fieldNumRows = uint64(len(fieldData.GetValidData()))
+		} else {
+			dim := fieldData.GetVectors().GetDim()
+			fieldNumRows, err = GetNumRowsOfFloatVectorField(fieldData.GetVectors().GetFloatVector().GetData(), dim)
+			if err != nil {
+				return 0, err
+			}
 		}
 	case schemapb.DataType_BinaryVector:
-		dim := fieldData.GetVectors().GetDim()
-		fieldNumRows, err = GetNumRowsOfBinaryVectorField(fieldData.GetVectors().GetBinaryVector(), dim)
-		if err != nil {
-			return 0, err
+		if len(fieldData.GetValidData()) > 0 {
+			fieldNumRows = uint64(len(fieldData.GetValidData()))
+		} else {
+			dim := fieldData.GetVectors().GetDim()
+			fieldNumRows, err = GetNumRowsOfBinaryVectorField(fieldData.GetVectors().GetBinaryVector(), dim)
+			if err != nil {
+				return 0, err
+			}
 		}
 	case schemapb.DataType_Float16Vector:
-		dim := fieldData.GetVectors().GetDim()
-		fieldNumRows, err = GetNumRowsOfFloat16VectorField(fieldData.GetVectors().GetFloat16Vector(), dim)
-		if err != nil {
-			return 0, err
+		if len(fieldData.GetValidData()) > 0 {
+			fieldNumRows = uint64(len(fieldData.GetValidData()))
+		} else {
+			dim := fieldData.GetVectors().GetDim()
+			fieldNumRows, err = GetNumRowsOfFloat16VectorField(fieldData.GetVectors().GetFloat16Vector(), dim)
+			if err != nil {
+				return 0, err
+			}
 		}
 	case schemapb.DataType_BFloat16Vector:
-		dim := fieldData.GetVectors().GetDim()
-		fieldNumRows, err = GetNumRowsOfBFloat16VectorField(fieldData.GetVectors().GetBfloat16Vector(), dim)
-		if err != nil {
-			return 0, err
+		if len(fieldData.GetValidData()) > 0 {
+			fieldNumRows = uint64(len(fieldData.GetValidData()))
+		} else {
+			dim := fieldData.GetVectors().GetDim()
+			fieldNumRows, err = GetNumRowsOfBFloat16VectorField(fieldData.GetVectors().GetBfloat16Vector(), dim)
+			if err != nil {
+				return 0, err
+			}
 		}
 	case schemapb.DataType_SparseFloatVector:
-		fieldNumRows = uint64(len(fieldData.GetVectors().GetSparseFloatVector().GetContents()))
+		if len(fieldData.GetValidData()) > 0 {
+			fieldNumRows = uint64(len(fieldData.GetValidData()))
+		} else {
+			fieldNumRows = uint64(len(fieldData.GetVectors().GetSparseFloatVector().GetContents()))
+		}
 	case schemapb.DataType_Int8Vector:
-		dim := fieldData.GetVectors().GetDim()
-		fieldNumRows, err = GetNumRowsOfInt8VectorField(fieldData.GetVectors().GetInt8Vector(), dim)
-		if err != nil {
-			return 0, err
+		if len(fieldData.GetValidData()) > 0 {
+			fieldNumRows = uint64(len(fieldData.GetValidData()))
+		} else {
+			dim := fieldData.GetVectors().GetDim()
+			fieldNumRows, err = GetNumRowsOfInt8VectorField(fieldData.GetVectors().GetInt8Vector(), dim)
+			if err != nil {
+				return 0, err
+			}
 		}
 	case schemapb.DataType_ArrayOfVector:
-		fieldNumRows = getNumRowsOfArrayVectorField(fieldData.GetVectors().GetVectorArray().GetData())
+		if len(fieldData.GetValidData()) > 0 {
+			fieldNumRows = uint64(len(fieldData.GetValidData()))
+		} else {
+			fieldNumRows = getNumRowsOfArrayVectorField(fieldData.GetVectors().GetVectorArray().GetData())
+		}
 	default:
 		return 0, fmt.Errorf("%s is not supported now", fieldSchema.GetDataType())
 	}
@@ -519,6 +637,9 @@ func GetNumRowOfFieldData(fieldData *schemapb.FieldData) (uint64, error) {
 			return 0, fmt.Errorf("%s is not supported now", scalarType)
 		}
 	case *schemapb.FieldData_Vectors:
+		if len(fieldData.GetValidData()) > 0 {
+			return uint64(len(fieldData.GetValidData())), nil
+		}
 		vectorField := fieldData.GetVectors()
 		switch vectorFieldType := vectorField.Data.(type) {
 		case *schemapb.VectorField_FloatVector:
@@ -590,14 +711,18 @@ func IsEmptyString(str string) bool {
 	return strings.TrimSpace(str) == ""
 }
 
-func HandleTenantForEtcdKey(prefix string, tenant string, key string) string {
+// HandleTenantForEtcdPrefix builds an etcd prefix for range scans (always ends with /).
+// Two layers: HandleTenantForEtcdPrefix("a", "b") => "a/b/"
+// Three layers: HandleTenantForEtcdPrefix("a", "b", "c") => "a/b/c/"
+func HandleTenantForEtcdPrefix(prefix string, tenant string, subPrefixes ...string) string {
 	res := prefix
 	if tenant != "" {
 		res += "/" + tenant
 	}
-	if key != "" {
-		res += "/" + key
+	for _, sub := range subPrefixes {
+		res += "/" + sub
 	}
+	res += "/"
 	return res
 }
 
@@ -621,4 +746,74 @@ func DecodeUserRoleCache(cache string) (string, string, error) {
 	user := cache[:index]
 	role := cache[index+1:]
 	return user, role, nil
+}
+
+// isIPv4Private checks if an IPv4 address is in RFC 1918 private ranges
+func isIPv4Private(ip net.IP) bool {
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return false
+	}
+	// RFC 1918 private address ranges:
+	// 10.0.0.0/8        (10.0.0.0 to 10.255.255.255)
+	// 172.16.0.0/12     (172.16.0.0 to 172.31.255.255)
+	// 192.168.0.0/16    (192.168.0.0 to 192.168.255.255)
+	return ipv4[0] == 10 ||
+		(ipv4[0] == 172 && ipv4[1] >= 16 && ipv4[1] <= 31) ||
+		(ipv4[0] == 192 && ipv4[1] == 168)
+}
+
+func categorizeLocalIP(ip net.IP) (ipCategory, bool) {
+	if ip == nil {
+		return 0, false
+	}
+
+	if ip.IsLoopback() || ip.IsInterfaceLocalMulticast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return 0, false
+	}
+
+	if ipv4 := ip.To4(); ipv4 != nil {
+		if !ip.IsGlobalUnicast() {
+			return 0, false
+		}
+		if isIPv4Private(ipv4) {
+			return ipCategoryIPv4Private, true
+		}
+		return ipCategoryIPv4Public, true
+	}
+
+	ipv6 := ip.To16()
+	if ipv6 == nil {
+		return 0, false
+	}
+
+	if ip.IsLinkLocalUnicast() {
+		return ipCategoryIPv6LinkLocal, true
+	}
+	if isIPv6Private(ipv6) {
+		return ipCategoryIPv6Private, true
+	}
+	if ip.IsGlobalUnicast() {
+		return ipCategoryIPv6Public, true
+	}
+
+	log.Debug("IP categorization: uncategorized IPv6", zap.String("ip", ip.String()))
+	return 0, false
+}
+
+// isIPv6Private checks if an IPv6 address is in private ranges
+func isIPv6Private(ip net.IP) bool {
+	ip = ip.To16()
+	if len(ip) != net.IPv6len {
+		return false
+	}
+	// RFC 4193 Unique Local Addresses (ULA): fc00::/7
+	return ip[0]&0xfe == 0xfc
+}
+
+func formatLocalIP(ip net.IP) string {
+	if ip.To4() != nil {
+		return ip.String()
+	}
+	return "[" + ip.String() + "]"
 }

@@ -14,14 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <stdio.h>
+#include <string.h>
+#include <exception>
 #include <mutex>
 
 #include "ConfigKnowhere.h"
 #include "common/EasyAssert.h"
+#include "common/logging_c.h"
+#include "gflags/gflags.h"
 #include "glog/logging.h"
-#include "log/Log.h"
 #include "knowhere/comp/knowhere_config.h"
 #include "knowhere/version.h"
+#include "log/Log.h"
 
 namespace milvus::config {
 
@@ -33,9 +38,7 @@ KnowhereInitImpl(const char* conf_file) {
         knowhere::KnowhereConfig::SetBlasThreshold(16384);
         knowhere::KnowhereConfig::SetEarlyStopThreshold(0);
         knowhere::KnowhereConfig::ShowVersion();
-        if (!google::IsGoogleLoggingInitialized()) {
-            google::InitGoogleLogging("milvus");
-        }
+        InitGoogleLoggingWithZapSink();
 
 #ifdef EMBEDDED_MILVUS
         // always disable all logs for embedded milvus
@@ -68,7 +71,7 @@ KnowhereSetSimdType(const char* value) {
     try {
         return knowhere::KnowhereConfig::SetSimdType(simd_type);
     } catch (std::exception& e) {
-        LOG_ERROR(e.what());
+        LOG_ERROR("{}", e.what());
         ThrowInfo(ConfigInvalid, e.what());
     }
 }

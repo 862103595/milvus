@@ -43,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/kv/predicates"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
@@ -405,6 +406,28 @@ func Test_AlterSegments(t *testing.T) {
 		verifySavedKvsForSegment(t, savedKvs)
 	})
 
+	t.Run("save successfully with update mask", func(t *testing.T) {
+		var savedKvs map[string]string
+		metakv := mocks.NewMetaKv(t)
+		metakv.EXPECT().MultiSave(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, m map[string]string) error {
+			savedKvs = m
+			return nil
+		})
+
+		catalog := NewCatalog(metakv, rootPath, "")
+		err := catalog.AlterSegments(context.TODO(), []*datapb.SegmentInfo{segment1}, metastore.BinlogsIncrement{
+			Segment: segment1,
+			UpdateMask: metastore.BinlogsUpdateMask{
+				WithoutBinlogs:       true,
+				WithoutDeltalogs:     true,
+				WithoutStatslogs:     true,
+				WithoutBm25Statslogs: true,
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(savedKvs))
+	})
+
 	t.Run("save large ops successfully", func(t *testing.T) {
 		savedKvs := make(map[string]string)
 		opGroupCount := 0
@@ -528,12 +551,13 @@ func Test_DropSegment(t *testing.T) {
 		assert.NoError(t, err)
 
 		segKey := buildSegmentPath(segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
-		binlogPreix := fmt.Sprintf("%s/%d/%d/%d", SegmentBinlogPathPrefix, segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
-		deltalogPreix := fmt.Sprintf("%s/%d/%d/%d", SegmentDeltalogPathPrefix, segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
-		statelogPreix := fmt.Sprintf("%s/%d/%d/%d", SegmentStatslogPathPrefix, segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
+		binlogPrefix := fmt.Sprintf("%s/%d/%d/%d/", SegmentBinlogPathPrefix, segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
+		deltalogPrefix := fmt.Sprintf("%s/%d/%d/%d/", SegmentDeltalogPathPrefix, segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
+		statelogPrefix := fmt.Sprintf("%s/%d/%d/%d/", SegmentStatslogPathPrefix, segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
+		bm25logPrefix := fmt.Sprintf("%s/%d/%d/%d/", SegmentBM25logPathPrefix, segment1.GetCollectionID(), segment1.GetPartitionID(), segment1.GetID())
 
 		assert.Equal(t, 5, len(removedKvs))
-		for _, k := range []string{segKey, binlogPreix, deltalogPreix, statelogPreix} {
+		for _, k := range []string{segKey, binlogPrefix, deltalogPrefix, statelogPrefix, bm25logPrefix} {
 			_, ok := removedKvs[k]
 			assert.True(t, ok)
 		}
@@ -1052,7 +1076,7 @@ func TestCatalog_ListSegmentIndexes(t *testing.T) {
 			MetaKv: metakv,
 		}
 
-		segIdxes, err := catalog.ListSegmentIndexes(context.Background())
+		segIdxes, err := catalog.ListSegmentIndexes(context.Background(), 0)
 		assert.NoError(t, err)
 		assert.Equal(t, 1, len(segIdxes))
 	})
@@ -1064,7 +1088,7 @@ func TestCatalog_ListSegmentIndexes(t *testing.T) {
 			MetaKv: metakv,
 		}
 
-		_, err := catalog.ListSegmentIndexes(context.Background())
+		_, err := catalog.ListSegmentIndexes(context.Background(), 0)
 		assert.Error(t, err)
 	})
 
@@ -1077,7 +1101,7 @@ func TestCatalog_ListSegmentIndexes(t *testing.T) {
 			MetaKv: metakv,
 		}
 
-		_, err := catalog.ListSegmentIndexes(context.Background())
+		_, err := catalog.ListSegmentIndexes(context.Background(), 0)
 		assert.Error(t, err)
 	})
 }
@@ -1804,5 +1828,324 @@ func Test_StatsTasks(t *testing.T) {
 
 		err = kc.DropStatsTask(context.Background(), 1)
 		assert.NoError(t, err)
+	})
+}
+
+func TestCatalog_CopySegmentJob(t *testing.T) {
+	kc := &Catalog{}
+	mockErr := errors.New("mock error")
+
+	job := &datapb.CopySegmentJob{
+		JobId:          1,
+		CollectionId:   100,
+		CollectionName: "test_collection",
+		State:          datapb.CopySegmentJobState_CopySegmentJobPending,
+	}
+
+	t.Run("SaveCopySegmentJob", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Save(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		kc.MetaKv = txn
+
+		err := kc.SaveCopySegmentJob(context.Background(), job)
+		assert.NoError(t, err)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().Save(mock.Anything, mock.Anything, mock.Anything).Return(mockErr)
+		kc.MetaKv = txn
+
+		err = kc.SaveCopySegmentJob(context.Background(), job)
+		assert.Error(t, err)
+	})
+
+	t.Run("ListCopySegmentJobs", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mockErr)
+		kc.MetaKv = txn
+
+		jobs, err := kc.ListCopySegmentJobs(context.Background())
+		assert.Error(t, err)
+		assert.Nil(t, jobs)
+
+		value, err := proto.Marshal(job)
+		assert.NoError(t, err)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, _ string, _ int, f func([]byte, []byte) error) error {
+			return f([]byte("key1"), value)
+		})
+		kc.MetaKv = txn
+
+		jobs, err = kc.ListCopySegmentJobs(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(jobs))
+		assert.Equal(t, int64(1), jobs[0].JobId)
+		assert.Equal(t, int64(100), jobs[0].CollectionId)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, _ string, _ int, f func([]byte, []byte) error) error {
+			return f([]byte("key1"), []byte("invalid"))
+		})
+		kc.MetaKv = txn
+
+		jobs, err = kc.ListCopySegmentJobs(context.Background())
+		assert.Error(t, err)
+		assert.Nil(t, jobs)
+	})
+
+	t.Run("DropCopySegmentJob", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Remove(mock.Anything, mock.Anything).Return(nil)
+		kc.MetaKv = txn
+
+		err := kc.DropCopySegmentJob(context.Background(), job.GetJobId())
+		assert.NoError(t, err)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().Remove(mock.Anything, mock.Anything).Return(mockErr)
+		kc.MetaKv = txn
+
+		err = kc.DropCopySegmentJob(context.Background(), job.GetJobId())
+		assert.Error(t, err)
+	})
+}
+
+func TestCatalog_CopySegmentTask(t *testing.T) {
+	kc := &Catalog{}
+	mockErr := errors.New("mock error")
+
+	task := &datapb.CopySegmentTask{
+		TaskId: 1,
+		JobId:  10,
+		State:  datapb.CopySegmentTaskState_CopySegmentTaskPending,
+	}
+
+	t.Run("SaveCopySegmentTask", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Save(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		kc.MetaKv = txn
+
+		err := kc.SaveCopySegmentTask(context.Background(), task)
+		assert.NoError(t, err)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().Save(mock.Anything, mock.Anything, mock.Anything).Return(mockErr)
+		kc.MetaKv = txn
+
+		err = kc.SaveCopySegmentTask(context.Background(), task)
+		assert.Error(t, err)
+	})
+
+	t.Run("SaveCopySegmentTasksBatch", func(t *testing.T) {
+		tasks := []*datapb.CopySegmentTask{
+			{TaskId: 1, JobId: 10, State: datapb.CopySegmentTaskState_CopySegmentTaskPending},
+			{TaskId: 2, JobId: 10, State: datapb.CopySegmentTaskState_CopySegmentTaskInProgress},
+			{TaskId: 3, JobId: 10, State: datapb.CopySegmentTaskState_CopySegmentTaskCompleted},
+		}
+
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().MultiSave(mock.Anything, mock.Anything).Return(nil)
+		kc.MetaKv = txn
+
+		err := kc.SaveCopySegmentTasksBatch(context.Background(), tasks)
+		assert.NoError(t, err)
+
+		err = kc.SaveCopySegmentTasksBatch(context.Background(), nil)
+		assert.NoError(t, err)
+
+		err = kc.SaveCopySegmentTasksBatch(context.Background(), []*datapb.CopySegmentTask{})
+		assert.NoError(t, err)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().MultiSave(mock.Anything, mock.Anything).Return(mockErr)
+		kc.MetaKv = txn
+
+		err = kc.SaveCopySegmentTasksBatch(context.Background(), tasks)
+		assert.Error(t, err)
+	})
+
+	t.Run("ListCopySegmentTasks", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mockErr)
+		kc.MetaKv = txn
+
+		tasks, err := kc.ListCopySegmentTasks(context.Background())
+		assert.Error(t, err)
+		assert.Nil(t, tasks)
+
+		value, err := proto.Marshal(task)
+		assert.NoError(t, err)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, _ string, _ int, f func([]byte, []byte) error) error {
+			return f([]byte("key1"), value)
+		})
+		kc.MetaKv = txn
+
+		tasks, err = kc.ListCopySegmentTasks(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(tasks))
+		assert.Equal(t, int64(1), tasks[0].TaskId)
+		assert.Equal(t, int64(10), tasks[0].JobId)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, _ string, _ int, f func([]byte, []byte) error) error {
+			return f([]byte("key1"), []byte("invalid"))
+		})
+		kc.MetaKv = txn
+
+		tasks, err = kc.ListCopySegmentTasks(context.Background())
+		assert.Error(t, err)
+		assert.Nil(t, tasks)
+	})
+
+	t.Run("DropCopySegmentTask", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Remove(mock.Anything, mock.Anything).Return(nil)
+		kc.MetaKv = txn
+
+		err := kc.DropCopySegmentTask(context.Background(), task.GetTaskId())
+		assert.NoError(t, err)
+
+		txn = mocks.NewMetaKv(t)
+		txn.EXPECT().Remove(mock.Anything, mock.Anything).Return(mockErr)
+		kc.MetaKv = txn
+
+		err = kc.DropCopySegmentTask(context.Background(), task.GetTaskId())
+		assert.Error(t, err)
+	})
+}
+
+func TestCatalog_ExternalCollectionRefreshAndFileResource(t *testing.T) {
+	kc := &Catalog{}
+
+	job := &datapb.ExternalCollectionRefreshJob{
+		JobId:          12345,
+		CollectionName: "test_collection",
+		State:          indexpb.JobState_JobStateInProgress,
+		Progress:       50,
+	}
+
+	task := &datapb.ExternalCollectionRefreshTask{
+		TaskId: 54321,
+		JobId:  12345,
+		State:  indexpb.JobState_JobStateInProgress,
+	}
+
+	resource := &internalpb.FileResourceInfo{
+		Id:   int64(12345),
+		Name: "test_resource",
+	}
+
+	t.Run("SaveExternalCollectionRefreshJob", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Save(mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(1)
+		kc.MetaKv = txn
+
+		err := kc.SaveExternalCollectionRefreshJob(context.Background(), job)
+		assert.NoError(t, err)
+	})
+
+	t.Run("ListExternalCollectionRefreshJobs", func(t *testing.T) {
+		value, err := proto.Marshal(job)
+		assert.NoError(t, err)
+
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+			func(_ context.Context, _ string, _ int, f func([]byte, []byte) error) error {
+				return f([]byte("key1"), value)
+			}).Times(1)
+		kc.MetaKv = txn
+
+		jobs, err := kc.ListExternalCollectionRefreshJobs(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(jobs))
+		assert.Equal(t, int64(12345), jobs[0].JobId)
+	})
+
+	t.Run("DropExternalCollectionRefreshJob", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Remove(mock.Anything, mock.Anything).Return(nil).Times(1)
+		kc.MetaKv = txn
+
+		err := kc.DropExternalCollectionRefreshJob(context.Background(), job.GetJobId())
+		assert.NoError(t, err)
+	})
+
+	t.Run("SaveExternalCollectionRefreshTask", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Save(mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(1)
+		kc.MetaKv = txn
+
+		err := kc.SaveExternalCollectionRefreshTask(context.Background(), task)
+		assert.NoError(t, err)
+	})
+
+	t.Run("ListExternalCollectionRefreshTasks", func(t *testing.T) {
+		value, err := proto.Marshal(task)
+		assert.NoError(t, err)
+
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+			func(_ context.Context, _ string, _ int, f func([]byte, []byte) error) error {
+				return f([]byte("key1"), value)
+			}).Times(1)
+		kc.MetaKv = txn
+
+		tasks, err := kc.ListExternalCollectionRefreshTasks(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(tasks))
+		assert.Equal(t, int64(54321), tasks[0].TaskId)
+	})
+
+	t.Run("DropExternalCollectionRefreshTask", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().Remove(mock.Anything, mock.Anything).Return(nil).Times(1)
+		kc.MetaKv = txn
+
+		err := kc.DropExternalCollectionRefreshTask(context.Background(), task.GetTaskId())
+		assert.NoError(t, err)
+	})
+
+	t.Run("SaveFileResource", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().MultiSave(mock.Anything, mock.Anything).Return(nil).Times(1)
+		kc.MetaKv = txn
+
+		err := kc.SaveFileResource(context.Background(), resource, uint64(1))
+		assert.NoError(t, err)
+	})
+
+	t.Run("RemoveFileResource", func(t *testing.T) {
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().MultiSaveAndRemove(mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(1)
+		kc.MetaKv = txn
+
+		err := kc.RemoveFileResource(context.Background(), resource.GetId(), uint64(1))
+		assert.NoError(t, err)
+	})
+
+	t.Run("ListFileResource", func(t *testing.T) {
+		value, err := proto.Marshal(resource)
+		assert.NoError(t, err)
+
+		txn := mocks.NewMetaKv(t)
+		txn.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).Return(
+			[]string{"key1"}, []string{string(value)}, nil).Times(1)
+		txn.EXPECT().Has(mock.Anything, mock.Anything).Return(true, nil).Times(1)
+		txn.EXPECT().Load(mock.Anything, mock.Anything).Return("100", nil).Times(1)
+		kc.MetaKv = txn
+
+		resources, version, err := kc.ListFileResource(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(resources))
+		assert.Equal(t, int64(12345), resources[0].GetId())
+		assert.Equal(t, uint64(100), version)
+	})
+
+	t.Run("BuildFileResourceKey", func(t *testing.T) {
+		key := BuildFileResourceKey(int64(12345))
+		assert.NotEmpty(t, key)
+		assert.Contains(t, key, "12345")
 	})
 }

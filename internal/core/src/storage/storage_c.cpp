@@ -15,15 +15,22 @@
 // limitations under the License.
 
 #include "storage/storage_c.h"
+
+#include <exception>
+#include <memory>
+#include <string>
+
+#include "PluginInterface.h"
+#include "common/EasyAssert.h"
+#include "monitor/scope_metric.h"
 #include "storage/FileWriter.h"
-#include "monitor/Monitor.h"
-#include "storage/PluginLoader.h"
-#include "storage/RemoteChunkManagerSingleton.h"
+#include "storage/LocalChunkManager.h"
 #include "storage/LocalChunkManagerSingleton.h"
 #include "storage/MmapManager.h"
+#include "storage/PluginLoader.h"
+#include "storage/RemoteChunkManagerSingleton.h"
 #include "storage/ThreadPools.h"
-#include "monitor/scope_metric.h"
-#include "common/EasyAssert.h"
+#include "storage/Types.h"
 
 CStatus
 GetLocalUsedSize(const char* c_dir, int64_t* size) {
@@ -83,8 +90,15 @@ InitRemoteChunkManagerSingleton(CStorageConfig c_storage_config) {
         storage_config.useVirtualHost = c_storage_config.useVirtualHost;
         storage_config.region = c_storage_config.region;
         storage_config.requestTimeoutMs = c_storage_config.requestTimeoutMs;
+        storage_config.max_connections = c_storage_config.max_connections;
         storage_config.gcp_credential_json =
             std::string(c_storage_config.gcp_credential_json);
+        if (c_storage_config.tls_min_version != nullptr) {
+            storage_config.tls_min_version =
+                std::string(c_storage_config.tls_min_version);
+        }
+        storage_config.use_crc32c_checksum =
+            c_storage_config.use_crc32c_checksum;
         milvus::storage::RemoteChunkManagerSingleton::GetInstance().Init(
             storage_config);
 
@@ -112,6 +126,7 @@ InitMmapManager(CMmapConfig c_mmap_config) {
             c_mmap_config.vector_index_enable_mmap;
         mmap_config.vector_field_enable_mmap =
             c_mmap_config.vector_field_enable_mmap;
+        mmap_config.mmap_populate = c_mmap_config.mmap_populate;
         milvus::storage::MmapManager::GetInstance().Init(mmap_config);
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {

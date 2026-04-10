@@ -12,6 +12,7 @@ default_dim = 128
 default_nb = 2000
 default_nb_medium = 5000
 default_max_capacity = 100
+default_max_length = 500
 default_top_k = 10
 default_nq = 2
 default_limit = 10
@@ -40,6 +41,7 @@ default_double_field_name = "double"
 default_string_field_name = "varchar"
 default_json_field_name = "json_field"
 default_geometry_field_name = "geometry_field"
+default_timestamptz_field_name = "timestamptz_field"
 default_array_field_name = "int_array"
 default_int8_array_field_name = "int8_array"
 default_int16_array_field_name = "int16_array"
@@ -88,7 +90,9 @@ all_scalar_data_types = [
     DataType.DOUBLE,
     DataType.VARCHAR,
     DataType.ARRAY,
-    DataType.JSON
+    DataType.JSON, 
+    DataType.GEOMETRY,
+    DataType.TIMESTAMPTZ
     ]
 
 default_field_name_map = {
@@ -141,7 +145,7 @@ compact_delta_ratio_reciprocal = 5  # compact_delta_binlog_ratio is 0.2
 compact_retention_duration = 40  # compaction travel time retention range 20s
 max_compaction_interval = 60  # the max time interval (s) from the last compaction
 max_field_num = 64  # Maximum number of fields in a collection
-max_vector_field_num = 4  # Maximum number of vector fields in a collection
+max_vector_field_num = 10  # Maximum number of vector fields in a collection
 max_name_length = 255  # Maximum length of name for a collection or alias
 default_replica_num = 1
 default_graceful_time = 5  #
@@ -294,6 +298,9 @@ all_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ",
                    "SPARSE_INVERTED_INDEX", "SPARSE_WAND",
                    "GPU_IVF_FLAT", "GPU_IVF_PQ"]
 
+all_dense_float_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ",
+                               "IVF_RABITQ", "HNSW", "SCANN", "DISKANN"]
+
 inverted_index_algo = ['TAAT_NAIVE', 'DAAT_WAND', 'DAAT_MAXSCORE']
 
 int8_vector_index = ["HNSW"]
@@ -323,6 +330,9 @@ structure_metrics = ["SUBSTRUCTURE", "SUPERSTRUCTURE"]
 sparse_metrics = ["IP", "BM25"]
 # all_scalar_data_types = ['int8', 'int16', 'int32', 'int64', 'float', 'double', 'bool', 'varchar']
 
+
+varchar_supported_index_types = ["STL_SORT", "TRIE", "INVERTED", "AUTOINDEX", ""]
+numeric_supported_index_types = ["STL_SORT", "INVERTED", "AUTOINDEX", ""]
 
 default_flat_index = {"index_type": "FLAT", "params": {}, "metric_type": default_L0_metric}
 default_bin_flat_index = {"index_type": "BIN_FLAT", "params": {}, "metric_type": "JACCARD"}
@@ -369,6 +379,13 @@ all_expr_fields = [default_int8_field_name, default_int16_field_name,
                    default_int32_array_field_name, default_int64_array_field_name,
                    default_bool_array_field_name, default_float_array_field_name,
                    default_double_array_field_name, default_string_array_field_name]
+
+not_supported_json_cast_types = [DataType.INT8.name, DataType.INT16.name, DataType.INT32.name,
+                                              DataType.INT64.name, DataType.FLOAT.name,
+                                              DataType.ARRAY.name, DataType.FLOAT_VECTOR.name,
+                                              DataType.FLOAT16_VECTOR.name, DataType.BFLOAT16_VECTOR.name,
+                                              DataType.BINARY_VECTOR.name,
+                                              DataType.SPARSE_FLOAT_VECTOR.name, DataType.INT8_VECTOR.name]
 
 class CheckTasks:
     """ The name of the method used to check the result """

@@ -28,11 +28,11 @@ func UnmarshalMessageID(data string) (message.MessageID, error) {
 func unmarshalMessageID(data string) (wpID, error) {
 	val, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
-		return wpID{logMsgId: nil}, errors.Wrapf(message.ErrInvalidMessageID, "decode pulsar fail when decode base64 with err: %s, id: %s", err.Error(), data)
+		return wpID{logMsgId: nil}, errors.Wrapf(message.ErrInvalidMessageID, "decode wp fail when decode base64 with err: %s, id: %s", err.Error(), data)
 	}
 	msgID, err := wp.DeserializeLogMessageId(val)
 	if err != nil {
-		return wpID{logMsgId: nil}, errors.Wrapf(message.ErrInvalidMessageID, "decode pulsar fail when deserialize with err: %s, id: %s", err.Error(), data)
+		return wpID{logMsgId: nil}, errors.Wrapf(message.ErrInvalidMessageID, "decode wp fail when deserialize with err: %s, id: %s", err.Error(), data)
 	}
 	return wpID{logMsgId: msgID}, nil
 }
@@ -44,10 +44,6 @@ type wpID struct {
 }
 
 func (id wpID) WoodpeckerID() *wp.LogMessageId {
-	return id.logMsgId
-}
-
-func (id wpID) WoodpeckerMsgId() *wp.LogMessageId {
 	return id.logMsgId
 }
 

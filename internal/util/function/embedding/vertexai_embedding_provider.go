@@ -19,6 +19,7 @@
 package embedding
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -79,8 +80,16 @@ type VertexAIEmbeddingProvider struct {
 	embedDimParam int64
 	task          string
 
+	isGemini  bool
+	geminiURL string
+
 	maxBatch   int
 	timeoutSec int64
+	extraInfo  *models.ModelExtraInfo
+}
+
+func isGeminiModel(modelName string) bool {
+	return strings.HasPrefix(modelName, "gemini-embedding-2")
 }
 
 func createVertexAIEmbeddingClient(url string, credentialsJSON []byte) (*vertexai.VertexAIEmbedding, error) {
@@ -123,7 +132,7 @@ func parseGcpCredentialInfo(credentials *credentials.Credentials, params []*comm
 	return credentialsJSON, nil
 }
 
-func NewVertexAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, c *vertexai.VertexAIEmbedding, params map[string]string, credentials *credentials.Credentials) (*VertexAIEmbeddingProvider, error) {
+func NewVertexAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, c *vertexai.VertexAIEmbedding, params map[string]string, credentials *credentials.Credentials, extraInfo *models.ModelExtraInfo) (*VertexAIEmbeddingProvider, error) {
 	fieldDim, err := typeutil.GetDim(fieldSchema)
 	if err != nil {
 		return nil, err
@@ -158,17 +167,37 @@ func NewVertexAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSch
 		location = "us-central1"
 	}
 
-	url := params[models.URLParamKey]
-	if url == "" {
-		url = fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/%s:predict", location, projectID, location, modelName)
+	modelName = strings.TrimPrefix(modelName, "models/")
+	gemini := isGeminiModel(modelName)
+	maxBatch := 128
+	if gemini {
+		maxBatch = 1
 	}
+
+	url := params[models.URLParamKey]
+	geminiURL := ""
+	if url == "" {
+		if gemini {
+			geminiURL = fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/%s:embedContent", location, projectID, location, modelName)
+		} else {
+			url = fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/%s:predict", location, projectID, location, modelName)
+		}
+	} else if gemini {
+		geminiURL = url
+		url = ""
+	}
+
 	var client *vertexai.VertexAIEmbedding
+	clientURL := url
+	if gemini {
+		clientURL = geminiURL
+	}
 	if c == nil {
 		jsonKey, err := parseGcpCredentialInfo(credentials, functionSchema.Params, params)
 		if err != nil {
 			return nil, err
 		}
-		client, err = createVertexAIEmbeddingClient(url, jsonKey)
+		client, err = createVertexAIEmbeddingClient(clientURL, jsonKey)
 		if err != nil {
 			return nil, err
 		}
@@ -182,14 +211,17 @@ func NewVertexAIEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSch
 		modelName:     modelName,
 		embedDimParam: dim,
 		task:          task,
-		maxBatch:      128,
+		isGemini:      gemini,
+		geminiURL:     geminiURL,
+		maxBatch:      maxBatch,
 		timeoutSec:    30,
+		extraInfo:     extraInfo,
 	}
 	return &provider, nil
 }
 
 func (provider *VertexAIEmbeddingProvider) MaxBatch() int {
-	return 5 * provider.maxBatch
+	return provider.extraInfo.BatchFactor * provider.maxBatch
 }
 
 func (provider *VertexAIEmbeddingProvider) FieldDim() int64 {
@@ -197,6 +229,9 @@ func (provider *VertexAIEmbeddingProvider) FieldDim() int64 {
 }
 
 func (provider *VertexAIEmbeddingProvider) getTaskType(mode models.TextEmbeddingMode) string {
+	if provider.isGemini {
+		return provider.getGeminiTaskType(mode)
+	}
 	if mode == models.SearchMode {
 		switch provider.task {
 		case vertexAIDocRetrival:
@@ -219,7 +254,26 @@ func (provider *VertexAIEmbeddingProvider) getTaskType(mode models.TextEmbedding
 	return ""
 }
 
-func (provider *VertexAIEmbeddingProvider) CallEmbedding(texts []string, mode models.TextEmbeddingMode) (any, error) {
+func (provider *VertexAIEmbeddingProvider) getGeminiTaskType(mode models.TextEmbeddingMode) string {
+	// Use the user-specified task unless it's the default DOC_RETRIEVAL,
+	// in which case fall through to mode-based selection below.
+	if provider.task != "" && provider.task != vertexAIDocRetrival {
+		return provider.task
+	}
+	if mode == models.InsertMode {
+		return "RETRIEVAL_DOCUMENT"
+	}
+	return "RETRIEVAL_QUERY"
+}
+
+func (provider *VertexAIEmbeddingProvider) CallEmbedding(ctx context.Context, texts []string, mode models.TextEmbeddingMode) (any, error) {
+	if provider.isGemini {
+		return provider.callGeminiEmbedding(texts, mode)
+	}
+	return provider.callVertexAIEmbedding(texts, mode)
+}
+
+func (provider *VertexAIEmbeddingProvider) callVertexAIEmbedding(texts []string, mode models.TextEmbeddingMode) (any, error) {
 	numRows := len(texts)
 	taskType := provider.getTaskType(mode)
 	data := make([][]float32, 0, numRows)
@@ -242,6 +296,25 @@ func (provider *VertexAIEmbeddingProvider) CallEmbedding(texts []string, mode mo
 			}
 			data = append(data, item.Embeddings.Values)
 		}
+	}
+	return data, nil
+}
+
+// callGeminiEmbedding sends one request per text because the VertexAI Gemini embedding
+// endpoint only exposes :embedContent (single text), not batchEmbedContents.
+func (provider *VertexAIEmbeddingProvider) callGeminiEmbedding(texts []string, mode models.TextEmbeddingMode) (any, error) {
+	taskType := provider.getTaskType(mode)
+	data := make([][]float32, 0, len(texts))
+	for _, text := range texts {
+		resp, err := provider.client.GeminiEmbedding(provider.geminiURL, text, provider.embedDimParam, taskType, provider.timeoutSec)
+		if err != nil {
+			return nil, err
+		}
+		if len(resp.Embedding.Values) != int(provider.fieldDim) {
+			return nil, fmt.Errorf("The required embedding dim is [%d], but the embedding obtained from the model is [%d]",
+				provider.fieldDim, len(resp.Embedding.Values))
+		}
+		data = append(data, resp.Embedding.Values)
 	}
 	return data, nil
 }

@@ -126,6 +126,7 @@ type Segment struct {
 	LastDeltaTimestamp uint64                            // The timestamp of the last delta record
 	IndexInfo          map[int64]*querypb.FieldIndexInfo // index info of loaded segment, indexID -> FieldIndexInfo
 	JSONStatsField     map[int64]*querypb.JsonStatsInfo  // json index info of loaded segment
+	ManifestPath       string                            // current manifest path of loaded segment
 }
 
 func SegmentFromInfo(info *datapb.SegmentInfo) *Segment {
@@ -162,6 +163,7 @@ type SegmentDistManagerInterface interface {
 	Update(nodeID typeutil.UniqueID, segments ...*Segment)
 	GetByFilter(filters ...SegmentDistFilter) []*Segment
 	GetSegmentDist(collectionID int64) []*metricsinfo.Segment
+	GetVersion() int64
 }
 
 type SegmentDistManager struct {
@@ -169,6 +171,13 @@ type SegmentDistManager struct {
 
 	// nodeID -> []*Segment
 	segments map[typeutil.UniqueID]nodeSegments
+	version  int64
+}
+
+func (m *SegmentDistManager) GetVersion() int64 {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+	return m.version
 }
 
 type nodeSegments struct {
@@ -213,10 +222,18 @@ func (m *SegmentDistManager) Update(nodeID typeutil.UniqueID, segments ...*Segme
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
+	if len(segments) == 0 {
+		// Node offline, remove entry to avoid memory leak
+		delete(m.segments, nodeID)
+		m.version++
+		return
+	}
+
 	for _, segment := range segments {
 		segment.Node = nodeID
 	}
 	m.segments[nodeID] = composeNodeSegments(segments)
+	m.version++
 }
 
 // GetByFilter return segment list which match all given filters

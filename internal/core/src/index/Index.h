@@ -64,11 +64,27 @@ class IndexBase {
     virtual IndexStatsPtr
     Upload(const Config& config = {}) = 0;
 
+    virtual void
+    LoadV3(const Config& config) {
+        ThrowInfo(Unsupported, "LoadV3 is not supported for this index type");
+    }
+
+    virtual IndexStatsPtr
+    UploadV3(const Config& config) {
+        ThrowInfo(Unsupported, "UploadV3 is not supported for this index type");
+    }
+
     virtual const bool
     HasRawData() const = 0;
 
     virtual bool
     IsMmapSupported() const = 0;
+
+    // Check if this index is a nested index (for array element-level indexing)
+    virtual bool
+    IsNestedIndex() const {
+        return false;
+    }
 
     const IndexType&
     Type() const {
@@ -91,6 +107,29 @@ class IndexBase {
         cell_size_ = cell_size;
     }
 
+    // Returns the memory usage in bytes that scales with data size (O(n)).
+    // Fixed overhead are minimal and thus not included.
+    //
+    // NOTE: This method returns a cached value computed by ComputeByteSize().
+    // It is designed for SEALED SEGMENTS only, where the index is fully built
+    // or loaded and no more data will be added. For GROWING SEGMENTS with
+    // ongoing inserts, the cached value will NOT be updated automatically.
+    // ComputeByteSize() should only be called after Build() or Load() completes
+    // on sealed segments.
+    int64_t
+    ByteSize() const {
+        return cached_byte_size_;
+    }
+
+    // Computes and caches the memory usage in bytes.
+    // Subclasses should override this method to calculate their specific memory usage
+    // and store the result in cached_byte_size_.
+    // This method should be called at the end of Build() or Load() for sealed segments.
+    virtual void
+    ComputeByteSize() {
+        cached_byte_size_ = 0;
+    }
+
  protected:
     explicit IndexBase(IndexType index_type)
         : index_type_(std::move(index_type)) {
@@ -98,6 +137,7 @@ class IndexBase {
 
     IndexType index_type_ = "";
     cachinglayer::ResourceUsage cell_size_ = {0, 0};
+    mutable int64_t cached_byte_size_ = 0;
 
     std::unique_ptr<MmapFileRAII> mmap_file_raii_;
 };

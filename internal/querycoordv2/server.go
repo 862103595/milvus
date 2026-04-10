@@ -20,10 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -42,6 +39,7 @@ import (
 	"github.com/milvus-io/milvus/internal/kv/tikv"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
+	"github.com/milvus-io/milvus/internal/querycoordv2/assign"
 	"github.com/milvus-io/milvus/internal/querycoordv2/balance"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
@@ -79,6 +77,8 @@ type Server struct {
 	tikvCli             *txnkv.Client
 	address             string
 	session             sessionutil.SessionInterface
+	sessionWatcher      sessionutil.SessionWatcher
+	sessionWatcherMu    sync.Mutex
 	kv                  kv.MetaKv
 	idAllocator         func() (int64, error)
 	metricsCacheManager *metricsinfo.MetricsCacheManager
@@ -109,15 +109,12 @@ type Server struct {
 	checkerController *checkers.CheckerController
 
 	// Observers
-	collectionObserver  *observers.CollectionObserver
-	targetObserver      *observers.TargetObserver
-	replicaObserver     *observers.ReplicaObserver
-	resourceObserver    *observers.ResourceObserver
-	leaderCacheObserver *observers.LeaderCacheObserver
-
-	getBalancerFunc checkers.GetBalancerFunc
-	balancerMap     map[string]balance.Balance
-	balancerLock    sync.RWMutex
+	collectionObserver   *observers.CollectionObserver
+	targetObserver       *observers.TargetObserver
+	replicaObserver      *observers.ReplicaObserver
+	resourceObserver     *observers.ResourceObserver
+	leaderCacheObserver  *observers.LeaderCacheObserver
+	fileResourceObserver FileResourceObserver
 
 	// Active-standby
 	enableActiveStandBy bool
@@ -133,6 +130,14 @@ type Server struct {
 	// for balance streaming node request
 	// now only used for run analyzer and validate analyzer
 	nodeIdx atomic.Uint32
+
+	// load config watcher
+	loadConfigWatcher *LoadConfigWatcher
+}
+
+type FileResourceObserver interface {
+	InitQueryCoord(manager *session.NodeManager, cluster session.Cluster)
+	Notify()
 }
 
 func NewQueryCoord(ctx context.Context) (*Server, error) {
@@ -140,7 +145,6 @@ func NewQueryCoord(ctx context.Context) (*Server, error) {
 	server := &Server{
 		ctx:            ctx,
 		cancel:         cancel,
-		balancerMap:    make(map[string]balance.Balance),
 		metricsRequest: metricsinfo.NewMetricsRequest(),
 	}
 	server.UpdateStateCode(commonpb.StateCode_Abnormal)
@@ -162,7 +166,7 @@ func (s *Server) SetSession(session sessionutil.SessionInterface) error {
 }
 
 func (s *Server) ServerExist(serverID int64) bool {
-	sessions, _, err := s.session.GetSessions(typeutil.QueryNodeRole)
+	sessions, _, err := s.session.GetSessions(s.ctx, typeutil.QueryNodeRole)
 	if err != nil {
 		log.Ctx(s.ctx).Warn("failed to get sessions", zap.Error(err))
 		return false
@@ -229,6 +233,10 @@ func (s *Server) registerMetricsRequest() {
 	log.Ctx(s.ctx).Info("register metrics actions finished")
 }
 
+func (s *Server) SetFileResourceObserver(observer FileResourceObserver) {
+	s.fileResourceObserver = observer
+}
+
 func (s *Server) Init() error {
 	log := log.Ctx(s.ctx)
 	log.Info("QueryCoord start init",
@@ -247,7 +255,7 @@ func (s *Server) initSession() error {
 	// Init QueryCoord session
 	if s.session == nil {
 		s.session = sessionutil.NewSession(s.ctx)
-		s.session.Init(typeutil.QueryCoordRole, s.address, true, true)
+		s.session.Init(typeutil.QueryCoordRole, s.address, true)
 		s.enableActiveStandBy = Params.QueryCoordCfg.EnableActiveStandby.GetAsBool()
 		s.session.SetEnableActiveStandBy(s.enableActiveStandBy)
 	}
@@ -291,6 +299,7 @@ func (s *Server) initQueryCoord() error {
 
 	// Init meta
 	s.nodeMgr = session.NewNodeManager()
+	s.nodeMgr.Start(s.ctx)
 	err = s.initMeta()
 	if err != nil {
 		return err
@@ -316,44 +325,22 @@ func (s *Server) initQueryCoord() error {
 	s.proxyClientManager = proxyutil.NewProxyClientManager(proxyutil.DefaultProxyCreator)
 	s.proxyWatcher = proxyutil.NewProxyWatcher(
 		s.etcdCli,
-		s.proxyClientManager.AddProxyClients,
+		s.proxyClientManager.SetProxyClients,
 	)
 	s.proxyWatcher.AddSessionFunc(s.proxyClientManager.AddProxyClient)
 	s.proxyWatcher.DelSessionFunc(s.proxyClientManager.DelProxyClient)
 	log.Info("init proxy manager done")
 
+	// Init global assign policy factory
+	log.Info("init global assign policy factory")
+	assign.InitGlobalAssignPolicyFactory(s.taskScheduler, s.nodeMgr, s.dist, s.meta, s.targetMgr)
+
+	// Init global balancer factory
+	log.Info("init global balancer factory")
+	balance.InitGlobalBalancerFactory(s.taskScheduler, s.nodeMgr, s.dist, s.meta, s.targetMgr)
+
 	// Init checker controller
 	log.Info("init checker controller")
-	s.getBalancerFunc = func() balance.Balance {
-		balanceKey := paramtable.Get().QueryCoordCfg.Balancer.GetValue()
-		s.balancerLock.Lock()
-		defer s.balancerLock.Unlock()
-
-		balancer, ok := s.balancerMap[balanceKey]
-		if ok {
-			return balancer
-		}
-
-		log.Info("switch to new balancer", zap.String("name", balanceKey))
-		switch balanceKey {
-		case meta.RoundRobinBalancerName:
-			balancer = balance.NewRoundRobinBalancer(s.taskScheduler, s.nodeMgr)
-		case meta.RowCountBasedBalancerName:
-			balancer = balance.NewRowCountBasedBalancer(s.taskScheduler, s.nodeMgr, s.dist, s.meta, s.targetMgr)
-		case meta.ScoreBasedBalancerName:
-			balancer = balance.NewScoreBasedBalancer(s.taskScheduler, s.nodeMgr, s.dist, s.meta, s.targetMgr)
-		case meta.MultiTargetBalancerName:
-			balancer = balance.NewMultiTargetBalancer(s.taskScheduler, s.nodeMgr, s.dist, s.meta, s.targetMgr)
-		case meta.ChannelLevelScoreBalancerName:
-			balancer = balance.NewChannelLevelScoreBalancer(s.taskScheduler, s.nodeMgr, s.dist, s.meta, s.targetMgr)
-		default:
-			log.Info(fmt.Sprintf("default to use %s", meta.ScoreBasedBalancerName))
-			balancer = balance.NewScoreBasedBalancer(s.taskScheduler, s.nodeMgr, s.dist, s.meta, s.targetMgr)
-		}
-
-		s.balancerMap[balanceKey] = balancer
-		return balancer
-	}
 	s.checkerController = checkers.NewCheckerController(
 		s.meta,
 		s.dist,
@@ -361,7 +348,6 @@ func (s *Server) initQueryCoord() error {
 		s.nodeMgr,
 		s.taskScheduler,
 		s.broker,
-		s.getBalancerFunc,
 	)
 
 	// Init observers
@@ -457,6 +443,7 @@ func (s *Server) initObserver() {
 	s.replicaObserver = observers.NewReplicaObserver(
 		s.meta,
 		s.dist,
+		s.targetMgr,
 	)
 
 	s.resourceObserver = observers.NewResourceObserver(s.meta)
@@ -464,6 +451,10 @@ func (s *Server) initObserver() {
 	s.leaderCacheObserver = observers.NewLeaderCacheObserver(
 		s.proxyClientManager,
 	)
+
+	if s.fileResourceObserver != nil {
+		s.fileResourceObserver.InitQueryCoord(s.nodeMgr, s.cluster)
+	}
 }
 
 func (s *Server) afterStart() {}
@@ -479,7 +470,7 @@ func (s *Server) Start() error {
 
 func (s *Server) startQueryCoord() error {
 	log.Ctx(s.ctx).Info("start watcher...")
-	sessions, revision, err := s.session.GetSessions(typeutil.QueryNodeRole)
+	sessions, revision, err := s.session.GetSessions(s.ctx, typeutil.QueryNodeRole)
 	if err != nil {
 		return err
 	}
@@ -544,6 +535,11 @@ func (s *Server) Stop() error {
 	// job scheduler -> checker controller -> task scheduler -> dist controller -> cluster -> session
 	// observers -> dist controller
 
+	if s.loadConfigWatcher != nil {
+		log.Info("stop load config watcher...")
+		s.loadConfigWatcher.Close()
+	}
+
 	if s.jobScheduler != nil {
 		log.Info("stop job scheduler...")
 		s.jobScheduler.Stop()
@@ -593,12 +589,19 @@ func (s *Server) Stop() error {
 		s.cluster.Stop()
 	}
 
+	s.sessionWatcherMu.Lock()
+	if s.sessionWatcher != nil {
+		s.sessionWatcher.Stop()
+	}
+	s.sessionWatcherMu.Unlock()
+
+	s.cancel()
+	s.wg.Wait()
+
 	if s.session != nil {
 		s.session.Stop()
 	}
 
-	s.cancel()
-	s.wg.Wait()
 	log.Info("QueryCoord stop successfully")
 	return nil
 }
@@ -635,25 +638,27 @@ func (s *Server) SetQueryNodeCreator(f func(ctx context.Context, addr string, no
 }
 
 func (s *Server) watchNodes(revision int64) {
-	log := log.Ctx(s.ctx)
 	defer s.wg.Done()
 
-	eventChan := s.session.WatchServices(typeutil.QueryNodeRole, revision+1, s.rewatchNodes)
+	s.sessionWatcherMu.Lock()
+	s.sessionWatcher = s.session.WatchServices(typeutil.QueryNodeRole, revision+1, s.rewatchNodes)
+	s.sessionWatcherMu.Unlock()
 	for {
 		select {
 		case <-s.ctx.Done():
 			log.Info("stop watching nodes, QueryCoord stopped")
 			return
 
-		case event, ok := <-eventChan:
+		case event, ok := <-s.sessionWatcher.EventChannel():
 			if !ok {
 				// ErrCompacted is handled inside SessionWatcher
-				log.Warn("Session Watcher channel closed", zap.Int64("serverID", paramtable.GetNodeID()))
-				go s.Stop()
-				if s.session.IsTriggerKill() {
-					if p, err := os.FindProcess(os.Getpid()); err == nil {
-						p.Signal(syscall.SIGINT)
-					}
+				log.Ctx(s.ctx).Warn("Session Watcher channel closed", zap.Int64("serverID", paramtable.GetNodeID()))
+				if s.ctx.Err() == nil {
+					// ctx is still active, meaning this is not a normal shutdown but a genuine watch failure.
+					// Force exit so the process can be restarted by the orchestrator (e.g. K8s).
+					log.Ctx(s.ctx).Error("force exit due to unexpected session watcher failure")
+					log.Cleanup()
+					os.Exit(sessionutil.ExitCodeEtcd)
 				}
 				return
 			}
@@ -675,6 +680,9 @@ func (s *Server) watchNodes(revision int64) {
 					Labels:   event.Session.GetServerLabel(),
 				}))
 				s.handleNodeUp(nodeID)
+				if s.fileResourceObserver != nil {
+					s.fileResourceObserver.Notify()
+				}
 
 			case sessionutil.SessionUpdateEvent:
 				log.Info("stopping the node")
@@ -704,10 +712,14 @@ func (s *Server) rewatchNodes(sessions map[string]*sessionutil.Session) error {
 			// node in node manager but session not exist, means it's offline
 			s.nodeMgr.Remove(node.ID())
 			s.handleNodeDown(node.ID())
-		} else if nodeSession.Stopping && !node.IsStoppingState() {
-			// node in node manager but session is stopping, means it's stopping
-			s.nodeMgr.Stopping(node.ID())
-			s.handleNodeStopping(node.ID())
+		} else {
+			if nodeSession.Stopping && !node.IsStoppingState() {
+				// node in node manager but session is stopping, means it's stopping
+				log.Warn("rewatch found old querynode in stopping state", zap.Int64("nodeID", nodeSession.ServerID))
+				s.nodeMgr.Stopping(node.ID())
+				s.handleNodeStopping(node.ID())
+			}
+			delete(sessionMap, node.ID())
 		}
 	}
 
@@ -723,11 +735,14 @@ func (s *Server) rewatchNodes(sessions map[string]*sessionutil.Session) error {
 				Labels:   nodeSession.GetServerLabel(),
 			}))
 
+			// call handleNodeUp no matter what state new querynode is in
+			// all component need this op so that stopping balance could work correctly
+			s.handleNodeUp(nodeSession.GetServerID())
+
 			if nodeSession.Stopping {
+				log.Warn("rewatch found new querynode in stopping state", zap.Int64("nodeID", nodeSession.ServerID))
 				s.nodeMgr.Stopping(nodeSession.ServerID)
 				s.handleNodeStopping(nodeSession.ServerID)
-			} else {
-				s.handleNodeUp(nodeSession.GetServerID())
 			}
 		}
 	}
@@ -849,69 +864,14 @@ func (s *Server) updateBalanceConfig() bool {
 	return false
 }
 
-func (s *Server) applyLoadConfigChanges(ctx context.Context, newReplicaNum int32, newRGs []string) {
-	if newReplicaNum <= 0 && len(newRGs) == 0 {
-		log.Info("invalid cluster level load config, skip it", zap.Int32("replica_num", newReplicaNum), zap.Strings("resource_groups", newRGs))
-		return
-	}
-
-	// try to check load config changes after restart, and try to update replicas
-	collectionIDs := s.meta.GetAll(ctx)
-	collectionIDs = lo.Filter(collectionIDs, func(collectionID int64, _ int) bool {
-		collection := s.meta.GetCollection(ctx, collectionID)
-		if collection.UserSpecifiedReplicaMode {
-			log.Info("collection is user specified replica mode, skip update load config", zap.Int64("collectionID", collectionID))
-			return false
-		}
-		return true
-	})
-
-	if len(collectionIDs) == 0 {
-		log.Info("no collection to update load config, skip it")
-		return
-	}
-
-	log.Info("apply load config changes",
-		zap.Int64s("collectionIDs", collectionIDs),
-		zap.Int32("replicaNum", newReplicaNum),
-		zap.Strings("resourceGroups", newRGs))
-	err := s.updateLoadConfig(ctx, collectionIDs, newReplicaNum, newRGs)
-	if err != nil {
-		log.Warn("failed to update load config", zap.Error(err))
-	}
-}
-
 func (s *Server) watchLoadConfigChanges() {
-	// first apply load config change from params
-	replicaNum := paramtable.Get().QueryCoordCfg.ClusterLevelLoadReplicaNumber.GetAsUint32()
-	rgs := paramtable.Get().QueryCoordCfg.ClusterLevelLoadResourceGroups.GetAsStrings()
-	s.applyLoadConfigChanges(s.ctx, int32(replicaNum), rgs)
+	w := NewLoadConfigWatcher(s)
+	s.loadConfigWatcher = w
+	w.Trigger()
 
-	log := log.Ctx(s.ctx)
-	replicaNumHandler := config.NewHandler("watchReplicaNumberChanges", func(e *config.Event) {
-		log.Info("watch load config changes", zap.String("key", e.Key), zap.String("value", e.Value), zap.String("type", e.EventType))
-		replicaNum, err := strconv.ParseInt(e.Value, 10, 64)
-		if err != nil {
-			log.Warn("invalid cluster level load config, skip it", zap.String("key", e.Key), zap.String("value", e.Value))
-			return
-		}
-		rgs := paramtable.Get().QueryCoordCfg.ClusterLevelLoadResourceGroups.GetAsStrings()
-
-		s.applyLoadConfigChanges(s.ctx, int32(replicaNum), rgs)
-	})
+	replicaNumHandler := config.NewHandler("watchReplicaNumberChanges", func(e *config.Event) { w.Trigger() })
 	paramtable.Get().Watch(paramtable.Get().QueryCoordCfg.ClusterLevelLoadReplicaNumber.Key, replicaNumHandler)
 
-	rgHandler := config.NewHandler("watchResourceGroupChanges", func(e *config.Event) {
-		log.Info("watch load config changes", zap.String("key", e.Key), zap.String("value", e.Value), zap.String("type", e.EventType))
-		if len(e.Value) == 0 {
-			log.Warn("invalid cluster level load config, skip it", zap.String("key", e.Key), zap.String("value", e.Value))
-			return
-		}
-
-		rgs := strings.Split(e.Value, ",")
-		rgs = lo.Map(rgs, func(rg string, _ int) string { return strings.TrimSpace(rg) })
-		replicaNum := paramtable.Get().QueryCoordCfg.ClusterLevelLoadReplicaNumber.GetAsInt64()
-		s.applyLoadConfigChanges(s.ctx, int32(replicaNum), rgs)
-	})
+	rgHandler := config.NewHandler("watchResourceGroupChanges", func(e *config.Event) { w.Trigger() })
 	paramtable.Get().Watch(paramtable.Get().QueryCoordCfg.ClusterLevelLoadResourceGroups.Key, rgHandler)
 }

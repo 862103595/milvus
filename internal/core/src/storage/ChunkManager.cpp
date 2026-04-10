@@ -14,7 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <fstream>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
@@ -28,16 +27,10 @@
 #include <aws/s3/model/ListObjectsRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
 
-#include "storage/MinioChunkManager.h"
-#include "storage/AliyunSTSClient.h"
-#include "storage/TencentCloudSTSClient.h"
-#include "storage/AliyunCredentialsProvider.h"
-#include "storage/TencentCloudCredentialsProvider.h"
-#include "storage/HuaweiCloudCredentialsProvider.h"
+#include "storage/minio/MinioChunkManager.h"
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "log/Log.h"
-#include "signal.h"
 
 namespace milvus::storage {
 
@@ -78,14 +71,18 @@ generateConfig(const StorageConfig& storage_config) {
                                   ? DEFAULT_CHUNK_MANAGER_REQUEST_TIMEOUT_MS
                                   : storage_config.requestTimeoutMs;
 
+    if (storage_config.max_connections > 0) {
+        config.maxConnections = storage_config.max_connections;
+    }
     return config;
 }
 
 AwsChunkManager::AwsChunkManager(const StorageConfig& storage_config) {
     default_bucket_name_ = storage_config.bucket_name;
     remote_root_path_ = storage_config.root_path;
+    use_crc32c_checksum_ = storage_config.use_crc32c_checksum;
 
-    InitSDKAPIDefault(storage_config.log_level);
+    InitSDKAPIDefault(storage_config.log_level, storage_config.tls_min_version);
 
     Aws::Client::ClientConfiguration config = generateConfig(storage_config);
     if (storage_config.useIAM) {
@@ -112,28 +109,27 @@ AwsChunkManager::AwsChunkManager(const StorageConfig& storage_config) {
 
     LOG_INFO(
         "init AwsChunkManager with "
-        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]",
+        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]"
+        "[tls_min_version={}]",
         storage_config.address,
         storage_config.bucket_name,
         storage_config.root_path,
-        storage_config.useSSL);
+        storage_config.useSSL,
+        storage_config.tls_min_version.empty()
+            ? "default"
+            : storage_config.tls_min_version);
 }
 
 GcpChunkManager::GcpChunkManager(const StorageConfig& storage_config) {
     default_bucket_name_ = storage_config.bucket_name;
     remote_root_path_ = storage_config.root_path;
+    use_crc32c_checksum_ = storage_config.use_crc32c_checksum;
 
     if (storage_config.useIAM) {
-        sdk_options_.httpOptions.httpClientFactory_create_fn = []() {
-            auto credentials = std::make_shared<
-                google::cloud::oauth2_internal::GOOGLE_CLOUD_CPP_NS::
-                    ComputeEngineCredentials>();
-            return Aws::MakeShared<GoogleHttpClientFactory>(
-                GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG, credentials);
-        };
+        ConfigureGoogleCloudIAMHttpClientFactory(sdk_options_);
     }
 
-    InitSDKAPIDefault(storage_config.log_level);
+    InitSDKAPIDefault(storage_config.log_level, storage_config.tls_min_version);
 
     Aws::Client::ClientConfiguration config = generateConfig(storage_config);
     if (storage_config.useIAM) {
@@ -150,18 +146,23 @@ GcpChunkManager::GcpChunkManager(const StorageConfig& storage_config) {
 
     LOG_INFO(
         "init GcpChunkManager with "
-        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]",
+        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]"
+        "[tls_min_version={}]",
         storage_config.address,
         storage_config.bucket_name,
         storage_config.root_path,
-        storage_config.useSSL);
+        storage_config.useSSL,
+        storage_config.tls_min_version.empty()
+            ? "default"
+            : storage_config.tls_min_version);
 }
 
 AliyunChunkManager::AliyunChunkManager(const StorageConfig& storage_config) {
     default_bucket_name_ = storage_config.bucket_name;
     remote_root_path_ = storage_config.root_path;
+    use_crc32c_checksum_ = storage_config.use_crc32c_checksum;
 
-    InitSDKAPIDefault(storage_config.log_level);
+    InitSDKAPIDefault(storage_config.log_level, storage_config.tls_min_version);
 
     Aws::Client::ClientConfiguration config = generateConfig(storage_config);
 
@@ -169,9 +170,8 @@ AliyunChunkManager::AliyunChunkManager(const StorageConfig& storage_config) {
     StorageConfig mutable_config = storage_config;
     mutable_config.useVirtualHost = true;
     if (storage_config.useIAM) {
-        auto aliyun_provider = Aws::MakeShared<
-            Aws::Auth::AliyunSTSAssumeRoleWebIdentityCredentialsProvider>(
-            "AliyunSTSAssumeRoleWebIdentityCredentialsProvider");
+        auto aliyun_provider = AliyunChunkManager::
+            GetAliyunSTSAssumeRoleWebIdentityCredentialsProvider();
         auto aliyun_credentials = aliyun_provider->GetAWSCredentials();
         AssertInfo(!aliyun_credentials.GetAWSAccessKeyId().empty(),
                    "if use iam, access key id should not be empty");
@@ -192,28 +192,32 @@ AliyunChunkManager::AliyunChunkManager(const StorageConfig& storage_config) {
 
     LOG_INFO(
         "init AliyunChunkManager with "
-        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]",
+        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]"
+        "[tls_min_version={}]",
         storage_config.address,
         storage_config.bucket_name,
         storage_config.root_path,
-        storage_config.useSSL);
+        storage_config.useSSL,
+        storage_config.tls_min_version.empty()
+            ? "default"
+            : storage_config.tls_min_version);
 }
 
 TencentCloudChunkManager::TencentCloudChunkManager(
     const StorageConfig& storage_config) {
     default_bucket_name_ = storage_config.bucket_name;
     remote_root_path_ = storage_config.root_path;
+    use_crc32c_checksum_ = storage_config.use_crc32c_checksum;
 
-    InitSDKAPIDefault(storage_config.log_level);
+    InitSDKAPIDefault(storage_config.log_level, storage_config.tls_min_version);
 
     Aws::Client::ClientConfiguration config = generateConfig(storage_config);
 
     StorageConfig mutable_config = storage_config;
     mutable_config.useVirtualHost = true;
     if (storage_config.useIAM) {
-        auto tencent_cloud_provider = Aws::MakeShared<
-            Aws::Auth::TencentCloudSTSAssumeRoleWebIdentityCredentialsProvider>(
-            "TencentCloudSTSAssumeRoleWebIdentityCredentialsProvider");
+        auto tencent_cloud_provider = TencentCloudChunkManager::
+            GetTencentCloudSTSAssumeRoleWebIdentityCredentialsProvider();
         auto tencent_cloud_credentials =
             tencent_cloud_provider->GetAWSCredentials();
         AssertInfo(!tencent_cloud_credentials.GetAWSAccessKeyId().empty(),
@@ -235,25 +239,29 @@ TencentCloudChunkManager::TencentCloudChunkManager(
 
     LOG_INFO(
         "init TencentCloudChunkManager with "
-        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]",
+        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]"
+        "[tls_min_version={}]",
         storage_config.address,
         storage_config.bucket_name,
         storage_config.root_path,
-        storage_config.useSSL);
+        storage_config.useSSL,
+        storage_config.tls_min_version.empty()
+            ? "default"
+            : storage_config.tls_min_version);
 }
 
 HuaweiCloudChunkManager::HuaweiCloudChunkManager(
     const StorageConfig& storage_config) {
     default_bucket_name_ = storage_config.bucket_name;
     remote_root_path_ = storage_config.root_path;
-    InitSDKAPIDefault(storage_config.log_level);
+    use_crc32c_checksum_ = storage_config.use_crc32c_checksum;
+    InitSDKAPIDefault(storage_config.log_level, storage_config.tls_min_version);
     Aws::Client::ClientConfiguration config = generateConfig(storage_config);
     StorageConfig mutable_config = storage_config;
     mutable_config.useVirtualHost = true;
     if (storage_config.useIAM) {
-        auto huawei_cloud_provider = Aws::MakeShared<
-            Aws::Auth::HuaweiCloudSTSAssumeRoleWebIdentityCredentialsProvider>(
-            "HuaweiCloudSTSAssumeRoleWebIdentityCredentialsProvider");
+        auto huawei_cloud_provider = HuaweiCloudChunkManager::
+            GetHuaweiCloudSTSAssumeRoleWebIdentityCredentialsProvider();
         auto huawei_cloud_credentials =
             huawei_cloud_provider->GetAWSCredentials();
         AssertInfo(!huawei_cloud_credentials.GetAWSAccessKeyId().empty(),
@@ -275,11 +283,48 @@ HuaweiCloudChunkManager::HuaweiCloudChunkManager(
 
     LOG_INFO(
         "init HuaweiCloudChunkManager with "
-        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]",
+        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]"
+        "[tls_min_version={}]",
         storage_config.address,
         storage_config.bucket_name,
         storage_config.root_path,
-        storage_config.useSSL);
+        storage_config.useSSL,
+        storage_config.tls_min_version.empty()
+            ? "default"
+            : storage_config.tls_min_version);
+}
+
+std::shared_ptr<
+    Aws::Auth::HuaweiCloudSTSAssumeRoleWebIdentityCredentialsProvider>
+HuaweiCloudChunkManager::
+    GetHuaweiCloudSTSAssumeRoleWebIdentityCredentialsProvider() {
+    static std::shared_ptr<
+        Aws::Auth::HuaweiCloudSTSAssumeRoleWebIdentityCredentialsProvider>
+        provider = std::make_shared<
+            Aws::Auth::
+                HuaweiCloudSTSAssumeRoleWebIdentityCredentialsProvider>();
+    return provider;
+}
+
+std::shared_ptr<Aws::Auth::AliyunSTSAssumeRoleWebIdentityCredentialsProvider>
+AliyunChunkManager::GetAliyunSTSAssumeRoleWebIdentityCredentialsProvider() {
+    static std::shared_ptr<
+        Aws::Auth::AliyunSTSAssumeRoleWebIdentityCredentialsProvider>
+        provider = std::make_shared<
+            Aws::Auth::AliyunSTSAssumeRoleWebIdentityCredentialsProvider>();
+    return provider;
+}
+
+std::shared_ptr<
+    Aws::Auth::TencentCloudSTSAssumeRoleWebIdentityCredentialsProvider>
+TencentCloudChunkManager::
+    GetTencentCloudSTSAssumeRoleWebIdentityCredentialsProvider() {
+    static std::shared_ptr<
+        Aws::Auth::TencentCloudSTSAssumeRoleWebIdentityCredentialsProvider>
+        provider = std::make_shared<
+            Aws::Auth::
+                TencentCloudSTSAssumeRoleWebIdentityCredentialsProvider>();
+    return provider;
 }
 
 }  // namespace milvus::storage

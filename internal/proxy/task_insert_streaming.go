@@ -52,7 +52,7 @@ func (it *insertTask) Execute(ctx context.Context) error {
 		zap.Duration("get cache duration", getCacheDur))
 
 	var ez *message.CipherConfig
-	if hookutil.IsClusterEncyptionEnabled() {
+	if hookutil.IsClusterEncryptionEnabled() {
 		ez = hookutil.GetEzByCollProperties(it.schema.GetProperties(), it.collectionID).AsMessageConfig()
 	}
 
@@ -88,12 +88,13 @@ func repackInsertDataForStreamingService(
 	messages := make([]message.MutableMessage, 0)
 
 	channel2RowOffsets := assignChannelsByPK(result.IDs, channelNames, insertMsg)
+	partitionName := insertMsg.PartitionName
+	partitionID, err := globalMetaCache.GetPartitionID(ctx, insertMsg.GetDbName(), insertMsg.CollectionName, partitionName)
+	if err != nil {
+		return nil, err
+	}
+
 	for channel, rowOffsets := range channel2RowOffsets {
-		partitionName := insertMsg.PartitionName
-		partitionID, err := globalMetaCache.GetPartitionID(ctx, insertMsg.GetDbName(), insertMsg.CollectionName, partitionName)
-		if err != nil {
-			return nil, err
-		}
 		// segment id is assigned at streaming node.
 		msgs, err := genInsertMsgsByPartition(ctx, 0, partitionID, partitionName, rowOffsets, channel, insertMsg)
 		if err != nil {

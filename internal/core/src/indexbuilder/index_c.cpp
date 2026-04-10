@@ -10,35 +10,48 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <glog/logging.h>
+#include <string.h>
+#include <exception>
+#include <map>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include "common/Consts.h"
-#include "fmt/core.h"
-#include "indexbuilder/type_c.h"
-#include "log/Log.h"
-#include "storage/PluginLoader.h"
-
-#ifdef __linux__
-#include <malloc.h>
-#endif
-
 #include "common/EasyAssert.h"
+#include "common/FieldMeta.h"
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
+#include "common/type_c.h"
+#include "filemanager/InputStream.h"
+#include "index/IndexStats.h"
+#include "index/Meta.h"
+#include "index/TextMatchIndex.h"
+#include "index/Utils.h"
+#include "index/json_stats/JsonKeyStats.h"
+#include "indexbuilder/IndexCreatorBase.h"
+#include "indexbuilder/IndexFactory.h"
 #include "indexbuilder/VecIndexCreator.h"
 #include "indexbuilder/index_c.h"
-
-#include "index/TextMatchIndex.h"
-
-#include "indexbuilder/IndexFactory.h"
-#include "common/type_c.h"
-#include "storage/Types.h"
-#include "indexbuilder/types.h"
-#include "index/Utils.h"
-#include "pb/index_cgo_msg.pb.h"
-#include "storage/Util.h"
-#include "index/Meta.h"
-#include "index/json_stats/JsonKeyStats.h"
-#include "milvus-storage/filesystem/fs.h"
+#include "indexbuilder/type_c.h"
+#include "knowhere/binaryset.h"
+#include "knowhere/dataset.h"
+#include "knowhere/version.h"
+#include "log/Log.h"
 #include "monitor/scope_metric.h"
+#include "nlohmann/json.hpp"
+#include "pb/common.pb.h"
+#include "pb/index_cgo_msg.pb.h"
+#include "pb/schema.pb.h"
+#include "storage/FileManager.h"
+#include "storage/PluginLoader.h"
+#include "storage/Types.h"
+#include "storage/Util.h"
+#include "storage/loon_ffi/util.h"
+#include "storage/plugin/PluginInterface.h"
 
 using namespace milvus;
 CStatus
@@ -112,6 +125,9 @@ get_storage_config(const milvus::proto::indexcgo::StorageConfig& config) {
     storage_config.requestTimeoutMs = config.request_timeout_ms();
     storage_config.gcp_credential_json =
         std::string(config.gcpcredentialjson());
+    storage_config.max_connections = config.max_connections();
+    storage_config.tls_min_version = std::string(config.ssl_tls_min_version());
+    storage_config.use_crc32c_checksum = config.use_crc32c_checksum();
     return storage_config;
 }
 
@@ -174,13 +190,22 @@ get_config(std::unique_ptr<milvus::proto::indexcgo::BuildIndexInfo>& info) {
     }
     config[INDEX_NUM_ROWS_KEY] = info->num_rows();
     config[STORAGE_VERSION_KEY] = info->storage_version();
-    if (info->storage_version() == STORAGE_V2) {
+    if (info->storage_version() == STORAGE_V2 ||
+        info->storage_version() == STORAGE_V3) {
         config[SEGMENT_INSERT_FILES_KEY] =
             get_segment_insert_files(info->segment_insert_files());
+        config[SEGMENT_MANIFEST_KEY] = info->manifest();
     }
     config[DIM_KEY] = info->dim();
     config[DATA_TYPE_KEY] = info->field_schema().data_type();
     config[ELEMENT_TYPE_KEY] = info->field_schema().element_type();
+    if (!info->stats_base_path().empty()) {
+        config[STATS_BASE_PATH_KEY] = info->stats_base_path();
+    }
+
+    if (!info->analyzer_extra_info().empty()) {
+        config["analyzer_extra_info"] = info->analyzer_extra_info();
+    }
 
     return config;
 }
@@ -251,6 +276,15 @@ CreateIndex(CIndex* res_index,
 
         milvus::storage::FileManagerContext fileManagerContext(
             field_meta, index_meta, chunk_manager, fs);
+        if (!build_index_info->stats_base_path().empty()) {
+            fileManagerContext.set_stats_base_path(
+                build_index_info->stats_base_path());
+        }
+        if (build_index_info->manifest() != "") {
+            auto loon_properties = MakeInternalPropertiesFromStorageConfig(
+                ToCStorageConfig(storage_config));
+            fileManagerContext.set_loon_ffi_properties(loon_properties);
+        }
 
         if (build_index_info->has_storage_plugin_context()) {
             auto cipherPlugin =
@@ -314,6 +348,9 @@ BuildJsonKeyIndex(ProtoLayoutInterface result,
             get_storage_config(build_index_info->storage_config());
         auto config = get_config(build_index_info);
 
+        auto loon_properties =
+            MakePropertiesFromStorageConfig(ToCStorageConfig(storage_config));
+
         // init file manager
         milvus::storage::FieldDataMeta field_meta{
             build_index_info->collectionid(),
@@ -349,6 +386,14 @@ BuildJsonKeyIndex(ProtoLayoutInterface result,
 
         milvus::storage::FileManagerContext fileManagerContext(
             field_meta, index_meta, chunk_manager, fs);
+        fileManagerContext.set_stats_base_path(
+            build_index_info->stats_base_path());
+
+        if (build_index_info->manifest() != "") {
+            auto loon_properties = MakeInternalPropertiesFromStorageConfig(
+                ToCStorageConfig(storage_config));
+            fileManagerContext.set_loon_ffi_properties(loon_properties);
+        }
 
         if (build_index_info->has_storage_plugin_context()) {
             auto cipherPlugin =
@@ -358,6 +403,13 @@ BuildJsonKeyIndex(ProtoLayoutInterface result,
                 build_index_info->storage_plugin_context().encryption_zone_id(),
                 build_index_info->storage_plugin_context().collection_id(),
                 build_index_info->storage_plugin_context().encryption_key());
+
+            auto plugin_context = std::make_shared<CPluginContext>();
+            plugin_context->ez_id =
+                build_index_info->storage_plugin_context().encryption_zone_id();
+            plugin_context->collection_id =
+                build_index_info->storage_plugin_context().collection_id();
+            fileManagerContext.set_plugin_context(plugin_context);
         }
 
         auto field_schema =
@@ -434,6 +486,14 @@ BuildTextIndex(ProtoLayoutInterface result,
 
         milvus::storage::FileManagerContext fileManagerContext(
             field_meta, index_meta, chunk_manager, fs);
+        fileManagerContext.set_stats_base_path(
+            build_index_info->stats_base_path());
+
+        if (build_index_info->manifest() != "") {
+            auto loon_properties = MakeInternalPropertiesFromStorageConfig(
+                ToCStorageConfig(storage_config));
+            fileManagerContext.set_loon_ffi_properties(loon_properties);
+        }
 
         if (build_index_info->has_storage_plugin_context()) {
             auto cipherPlugin =
@@ -443,6 +503,12 @@ BuildTextIndex(ProtoLayoutInterface result,
                 build_index_info->storage_plugin_context().encryption_zone_id(),
                 build_index_info->storage_plugin_context().collection_id(),
                 build_index_info->storage_plugin_context().encryption_key());
+            auto plugin_context = std::make_shared<CPluginContext>();
+            plugin_context->ez_id =
+                build_index_info->storage_plugin_context().encryption_zone_id();
+            plugin_context->collection_id =
+                build_index_info->storage_plugin_context().collection_id();
+            fileManagerContext.set_plugin_context(plugin_context);
         }
 
         auto scalar_index_engine_version =
@@ -457,11 +523,14 @@ BuildTextIndex(ProtoLayoutInterface result,
 
         auto field_schema =
             FieldMeta::ParseFrom(build_index_info->field_schema());
+
         auto index = std::make_unique<index::TextMatchIndex>(
             fileManagerContext,
             tantivy_index_version,
             "milvus_tokenizer",
-            field_schema.get_analyzer_params().c_str());
+            field_schema.get_analyzer_params().c_str(),
+            build_index_info->analyzer_extra_info().c_str());
+
         index->Build(config);
         auto create_index_result = index->Upload(config);
         create_index_result->SerializeAt(
@@ -530,6 +599,35 @@ BuildFloatVecIndex(CIndex index,
 }
 
 CStatus
+BuildFloatVecIndexWithValidData(CIndex index,
+                                int64_t float_value_num,
+                                const float* vectors,
+                                const bool* valid_data,
+                                int64_t valid_data_len) {
+    SCOPE_CGO_CALL_METRIC();
+
+    auto status = CStatus();
+    try {
+        AssertInfo(index,
+                   "failed to build float vector index, passed index was null");
+        auto real_index =
+            reinterpret_cast<milvus::indexbuilder::IndexCreatorBase*>(index);
+        auto cIndex =
+            dynamic_cast<milvus::indexbuilder::VecIndexCreator*>(real_index);
+        auto dim = cIndex->dim();
+        auto row_nums = float_value_num / dim;
+        auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
+        cIndex->Build(ds, valid_data, valid_data_len);
+        status.error_code = Success;
+        status.error_msg = "";
+    } catch (std::exception& e) {
+        status.error_code = UnexpectedError;
+        status.error_msg = strdup(e.what());
+    }
+    return status;
+}
+
+CStatus
 BuildFloat16VecIndex(CIndex index,
                      int64_t float16_value_num,
                      const uint8_t* vectors) {
@@ -548,6 +646,36 @@ BuildFloat16VecIndex(CIndex index,
         auto row_nums = float16_value_num / dim / 2;
         auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
         cIndex->Build(ds);
+        status.error_code = Success;
+        status.error_msg = "";
+    } catch (std::exception& e) {
+        status.error_code = UnexpectedError;
+        status.error_msg = strdup(e.what());
+    }
+    return status;
+}
+
+CStatus
+BuildFloat16VecIndexWithValidData(CIndex index,
+                                  int64_t float16_value_num,
+                                  const uint8_t* vectors,
+                                  const bool* valid_data,
+                                  int64_t valid_data_len) {
+    SCOPE_CGO_CALL_METRIC();
+
+    auto status = CStatus();
+    try {
+        AssertInfo(
+            index,
+            "failed to build float16 vector index, passed index was null");
+        auto real_index =
+            reinterpret_cast<milvus::indexbuilder::IndexCreatorBase*>(index);
+        auto cIndex =
+            dynamic_cast<milvus::indexbuilder::VecIndexCreator*>(real_index);
+        auto dim = cIndex->dim();
+        auto row_nums = float16_value_num / dim / 2;
+        auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
+        cIndex->Build(ds, valid_data, valid_data_len);
         status.error_code = Success;
         status.error_msg = "";
     } catch (std::exception& e) {
@@ -586,6 +714,36 @@ BuildBFloat16VecIndex(CIndex index,
 }
 
 CStatus
+BuildBFloat16VecIndexWithValidData(CIndex index,
+                                   int64_t bfloat16_value_num,
+                                   const uint8_t* vectors,
+                                   const bool* valid_data,
+                                   int64_t valid_data_len) {
+    SCOPE_CGO_CALL_METRIC();
+
+    auto status = CStatus();
+    try {
+        AssertInfo(
+            index,
+            "failed to build bfloat16 vector index, passed index was null");
+        auto real_index =
+            reinterpret_cast<milvus::indexbuilder::IndexCreatorBase*>(index);
+        auto cIndex =
+            dynamic_cast<milvus::indexbuilder::VecIndexCreator*>(real_index);
+        auto dim = cIndex->dim();
+        auto row_nums = bfloat16_value_num / dim / 2;
+        auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
+        cIndex->Build(ds, valid_data, valid_data_len);
+        status.error_code = Success;
+        status.error_msg = "";
+    } catch (std::exception& e) {
+        status.error_code = UnexpectedError;
+        status.error_msg = strdup(e.what());
+    }
+    return status;
+}
+
+CStatus
 BuildBinaryVecIndex(CIndex index, int64_t data_size, const uint8_t* vectors) {
     SCOPE_CGO_CALL_METRIC();
 
@@ -602,6 +760,36 @@ BuildBinaryVecIndex(CIndex index, int64_t data_size, const uint8_t* vectors) {
         auto row_nums = (data_size * 8) / dim;
         auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
         cIndex->Build(ds);
+        status.error_code = Success;
+        status.error_msg = "";
+    } catch (std::exception& e) {
+        status.error_code = UnexpectedError;
+        status.error_msg = strdup(e.what());
+    }
+    return status;
+}
+
+CStatus
+BuildBinaryVecIndexWithValidData(CIndex index,
+                                 int64_t data_size,
+                                 const uint8_t* vectors,
+                                 const bool* valid_data,
+                                 int64_t valid_data_len) {
+    SCOPE_CGO_CALL_METRIC();
+
+    auto status = CStatus();
+    try {
+        AssertInfo(
+            index,
+            "failed to build binary vector index, passed index was null");
+        auto real_index =
+            reinterpret_cast<milvus::indexbuilder::IndexCreatorBase*>(index);
+        auto cIndex =
+            dynamic_cast<milvus::indexbuilder::VecIndexCreator*>(real_index);
+        auto dim = cIndex->dim();
+        auto row_nums = (data_size * 8) / dim;
+        auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
+        cIndex->Build(ds, valid_data, valid_data_len);
         status.error_code = Success;
         status.error_msg = "";
     } catch (std::exception& e) {
@@ -640,6 +828,36 @@ BuildSparseFloatVecIndex(CIndex index,
 }
 
 CStatus
+BuildSparseFloatVecIndexWithValidData(CIndex index,
+                                      int64_t row_num,
+                                      int64_t dim,
+                                      const uint8_t* vectors,
+                                      const bool* valid_data,
+                                      int64_t valid_data_len) {
+    SCOPE_CGO_CALL_METRIC();
+
+    auto status = CStatus();
+    try {
+        AssertInfo(
+            index,
+            "failed to build sparse float vector index, passed index was null");
+        auto real_index =
+            reinterpret_cast<milvus::indexbuilder::IndexCreatorBase*>(index);
+        auto cIndex =
+            dynamic_cast<milvus::indexbuilder::VecIndexCreator*>(real_index);
+        auto ds = knowhere::GenDataSet(row_num, dim, vectors);
+        ds->SetIsSparse(true);
+        cIndex->Build(ds, valid_data, valid_data_len);
+        status.error_code = Success;
+        status.error_msg = "";
+    } catch (std::exception& e) {
+        status.error_code = UnexpectedError;
+        status.error_msg = strdup(e.what());
+    }
+    return status;
+}
+
+CStatus
 BuildInt8VecIndex(CIndex index, int64_t int8_value_num, const int8_t* vectors) {
     SCOPE_CGO_CALL_METRIC();
 
@@ -655,6 +873,35 @@ BuildInt8VecIndex(CIndex index, int64_t int8_value_num, const int8_t* vectors) {
         auto row_nums = int8_value_num / dim;
         auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
         cIndex->Build(ds);
+        status.error_code = Success;
+        status.error_msg = "";
+    } catch (std::exception& e) {
+        status.error_code = UnexpectedError;
+        status.error_msg = strdup(e.what());
+    }
+    return status;
+}
+
+CStatus
+BuildInt8VecIndexWithValidData(CIndex index,
+                               int64_t int8_value_num,
+                               const int8_t* vectors,
+                               const bool* valid_data,
+                               int64_t valid_data_len) {
+    SCOPE_CGO_CALL_METRIC();
+
+    auto status = CStatus();
+    try {
+        AssertInfo(index,
+                   "failed to build int8 vector index, passed index was null");
+        auto real_index =
+            reinterpret_cast<milvus::indexbuilder::IndexCreatorBase*>(index);
+        auto cIndex =
+            dynamic_cast<milvus::indexbuilder::VecIndexCreator*>(real_index);
+        auto dim = cIndex->dim();
+        auto row_nums = int8_value_num / dim;
+        auto ds = knowhere::GenDataSet(row_nums, dim, vectors);
+        cIndex->Build(ds, valid_data, valid_data_len);
         status.error_code = Success;
         status.error_msg = "";
     } catch (std::exception& e) {

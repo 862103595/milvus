@@ -27,11 +27,19 @@ struct RustArrayI64 {
   size_t cap;
 };
 
+/// Array of C strings (char*) for returning Vec<String> to C++
+struct RustStringArray {
+  char **array;
+  size_t len;
+  size_t cap;
+};
+
 struct Value {
   enum class Tag {
     None,
     RustArray,
     RustArrayI64,
+    RustStringArray,
     U32,
     U64,
     Ptr,
@@ -47,6 +55,10 @@ struct Value {
 
   struct RustArrayI64_Body {
     RustArrayI64 _0;
+  };
+
+  struct RustStringArray_Body {
+    RustStringArray _0;
   };
 
   struct U32_Body {
@@ -66,6 +78,7 @@ struct Value {
     None_Body none;
     RustArray_Body rust_array;
     RustArrayI64_Body rust_array_i64;
+    RustStringArray_Body rust_string_array;
     U32_Body u32;
     U64_Body u64;
     Ptr_Body ptr;
@@ -93,6 +106,8 @@ extern "C" {
 void free_rust_array(RustArray array);
 
 void free_rust_array_i64(RustArrayI64 array);
+
+void free_rust_string_array(RustStringArray array);
 
 void free_rust_result(RustResult result);
 
@@ -217,9 +232,15 @@ RustResult tantivy_range_query_keyword(void *ptr,
                                        bool ub_inclusive,
                                        void *bitset);
 
-RustResult tantivy_prefix_query_keyword(void *ptr, const char *prefix, void *bitset);
+RustResult tantivy_prefix_query_keyword(void *ptr,
+                                        const uint8_t *prefix,
+                                        uintptr_t prefix_len,
+                                        void *bitset);
 
-RustResult tantivy_regex_query(void *ptr, const char *pattern, void *bitset);
+RustResult tantivy_regex_query(void *ptr,
+                               const uint8_t *pattern,
+                               uintptr_t pattern_len,
+                               void *bitset);
 
 RustResult tantivy_json_term_query_i64(void *ptr,
                                        const char *json_path,
@@ -279,12 +300,14 @@ RustResult tantivy_json_range_query_keyword(void *ptr,
 
 RustResult tantivy_json_regex_query(void *ptr,
                                     const char *json_path,
-                                    const char *pattern,
+                                    const uint8_t *pattern,
+                                    uintptr_t pattern_len,
                                     void *bitset);
 
 RustResult tantivy_json_prefix_query(void *ptr,
                                      const char *json_path,
-                                     const char *prefix,
+                                     const uint8_t *prefix,
+                                     uintptr_t prefix_len,
                                      void *bitset);
 
 RustResult tantivy_ngram_match_query(void *ptr,
@@ -292,6 +315,14 @@ RustResult tantivy_ngram_match_query(void *ptr,
                                      uintptr_t min_gram,
                                      uintptr_t max_gram,
                                      void *bitset);
+
+RustResult tantivy_ngram_tokenize(void *ptr,
+                                  const char *const *literals,
+                                  uintptr_t literals_len,
+                                  uintptr_t min_gram,
+                                  uintptr_t max_gram);
+
+RustResult tantivy_ngram_term_posting_list(void *ptr, const char *term, void *bitset);
 
 RustResult tantivy_match_query(void *ptr,
                                const char *query,
@@ -302,7 +333,8 @@ RustResult tantivy_phrase_match_query(void *ptr, const char *query, uint32_t slo
 
 RustResult tantivy_register_tokenizer(void *ptr,
                                       const char *tokenizer_name,
-                                      const char *analyzer_params);
+                                      const char *analyzer_params,
+                                      const char *analyzer_extra_info);
 
 RustResult tantivy_create_index(const char *field_name,
                                 TantivyDataType data_type,
@@ -387,9 +419,11 @@ RustResult tantivy_index_add_bools_by_single_segment_writer(void *ptr,
                                                             const bool *array,
                                                             uintptr_t len);
 
-RustResult tantivy_index_add_string(void *ptr, const char *s, int64_t offset);
+RustResult tantivy_index_add_string(void *ptr, const uint8_t *s, uintptr_t len, int64_t offset);
 
-RustResult tantivy_index_add_string_by_single_segment_writer(void *ptr, const char *s);
+RustResult tantivy_index_add_string_by_single_segment_writer(void *ptr,
+                                                             const uint8_t *s,
+                                                             uintptr_t len);
 
 RustResult tantivy_index_add_json_key_stats_data_by_batch(void *ptr,
                                                           const char *const *keys,
@@ -468,22 +502,27 @@ RustResult tantivy_index_add_array_bools_by_single_segment_writer(void *ptr,
                                                                   uintptr_t len);
 
 RustResult tantivy_index_add_array_keywords(void *ptr,
-                                            const char *const *array,
+                                            const uint8_t *const *array,
+                                            const uintptr_t *str_lens,
                                             uintptr_t len,
                                             int64_t offset);
 
 RustResult tantivy_index_add_array_keywords_by_single_segment_writer(void *ptr,
-                                                                     const char *const *array,
+                                                                     const uint8_t *const *array,
+                                                                     const uintptr_t *str_lens,
                                                                      uintptr_t len);
 
 RustResult tantivy_create_text_writer(const char *field_name,
                                       const char *path,
                                       uint32_t tantivy_index_version,
-                                      const char *tokenizer_name,
+                                      const char *analyzer_name,
                                       const char *analyzer_params,
+                                      const char *analyzer_extra_info,
                                       uintptr_t num_threads,
                                       uintptr_t overall_memory_budget_in_bytes,
                                       bool in_ram);
+
+void tantivy_set_log_level(const char *level);
 
 void free_rust_string(const char *ptr);
 
@@ -497,7 +536,9 @@ const char *tantivy_token_stream_get_token(void *token_stream);
 
 TantivyToken tantivy_token_stream_get_detailed_token(void *token_stream);
 
-RustResult tantivy_create_analyzer(const char *analyzer_params);
+RustResult tantivy_create_analyzer(const char *analyzer_params, const char *extra_info);
+
+RustResult tantivy_validate_analyzer(const char *analyzer_params, const char *extra_info);
 
 void *tantivy_clone_analyzer(void *ptr);
 
@@ -506,5 +547,10 @@ void tantivy_free_analyzer(void *tokenizer);
 RustResult tantivy_set_analyzer_options(const char *params);
 
 bool tantivy_index_exist(const char *path);
+
+RustResult tantivy_compute_phrase_match_slop(const char *tokenizer_params,
+                                             const char *query,
+                                             const char *data,
+                                             uint32_t *slop);
 
 }  // extern "C"

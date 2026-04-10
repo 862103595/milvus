@@ -98,6 +98,7 @@ message ColumnInfo {
   schema.DataType element_type = 7;
   bool is_clustering_key = 8;
   bool nullable = 9;
+  bool is_element_level = 10;
 }
 
 message ColumnExpr {
@@ -190,6 +191,9 @@ message GISFunctionFilterExpr{
     Intersects = 6;
     Within = 7;
     DWithin = 8;
+    // STIsValid is a special operator that conflicts with proto-generated default methods.
+    // Using STIsValid instead of IsValid to avoid naming conflicts with IsValid() method.
+    STIsValid = 9;
   }
   GISOp op = 3;
   double distance = 4;  // Distance parameter for DWithin
@@ -242,6 +246,28 @@ message RandomSampleExpr {
   Expr predicate = 2;
 }
 
+message ElementFilterExpr {
+  Expr element_expr = 1;
+  string struct_name = 2;
+  Expr predicate = 3;
+}
+
+// MatchType defines the type of match operation for struct array queries
+enum MatchType {
+  MatchAll = 0;    // All elements must match the predicate
+  MatchAny = 1;    // At least one element matches the predicate
+  MatchLeast = 2;  // At least N elements match the predicate
+  MatchMost = 3;   // At most N elements match the predicate
+  MatchExact = 4;  // Exactly N elements match the predicate
+}
+
+message MatchExpr {
+  string struct_name = 1;      // The struct array field name (e.g., struct_array)
+  Expr predicate = 2;          // The condition expression using $[field] syntax (e.g., $[intField] == 1 && $[strField] == "aaa")
+  MatchType match_type = 3;    // Type of match operation
+  int64 count = 4;             // For MatchLeast/MatchMost: the count parameter (N)
+}
+
 message AlwaysTrueExpr {}
 
 message Interval {
@@ -282,6 +308,8 @@ message Expr {
     RandomSampleExpr random_sample_expr = 16;
     GISFunctionFilterExpr gisfunction_filter_expr = 17;
     TimestamptzArithCompareExpr timestamptz_arith_compare_expr = 18;
+    ElementFilterExpr element_filter_expr = 19;
+    MatchExpr match_expr = 21;
   };
   bool is_template = 20;
 }
@@ -294,10 +322,33 @@ message VectorANNS {
   string placeholder_tag = 5;  // always be "$0"
 }
 
+enum AggregateOp {
+  sum = 0;
+  count = 1;
+  avg = 2;
+  min = 3;
+  max = 4;
+}
+
+message Aggregate {
+  AggregateOp op = 1;
+  int64 field_id = 2;
+}
+
+// OrderByField specifies a single field for ORDER BY sorting
+message OrderByField {
+  int64 field_id = 1;      // Field ID to sort by
+  bool ascending = 2;      // true for ASC (default), false for DESC
+  bool nulls_first = 3;    // true for NULLS FIRST, false for NULLS LAST (default)
+}
+
 message QueryPlanNode {
   Expr predicates = 1;
   bool is_count = 2;
   int64 limit = 3;
+  repeated int64 group_by_field_ids = 4;
+  repeated Aggregate aggregates = 5;
+  repeated OrderByField order_by_fields = 6;  // ORDER BY specifications
 };
 
 enum FunctionType{

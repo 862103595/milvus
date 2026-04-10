@@ -34,11 +34,13 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	mhttp "github.com/milvus-io/milvus/internal/http"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -74,6 +76,7 @@ func (req *DefaultReq) GetDbName() string { return req.DbName }
 
 func init() {
 	paramtable.Init()
+	streaming.SetupNoopWALForTest()
 }
 
 func sendReqAndVerify(t *testing.T, testEngine *gin.Engine, testName, method string, testcase requestBodyTestCase) {
@@ -593,13 +596,17 @@ func TestDocInDocOutInsertInvalid(t *testing.T) {
 		ShardsNum:      ShardNumDefault,
 		Status:         &StatusSuccess,
 	}, nil).Once()
-	// invlaid insert request, will not be sent to proxy
+	// function output field data is now passed through to proxy for validation
+	insertErr := errors.Wrap(merr.ErrInvalidInsertData, "not allowed to provide data for BM25 function output field")
+	mp.EXPECT().Insert(mock.Anything, mock.Anything).Return(&milvuspb.MutationResult{
+		Status: merr.Status(insertErr),
+	}, nil).Once()
 
 	testcase := requestBodyTestCase{
 		path:        versionalV2(EntityCategory, InsertAction),
 		requestBody: []byte(`{"collectionName": "book", "data": [{"book_id": 0, "word_count": 0, "book_intro": {"1": 0.1}, "varchar_field": "some text"}]}`),
 		errCode:     1804,
-		errMsg:      "not allowed to provide input data for function output field",
+		errMsg:      "not allowed to provide data for BM25 function output field",
 	}
 
 	sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
@@ -1169,6 +1176,46 @@ func TestIndexProperties(t *testing.T) {
 	}
 }
 
+func TestDescribeIndexWithWarmup(t *testing.T) {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	mp := mocks.NewMockProxy(t)
+	mp.EXPECT().DescribeIndex(mock.Anything, mock.Anything).Return(&milvuspb.DescribeIndexResponse{
+		Status: &StatusSuccess,
+		IndexDescriptions: []*milvuspb.IndexDescription{
+			{
+				IndexName: DefaultIndexName,
+				FieldName: FieldBookIntro,
+				Params: []*commonpb.KeyValuePair{
+					{Key: common.MetricTypeKey, Value: DefaultMetricType},
+					{Key: common.IndexTypeKey, Value: "IVF_FLAT"},
+					{Key: common.WarmupKey, Value: "sync"},
+				},
+				State: commonpb.IndexState_Finished,
+			},
+		},
+	}, nil).Once()
+	testEngine := initHTTPServerV2(mp, false)
+
+	req := httptest.NewRequest(http.MethodPost, versionalV2(IndexCategory, DescribeAction),
+		bytes.NewReader([]byte(`{"collectionName": "`+DefaultCollectionName+`", "indexName": "`+DefaultIndexName+`"}`)))
+	w := httptest.NewRecorder()
+	testEngine.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]any
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Nil(t, err)
+	assert.Equal(t, float64(0), resp["code"])
+	data := resp["data"].([]any)
+	assert.Equal(t, 1, len(data))
+	indexInfo := data[0].(map[string]any)
+	assert.Equal(t, "sync", indexInfo["warmup"])
+}
+
 func TestCollectionFieldProperties(t *testing.T) {
 	paramtable.Init()
 	// disable rate limit
@@ -1515,6 +1562,40 @@ func TestCreateCollection(t *testing.T) {
 			}
 		})
 	}
+
+	// collection-level warmup params: assert Properties contains the 4 warmup key-value pairs
+	t.Run("warmup properties in CreateCollectionRequest", func(t *testing.T) {
+		mp2 := mocks.NewMockProxy(t)
+		mp2.EXPECT().CreateCollection(mock.Anything, mock.MatchedBy(func(req *milvuspb.CreateCollectionRequest) bool {
+			warmupProps := make(map[string]string)
+			for _, kv := range req.Properties {
+				warmupProps[kv.Key] = kv.Value
+			}
+			return warmupProps[common.WarmupScalarFieldKey] == "sync" &&
+				warmupProps[common.WarmupScalarIndexKey] == "sync" &&
+				warmupProps[common.WarmupVectorFieldKey] == "sync" &&
+				warmupProps[common.WarmupVectorIndexKey] == "disable"
+		})).Return(commonSuccessStatus, nil).Once()
+		mp2.EXPECT().CreateIndex(mock.Anything, mock.Anything).Return(commonSuccessStatus, nil).Once()
+		mp2.EXPECT().LoadCollection(mock.Anything, mock.Anything).Return(commonSuccessStatus, nil).Once()
+		testEngine2 := initHTTPServerV2(mp2, false)
+
+		reqBody := []byte(`{"collectionName": "` + DefaultCollectionName + `", "schema": {
+		        "fields": [
+		            {"fieldName": "book_id", "dataType": "Int64", "isPrimary": true, "elementTypeParams": {}},
+		            {"fieldName": "book_intro", "dataType": "FloatVector", "elementTypeParams": {"dim": 2}}
+		        ]
+		    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}],
+		    "params": {"warmup.scalarField": "sync", "warmup.scalarIndex": "sync", "warmup.vectorField": "sync", "warmup.vectorIndex": "disable"}}`)
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(reqBody))
+		w := httptest.NewRecorder()
+		testEngine2.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		returnBody := &ReturnErrMsg{}
+		err := json.Unmarshal(w.Body.Bytes(), returnBody)
+		assert.Nil(t, err)
+		assert.Equal(t, int32(0), returnBody.Code)
+	})
 }
 
 func versionalV2(category string, action string) string {
@@ -2871,4 +2952,231 @@ func (s *AddCollectionFieldSuite) TestAddCollectionFieldFail() {
 
 func TestAddCollectionFieldSuite(t *testing.T) {
 	suite.Run(t, new(AddCollectionFieldSuite))
+}
+
+func TestCollectionFunctionSuite(t *testing.T) {
+	suite.Run(t, new(CollectionFunctionSuite))
+}
+
+type CollectionFunctionSuite struct {
+	suite.Suite
+	testEngine *gin.Engine
+	mp         *mocks.MockProxy
+}
+
+func (s *CollectionFunctionSuite) SetupSuite() {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+}
+
+func (s *CollectionFunctionSuite) TearDownSuite() {
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+}
+
+func (s *CollectionFunctionSuite) SetupTest() {
+	s.mp = mocks.NewMockProxy(s.T())
+	s.testEngine = initHTTPServerV2(s.mp, false)
+}
+
+func (s *CollectionFunctionSuite) TestAddCollectionFunctionNormal() {
+	s.Run("success", func() {
+		addFunctionTestCases := []requestBodyTestCase{
+			{
+				path:        versionalV2(CollectionCategory, AddFunctionAction),
+				requestBody: []byte(`{"dbName": "db", "collectionName": "coll", "function": {"name": "test_function", "type": "TextEmbedding", "inputFieldNames": [], "OutputFieldNames": []}}`),
+				errCode:     0,
+				errMsg:      "",
+			},
+		}
+		s.mp.EXPECT().AddCollectionFunction(mock.Anything, mock.Anything).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil).Maybe()
+
+		validateRequestBodyTestCases(s.T(), s.testEngine, addFunctionTestCases, false)
+	})
+
+	s.Run("bad_request", func() {
+		addFunctionTestCases := []requestBodyTestCase{
+			{
+				path:        versionalV2(CollectionCategory, AddFunctionAction),
+				requestBody: []byte(`{"dbName": "db", "collectionName": "", "function": {"name": "test_function", "type": "BM25", "inputFieldNames": [], "OutputFieldNames": []}}`),
+				errCode:     1802,
+				errMsg:      "missing required parameters, error: Key: 'CollectionAddFunction.CollectionName' Error:Field validation for 'CollectionName' failed on the 'required' tag",
+			},
+			{
+				path:        versionalV2(CollectionCategory, AddFunctionAction),
+				requestBody: []byte(`invalid json`),
+				errCode:     1801,
+				errMsg:      "can only accept json format request, error: invalid character 'i' looking for beginning of value",
+			},
+		}
+		validateRequestBodyTestCases(s.T(), s.testEngine, addFunctionTestCases, false)
+	})
+}
+
+func (s *CollectionFunctionSuite) TestAlterCollectionFunctionNormal() {
+	s.Run("success", func() {
+		alterFunctionTestCases := []requestBodyTestCase{
+			{
+				path:        versionalV2(CollectionCategory, AlterFunctionAction),
+				requestBody: []byte(`{"dbName": "db", "collectionName": "coll", "functionName": "test_function", "function": {"name": "test_function", "type": "TextEmbedding", "inputFieldNames": [], "OutputFieldNames": []}}`),
+				errCode:     0,
+				errMsg:      "",
+			},
+		}
+		s.mp.EXPECT().AlterCollectionFunction(mock.Anything, mock.Anything).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil).Maybe()
+
+		validateRequestBodyTestCases(s.T(), s.testEngine, alterFunctionTestCases, false)
+	})
+
+	s.Run("bad_request", func() {
+		alterFunctionTestCases := []requestBodyTestCase{
+			{
+				path:        versionalV2(CollectionCategory, AlterFunctionAction),
+				requestBody: []byte(`{"dbName": "db", "collectionName": "", "functionName": "test_function", "function": {"name": "test_function", "type": "BM25", "inputFieldNames": [], "OutputFieldNames": []}}`),
+				errCode:     1802,
+				errMsg:      "missing required parameters, error: Key: 'CollectionAlterFunction.CollectionName' Error:Field validation for 'CollectionName' failed on the 'required' tag",
+			},
+			{
+				path:        versionalV2(CollectionCategory, AlterFunctionAction),
+				requestBody: []byte(`invalid json`),
+				errCode:     1801,
+				errMsg:      "can only accept json format request, error: invalid character 'i' looking for beginning of value",
+			},
+		}
+		validateRequestBodyTestCases(s.T(), s.testEngine, alterFunctionTestCases, false)
+	})
+}
+
+func (s *CollectionFunctionSuite) TestDropCollectionFunctionNormal() {
+	s.Run("success", func() {
+		addFunctionTestCases := []requestBodyTestCase{
+			{
+				path:        versionalV2(CollectionCategory, DropFunctionAction),
+				requestBody: []byte(`{"dbName": "db", "collectionName": "coll", "functionName": "test"}`),
+				errCode:     0,
+				errMsg:      "",
+			},
+		}
+		s.mp.EXPECT().DropCollectionFunction(mock.Anything, mock.Anything).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil).Maybe()
+
+		validateRequestBodyTestCases(s.T(), s.testEngine, addFunctionTestCases, false)
+	})
+}
+
+func TestTruncateCollection(t *testing.T) {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+	mp := mocks.NewMockProxy(t)
+	mp.EXPECT().TruncateCollection(mock.Anything, mock.Anything).Return(&milvuspb.TruncateCollectionResponse{
+		Status: commonSuccessStatus,
+	}, nil).Times(2)
+	testEngine := initHTTPServerV2(mp, false)
+
+	testCases := []requestBodyTestCase{
+		{
+			path:        versionalV2(CollectionCategory, TruncateAction),
+			requestBody: []byte(`{"dbName": "default", "collectionName": "` + DefaultCollectionName + `"}`),
+			errCode:     0,
+			errMsg:      "",
+		},
+		{
+			path:        versionalV2(CollectionCategory, TruncateAction),
+			requestBody: []byte(`{"collectionName": "` + DefaultCollectionName + `"}`),
+			errCode:     0,
+			errMsg:      "",
+		},
+		{
+			path:        versionalV2(CollectionCategory, TruncateAction),
+			requestBody: []byte(`{"dbName": "db", "collectionName": ""}`),
+			errCode:     1802,
+			errMsg:      "missing required parameters",
+		},
+		{
+			path:        versionalV2(CollectionCategory, TruncateAction),
+			requestBody: []byte(`invalid json`),
+			errCode:     1801,
+			errMsg:      "can only accept json format request",
+		},
+	}
+
+	for _, testcase := range testCases {
+		sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
+	}
+}
+
+func TestSearchByPK(t *testing.T) {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	outputFields := []string{FieldBookID, FieldWordCount}
+	mp := mocks.NewMockProxy(t)
+
+	// Mock for successful search by PK with int64 IDs
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, false, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Times(5)
+
+	mp.EXPECT().Search(mock.Anything, mock.MatchedBy(func(req *milvuspb.SearchRequest) bool {
+		// Verify the SearchInput is set with IDs
+		return req.GetIds() != nil
+	})).Return(&milvuspb.SearchResults{
+		Status: commonSuccessStatus,
+		Results: &schemapb.SearchResultData{
+			TopK:         int64(3),
+			OutputFields: outputFields,
+			FieldsData:   generateFieldData(),
+			Ids:          generateIDs(schemapb.DataType_Int64, 3),
+			Scores:       DefaultScores,
+		},
+	}, nil).Times(2)
+
+	testEngine := initHTTPServerV2(mp, false)
+
+	queryTestCases := []requestBodyTestCase{}
+
+	// Test case 1: Search by PK with int64 IDs (JSON numbers decoded as float64)
+	queryTestCases = append(queryTestCases, requestBodyTestCase{
+		path:        SearchAction,
+		requestBody: []byte(`{"collectionName": "book", "ids": [1, 2, 3], "limit": 10, "outputFields": ["word_count"]}`),
+	})
+
+	// Test case 2: Search by PK with string IDs for int64 PK
+	queryTestCases = append(queryTestCases, requestBodyTestCase{
+		path:        SearchAction,
+		requestBody: []byte(`{"collectionName": "book", "ids": ["1", "2", "3"], "limit": 10, "outputFields": ["word_count"]}`),
+	})
+
+	// Test case 3: Search by PK with fractional float64 should fail
+	queryTestCases = append(queryTestCases, requestBodyTestCase{
+		path:        SearchAction,
+		requestBody: []byte(`{"collectionName": "book", "ids": [1.5, 2.9], "limit": 10, "outputFields": ["word_count"]}`),
+		errMsg:      "has fractional part",
+		errCode:     1100, // ErrParameterInvalid
+	})
+
+	// Test case 4: Search by PK with empty ids array should fail
+	// Empty array is treated as "no ids provided" at request validation level
+	queryTestCases = append(queryTestCases, requestBodyTestCase{
+		path:        SearchAction,
+		requestBody: []byte(`{"collectionName": "book", "ids": [], "limit": 10, "outputFields": ["word_count"]}`),
+		errMsg:      "either 'ids' (for primary key search) or 'data' (for vector search) must be provided",
+		errCode:     1802, // ErrIncorrectParameterFormat
+	})
+
+	// Test case 5: Search by PK with invalid string value should fail
+	queryTestCases = append(queryTestCases, requestBodyTestCase{
+		path:        SearchAction,
+		requestBody: []byte(`{"collectionName": "book", "ids": ["not_a_number"], "limit": 10, "outputFields": ["word_count"]}`),
+		errMsg:      "invalid int64 id",
+		errCode:     1100, // ErrParameterInvalid
+	})
+
+	validateTestCases(t, testEngine, queryTestCases, false)
 }

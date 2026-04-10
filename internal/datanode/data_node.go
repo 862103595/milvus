@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"os"
 	"sync"
 	"time"
 
@@ -35,11 +34,15 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/compaction"
 	"github.com/milvus-io/milvus/internal/datanode/compactor"
+	"github.com/milvus-io/milvus/internal/datanode/external"
 	"github.com/milvus-io/milvus/internal/datanode/importv2"
 	"github.com/milvus-io/milvus/internal/datanode/index"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/analyzer"
+	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
@@ -86,6 +89,8 @@ type DataNode struct {
 	taskScheduler  *index.TaskScheduler
 	taskManager    *index.TaskManager
 
+	externalCollectionManager *external.ExternalCollectionManager
+
 	compactionExecutor compactor.Executor
 
 	etcdCli *clientv3.Client
@@ -103,8 +108,6 @@ type DataNode struct {
 	reportImportRetryTimes uint // unitest set this value to 1 to save time, default is 10
 	pool                   *conc.Pool[any]
 
-	totalSlot int64
-
 	metricsRequest *metricsinfo.MetricsRequest
 }
 
@@ -120,12 +123,12 @@ func NewDataNode(ctx context.Context) *DataNode {
 		compactionExecutor:     compactor.NewExecutor(),
 		reportImportRetryTimes: 10,
 		metricsRequest:         metricsinfo.NewMetricsRequest(),
-		totalSlot:              index.CalculateNodeSlots(),
 	}
 	sc := index.NewTaskScheduler(ctx2)
 	node.storageFactory = NewChunkMgrFactory()
 	node.taskScheduler = sc
 	node.taskManager = index.NewTaskManager(ctx2)
+	node.externalCollectionManager = external.NewExternalCollectionManager(ctx2, 8)
 	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 	expr.Register("datanode", node)
 	return node
@@ -157,12 +160,6 @@ func (node *DataNode) Register() error {
 
 	metrics.NumNodes.WithLabelValues(fmt.Sprint(node.GetNodeID()), typeutil.DataNodeRole).Inc()
 	log.Info("DataNode Register Finished")
-	// Start liveness check
-	node.session.LivenessCheck(node.ctx, func() {
-		log.Error("Data Node disconnected from etcd, process will exit", zap.Int64("Server Id", node.GetSession().ServerID))
-		os.Exit(1)
-	})
-
 	return nil
 }
 
@@ -171,7 +168,7 @@ func (node *DataNode) initSession() error {
 	if node.session == nil {
 		return errors.New("failed to initialize session")
 	}
-	node.session.Init(typeutil.DataNodeRole, node.address, false, true)
+	node.session.Init(typeutil.DataNodeRole, node.address, false)
 	sessionutil.SaveServerInfo(typeutil.DataNodeRole, node.session.ServerID)
 	return nil
 }
@@ -201,6 +198,25 @@ func (node *DataNode) Init() error {
 		syncMgr := syncmgr.NewSyncManager(nil)
 		node.syncMgr = syncMgr
 
+		fileMode := fileresource.ParseMode(paramtable.Get().CommonCfg.DNFileResourceMode.GetValue())
+		if fileMode == fileresource.SyncMode {
+			storageConfig := compaction.CreateStorageConfig()
+			if storageConfig.GetStorageType() != "local" && storageConfig.GetAddress() == "" {
+				log.Info("No storage address configured in yaml, file resource sync mode is disabled")
+				fileresource.InitManager(nil, fileresource.CloseMode)
+			} else {
+				cm, err := node.storageFactory.NewChunkManager(node.ctx, storageConfig)
+				if err != nil {
+					log.Error("Init chunk manager for file resource manager failed", zap.Error(err))
+					initError = err
+					return
+				}
+				fileresource.InitManager(cm, fileMode)
+			}
+		} else {
+			fileresource.InitManager(nil, fileMode)
+		}
+
 		node.importTaskMgr = importv2.NewTaskManager()
 		node.importScheduler = importv2.NewScheduler(node.importTaskMgr)
 
@@ -208,6 +224,8 @@ func (node *DataNode) Init() error {
 		if err != nil {
 			initError = err
 		}
+
+		analyzer.InitOptions()
 		log.Info("init datanode done", zap.String("Address", node.address))
 	})
 	return initError
@@ -295,6 +313,10 @@ func (node *DataNode) Stop() error {
 			node.importScheduler.Close()
 		}
 
+		if node.externalCollectionManager != nil {
+			node.externalCollectionManager.Close()
+		}
+
 		// cleanup all running tasks
 		node.taskManager.DeleteAllTasks()
 
@@ -303,6 +325,8 @@ func (node *DataNode) Stop() error {
 		}
 
 		index.CloseSegcore()
+
+		metrics.CleanupDataNodeCompactionMetrics(paramtable.GetNodeID())
 
 		// Delay the cancellation of ctx to ensure that the session is automatically recycled after closed the flow graph
 		node.cancel()

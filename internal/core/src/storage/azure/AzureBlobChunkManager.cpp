@@ -14,10 +14,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <iostream>
-#include <sstream>
+#include <azure/identity/managed_identity_credential.hpp>
 #include <azure/identity/workload_identity_credential.hpp>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
 #include "AzureBlobChunkManager.h"
+#include "azure/core/context.hpp"
+#include "azure/core/diagnostics/logger.hpp"
+#include "azure/core/http/http.hpp"
+#include "azure/core/http/http_status_code.hpp"
+#include "azure/core/io/body_stream.hpp"
+#include "azure/core/nullable.hpp"
+#include "azure/core/response.hpp"
+#include "azure/storage/blobs/blob_container_client.hpp"
+#include "azure/storage/blobs/blob_options.hpp"
+#include "azure/storage/blobs/blob_responses.hpp"
+#include "azure/storage/blobs/blob_service_client.hpp"
+#include "azure/storage/blobs/block_blob_client.hpp"
+#include "azure/storage/blobs/rest_client.hpp"
+#include "azure/storage/common/storage_exception.hpp"
 
 namespace azure {
 
@@ -66,29 +85,50 @@ AzureBlobChunkManager::AzureBlobChunkManager(
     bool useIAM) {
     requestTimeoutMs_ = requestTimeoutMs;
     if (useIAM) {
-        Azure::Identity::WorkloadIdentityCredentialOptions options;
-        auto workloadIdentityCredential =
-            std::make_shared<Azure::Identity::WorkloadIdentityCredential>(
-                options);
-        client_ = std::make_shared<Azure::Storage::Blobs::BlobServiceClient>(
-            "https://" + access_key_id + ".blob." + address + "/",
-            workloadIdentityCredential);
+        const char* federated_token_file =
+            std::getenv("AZURE_FEDERATED_TOKEN_FILE");
+        const bool has_federated_token = federated_token_file != nullptr &&
+                                         std::strlen(federated_token_file) > 0;
+        if (has_federated_token) {
+            Azure::Identity::WorkloadIdentityCredentialOptions options;
+            const char* workload_client_id = std::getenv("AZURE_CLIENT_ID");
+            const char* workload_tenant_id = std::getenv("AZURE_TENANT_ID");
+            options.ClientId =
+                workload_client_id == nullptr ? "" : workload_client_id;
+            options.TenantId =
+                workload_tenant_id == nullptr ? "" : workload_tenant_id;
+            options.TokenFilePath = federated_token_file;
+            auto workloadIdentityCredential =
+                std::make_shared<Azure::Identity::WorkloadIdentityCredential>(
+                    options);
+            client_ =
+                std::make_shared<Azure::Storage::Blobs::BlobServiceClient>(
+                    "https://" + access_key_id + ".blob." + address + "/",
+                    workloadIdentityCredential);
+        } else {
+            const char* client_id_env = std::getenv("AZURE_CLIENT_ID");
+            std::string client_id =
+                client_id_env == nullptr ? "" : client_id_env;
+            std::shared_ptr<Azure::Identity::ManagedIdentityCredential>
+                credential;
+            if (client_id.empty()) {
+                credential = std::make_shared<
+                    Azure::Identity::ManagedIdentityCredential>();
+            } else {
+                credential = std::make_shared<
+                    Azure::Identity::ManagedIdentityCredential>(client_id);
+            }
+
+            client_ =
+                std::make_shared<Azure::Storage::Blobs::BlobServiceClient>(
+                    "https://" + access_key_id + ".blob." + address + "/",
+                    credential);
+        }
     } else {
         client_ = std::make_shared<Azure::Storage::Blobs::BlobServiceClient>(
             Azure::Storage::Blobs::BlobServiceClient::
                 CreateFromConnectionString(GetConnectionString(
                     access_key_id, access_key_value, address)));
-    }
-    try {
-        Azure::Core::Context context;
-        client_->GetBlobContainerClient("justforconnectioncheck")
-            .GetBlockBlobClient("justforconnectioncheck")
-            .GetProperties(Azure::Storage::Blobs::GetBlobPropertiesOptions(),
-                           context);
-    } catch (const Azure::Storage::StorageException& e) {
-        if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
-            throw;
-        }
     }
 }
 

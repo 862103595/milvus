@@ -31,9 +31,8 @@ class TestAsyncMilvusClientCollectionInvalid(TestMilvusClientV2Base):
     """ Test case of collection interface """
 
     def teardown_method(self, method):
-        self.init_async_milvus_client()
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.async_milvus_client_wrap.close())
+        if self.async_milvus_client_wrap.async_milvus_client is not None:
+            asyncio.run(self.async_milvus_client_wrap.close())
         super().teardown_method(method)
 
     """
@@ -128,9 +127,8 @@ class TestAsyncMilvusClientCollectionValid(TestMilvusClientV2Base):
     """ Test case of collection interface """
 
     def teardown_method(self, method):
-        self.init_async_milvus_client()
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.async_milvus_client_wrap.close())
+        if self.async_milvus_client_wrap.async_milvus_client is not None:
+            asyncio.run(self.async_milvus_client_wrap.close())
         super().teardown_method(method)
 
     """
@@ -217,4 +215,35 @@ class TestAsyncMilvusClientCollectionValid(TestMilvusClientV2Base):
             await async_client.drop_partition(collection_name, partition_name)
             partitions, _ = await async_client.list_partitions(collection_name)
             assert partition_name not in partitions
+        await async_client.drop_collection(collection_name)
+
+
+    @pytest.mark.tags(CaseLabel.L0)
+    async def test_async_milvus_client_truncate_collection(self):
+        """
+        target: test truncate collection with strong consistency level
+        method: truncate collection with strong consistency level
+        expected: the collection is truncated
+        """
+        self.init_async_milvus_client()
+        async_client = self.async_milvus_client_wrap
+        
+        # 1. create collection
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        await async_client.create_collection(collection_name, default_dim)
+        collections, _ = await async_client.list_collections()
+        assert collection_name in collections
+        # 2. insert
+        rng = np.random.default_rng(seed=19530)
+        rows = [{default_primary_key_field_name: i, default_vector_field_name: list(rng.random((1, default_dim))[0]),
+                 default_float_field_name: i * 1.0, default_string_field_name: str(i)} for i in range(default_nb)]
+        await async_client.insert(collection_name, rows)
+        # 3. truncate collection
+        await async_client.truncate_collection(collection_name)
+        # 4. query
+        result = await async_client.query(collection_name, filter=default_search_exp, output_fields=["count(*)"])
+        assert result[0][0].get("count(*)", -1) == 0
+        seg = await async_client.list_persistent_segments(collection_name)
+        assert len(seg[0]) == 0
+        # 5. drop collection
         await async_client.drop_collection(collection_name)

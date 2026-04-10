@@ -21,9 +21,13 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
@@ -33,35 +37,10 @@ import (
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 )
-
-func TestNextID(t *testing.T) {
-	al := allocator.NewMockGIDAllocator()
-	i := int64(0)
-	al.AllocF = func(count uint32) (int64, int64, error) {
-		rt := i
-		i += int64(count)
-		return rt, int64(count), nil
-	}
-	al.AllocOneF = func() (allocator.UniqueID, error) {
-		rt := i
-		i++
-		return rt, nil
-	}
-	bw := NewBulkPackWriter(nil, nil, nil, al)
-	bw.prefetchIDs(new(SyncPack).WithFlush())
-
-	t.Run("normal_next", func(t *testing.T) {
-		id := bw.nextID()
-		assert.Equal(t, int64(0), id)
-	})
-	t.Run("id_exhausted", func(t *testing.T) {
-		assert.Panics(t, func() {
-			bw.nextID()
-		})
-	})
-}
 
 func TestBulkPackWriter_Write(t *testing.T) {
 	paramtable.Get().Init(paramtable.NewBaseTable())
@@ -149,10 +128,12 @@ func TestBulkPackWriter_Write(t *testing.T) {
 				FieldID: 100,
 				Binlogs: []*datapb.Binlog{
 					{
-						EntriesNum: 10,
-						LogPath:    "files/delta_log/123/456/789/10000",
-						LogSize:    60,
-						MemorySize: 240,
+						EntriesNum:    10,
+						TimestampFrom: 100,
+						TimestampTo:   109,
+						LogPath:       "files/delta_log/123/456/789/10000",
+						LogSize:       60,
+						MemorySize:    240,
 					},
 				},
 			},
@@ -186,4 +167,54 @@ func TestBulkPackWriter_Write(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBulkPackWriter_WriteLog_NonRetryableError(t *testing.T) {
+	paramtable.Get().Init(paramtable.NewBaseTable())
+
+	mc := metacache.NewMockMetaCache(t)
+	mc.EXPECT().Collection().Return(int64(1)).Maybe()
+
+	cm := mocks.NewChunkManager(t)
+	cm.EXPECT().RootPath().Return("files").Maybe()
+	// Return a permission-denied error — should NOT be retried
+	callCount := 0
+	cm.EXPECT().Write(mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(ctx context.Context, key string, data []byte) error {
+			callCount++
+			// Simulate MinIO AccessDenied — maps to ErrIoPermissionDenied via ToMilvusIoError
+			return minio.ErrorResponse{Code: "AccessDenied"}
+		})
+
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: common.RowIDField, DataType: schemapb.DataType_Int64},
+			{FieldID: common.TimeStampField, DataType: schemapb.DataType_Int64},
+			{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{
+				FieldID: 101, Name: "vec", DataType: schemapb.DataType_FloatVector,
+				TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "4"}},
+			},
+		},
+	}
+
+	bw := &BulkPackWriter{
+		metaCache:      mc,
+		schema:         schema,
+		chunkManager:   cm,
+		allocator:      allocator.NewLocalAllocator(10000, 100000),
+		writeRetryOpts: []retry.Option{retry.AttemptAlways(), retry.MaxSleepTime(10 * time.Second)},
+	}
+
+	// Use a timeout context so the test doesn't hang if retry loop is infinite
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	blob := &storage.Blob{Value: []byte("data"), RowNum: 1}
+	_, err := bw.writeLog(ctx, blob, "insert_log", "1/2/3/100/1", nil)
+	require.Error(t, err)
+	// Must stop after exactly 1 attempt — not retried
+	assert.Equal(t, 1, callCount, "non-retryable error should not be retried")
+	assert.True(t, merr.IsNonRetryableErr(err))
+	assert.True(t, errors.Is(err, merr.ErrIoPermissionDenied))
 }

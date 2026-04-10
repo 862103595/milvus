@@ -17,16 +17,32 @@
 #pragma once
 
 #include <fmt/core.h>
-#include <boost/variant.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "bitset/bitset.h"
+#include "bitset/common.h"
+#include "cachinglayer/CacheSlot.h"
 #include "common/EasyAssert.h"
 #include "common/OpContext.h"
+#include "common/Schema.h"
 #include "common/Types.h"
+#include "common/Utils.h"
 #include "common/Vector.h"
+#include "common/protobuf_utils.h"
 #include "common/type_c.h"
+#include "exec/expression/EvalCtx.h"
 #include "exec/expression/Expr.h"
-#include "segcore/SegmentInterface.h"
+#include "expr/ITypeExpr.h"
+#include "index/Index.h"
+#include "pb/plan.pb.h"
 #include "segcore/SegmentChunkReader.h"
+#include "segcore/SegmentInterface.h"
 
 namespace milvus {
 namespace exec {
@@ -221,7 +237,7 @@ class PhyCompareFilterExpr : public Expr {
     }
 
     std::string
-    ToString() const {
+    ToString() const override {
         return fmt::format("{}", expr_->ToString());
     }
 
@@ -233,6 +249,11 @@ class PhyCompareFilterExpr : public Expr {
     std::optional<milvus::expr::ColumnInfo>
     GetColumnInfo() const override {
         return std::nullopt;
+    }
+
+    bool
+    CanExecuteAllAtOnce() const override {
+        return false;
     }
 
  private:
@@ -269,7 +290,7 @@ class PhyCompareFilterExpr : public Expr {
                           OffsetVector* input,
                           TargetBitmapView res,
                           TargetBitmapView valid_res,
-                          ValTypes... values) {
+                          const ValTypes&... values) {
         if (segment_chunk_reader_.segment_->is_chunked()) {
             return ProcessBothDataChunksForMultipleChunk<T,
                                                          U,
@@ -288,10 +309,9 @@ class PhyCompareFilterExpr : public Expr {
                              OffsetVector* input,
                              TargetBitmapView res,
                              TargetBitmapView valid_res,
-                             ValTypes... values) {
+                             const ValTypes&... values) {
         int64_t size = input->size();
         int64_t processed_size = 0;
-        const auto size_per_chunk = segment_chunk_reader_.SizePerChunk();
         if (segment_chunk_reader_.segment_->is_chunked() ||
             segment_chunk_reader_.segment_->type() == SegmentType::Growing) {
             for (auto i = 0; i < size; ++i) {
@@ -380,7 +400,7 @@ class PhyCompareFilterExpr : public Expr {
     ProcessBothDataChunksForSingleChunk(FUNC func,
                                         TargetBitmapView res,
                                         TargetBitmapView valid_res,
-                                        ValTypes... values) {
+                                        const ValTypes&... values) {
         int64_t processed_size = 0;
 
         const auto active_count = segment_chunk_reader_.active_count_;
@@ -450,7 +470,7 @@ class PhyCompareFilterExpr : public Expr {
     ProcessBothDataChunksForMultipleChunk(FUNC func,
                                           TargetBitmapView res,
                                           TargetBitmapView valid_res,
-                                          ValTypes... values) {
+                                          const ValTypes&... values) {
         int64_t processed_size = 0;
 
         // only call this function when left and right are not indexed, so they have the same number of chunks

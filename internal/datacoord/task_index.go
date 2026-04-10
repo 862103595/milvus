@@ -31,6 +31,7 @@ import (
 	globalTask "github.com/milvus-io/milvus/internal/datacoord/task"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/segmentutil"
 	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
@@ -168,8 +169,19 @@ func (it *indexBuildTask) CreateTaskOnWorker(nodeID int64, cluster session.Clust
 	// Handle special cases for certain index types or small segments
 	indexParams := it.meta.indexMeta.GetIndexParams(segIndex.CollectionID, segIndex.IndexID)
 	indexType := GetIndexType(indexParams)
-	if isNoTrainIndex(indexType) || segIndex.NumRows < Params.DataCoordCfg.MinSegmentNumRowsToEnableIndex.GetAsInt64() {
-		log.Info("segment does not need index really, marking as finished", zap.Int64("numRows", segIndex.NumRows))
+	effectiveRows := segIndex.NumRows
+	if fieldID := it.meta.indexMeta.GetFieldIDByIndexID(segIndex.CollectionID, segIndex.IndexID); fieldID > 0 {
+		if collectionInfo, err := it.handler.GetCollection(ctx, segIndex.CollectionID); err == nil {
+			for _, f := range typeutil.GetAllFieldSchemas(collectionInfo.Schema) {
+				if f.FieldID == fieldID && f.GetNullable() && typeutil.IsVectorType(f.GetDataType()) {
+					effectiveRows = segmentutil.CalcValidRowCountFromFieldBinLog(segment.SegmentInfo, fieldID)
+					break
+				}
+			}
+		}
+	}
+	if isNoTrainIndex(indexType) || effectiveRows < Params.DataCoordCfg.MinSegmentNumRowsToEnableIndex.GetAsInt64() {
+		log.Info("segment does not need index really, marking as finished", zap.Int64("numRows", segIndex.NumRows), zap.Int64("effectiveRows", effectiveRows))
 		now := time.Now()
 		it.SetTaskTime(taskcommon.TimeStart, now)
 		it.SetTaskTime(taskcommon.TimeEnd, now)
@@ -288,17 +300,8 @@ func (it *indexBuildTask) prepareJobRequest(ctx context.Context, segment *Segmen
 		Value: indexNonEncoding,
 	})
 
-	currentVecIndexVersion := it.indexEngineVersionManager.GetCurrentIndexEngineVersion()
-	// if specify target vec index version, use it with high priority
-	if Params.DataCoordCfg.TargetVecIndexVersion.GetAsInt64() != -1 {
-		// if force rebuild segment index is true, use target vec index version directly
-		if Params.DataCoordCfg.ForceRebuildSegmentIndex.GetAsBool() {
-			currentVecIndexVersion = Params.DataCoordCfg.TargetVecIndexVersion.GetAsInt32()
-		} else {
-			// if force rebuild segment index is not enabled, use newer index version between current index version and target index version
-			currentVecIndexVersion = max(currentVecIndexVersion, Params.DataCoordCfg.TargetVecIndexVersion.GetAsInt32())
-		}
-	}
+	currentVecIndexVersion := it.indexEngineVersionManager.ResolveVecIndexVersion()
+	currentScalarIndexVersion := it.indexEngineVersionManager.ResolveScalarIndexVersion()
 
 	// Create the job request
 	req := &workerpb.CreateJobRequest{
@@ -311,7 +314,7 @@ func (it *indexBuildTask) prepareJobRequest(ctx context.Context, segment *Segmen
 		TypeParams:                typeParams,
 		NumRows:                   segIndex.NumRows,
 		CurrentIndexVersion:       currentVecIndexVersion,
-		CurrentScalarIndexVersion: it.indexEngineVersionManager.GetCurrentScalarIndexEngineVersion(),
+		CurrentScalarIndexVersion: currentScalarIndexVersion,
 		CollectionID:              segment.GetCollectionID(),
 		PartitionID:               segment.GetPartitionID(),
 		SegmentID:                 segment.GetID(),
@@ -327,6 +330,7 @@ func (it *indexBuildTask) prepareJobRequest(ctx context.Context, segment *Segmen
 		TaskSlot:                  it.taskSlot,
 		LackBinlogRows:            segIndex.NumRows - totalRows,
 		InsertLogs:                segment.GetBinlogs(),
+		Manifest:                  segment.GetManifestPath(),
 	}
 
 	WrapPluginContext(segment.GetCollectionID(), schema.GetProperties(), req)

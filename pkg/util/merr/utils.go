@@ -64,6 +64,38 @@ func IsRetryableErr(err error) bool {
 	return false
 }
 
+// IsNonRetryableErr checks if an error is non-retryable (denylist approach).
+// Returns true for permanent errors (resource not found, permission denied)
+// and client validation errors (invalid argument, invalid range).
+// All other errors are considered retryable (including nil).
+func IsNonRetryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Permanent errors - resource doesn't exist or access denied
+	if errors.Is(err, ErrIoKeyNotFound) ||
+		errors.Is(err, ErrIoPermissionDenied) ||
+		errors.Is(err, ErrIoBucketNotFound) ||
+		errors.Is(err, ErrIoInvalidCredentials) {
+		return true
+	}
+
+	// Client validation errors - request is malformed
+	if errors.Is(err, ErrIoInvalidArgument) ||
+		errors.Is(err, ErrIoInvalidRange) ||
+		errors.Is(err, ErrIoEntityTooLarge) {
+		return true
+	}
+
+	return false
+}
+
+func IsMilvusError(err error) bool {
+	var me milvusError
+	return errors.As(err, &me)
+}
+
 func IsCanceledOrTimeout(err error) bool {
 	return errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
 }
@@ -320,10 +352,6 @@ func WrapErrAsInputErrorWhen(err error, targets ...milvusError) error {
 		}
 	}
 	return err
-}
-
-func WrapErrCollectionReplicateMode(operation string) error {
-	return wrapFields(ErrCollectionReplicateMode, value("operation", operation))
 }
 
 func GetErrorType(err error) ErrorType {
@@ -759,6 +787,24 @@ func WrapErrSegmentLoadFailed(id int64, msg ...string) error {
 	return err
 }
 
+// WrapErrSegmentRequestResourceFailed creates a resource exhaustion error for segment loading.
+// resourceType should be one of: "Memory", "Disk", "GPU".
+// This error triggers the query coordinator to mark the node as resource exhausted,
+// applying a penalty period controlled by queryCoord.resourceExhaustionPenaltyDuration.
+func WrapErrSegmentRequestResourceFailed(
+	resourceType string,
+	msg ...string,
+) error {
+	err := wrapFields(ErrSegmentRequestResourceFailed,
+		value("resourceType", resourceType),
+	)
+
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
 func WrapErrSegmentNotLoaded(id int64, msg ...string) error {
 	err := wrapFields(ErrSegmentNotLoaded, value("segment", id))
 	if len(msg) > 0 {
@@ -924,6 +970,55 @@ func WrapErrIoUnexpectEOF(key string, err error) error {
 		return nil
 	}
 	return wrapFieldsWithDesc(ErrIoUnexpectEOF, err.Error(), value("key", key))
+}
+
+func WrapErrIoTooManyRequests(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoTooManyRequests, err.Error(), value("key", key))
+}
+
+func WrapErrIoPermissionDenied(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoPermissionDenied, err.Error(), value("key", key))
+}
+
+func WrapErrIoBucketNotFound(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoBucketNotFound, err.Error(), value("key", key))
+}
+
+func WrapErrIoInvalidCredentials(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoInvalidCredentials, err.Error(), value("key", key))
+}
+
+func WrapErrIoInvalidArgument(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoInvalidArgument, err.Error(), value("key", key))
+}
+
+func WrapErrIoInvalidRange(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoInvalidRange, err.Error(), value("key", key))
+}
+
+func WrapErrIoEntityTooLarge(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoEntityTooLarge, err.Error(), value("key", key))
 }
 
 // Parameter related
@@ -1119,6 +1214,12 @@ func WrapErrInconsistentRequery(msg ...string) error {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
+}
+
+func WrapErrKMSKeyRevoked(dbID int64, reason string) error {
+	return wrapFields(ErrKMSKeyRevoked,
+		value("dbID", dbID),
+		value("reason", reason))
 }
 
 func WrapErrCompactionReadDeltaLogErr(msg ...string) error {

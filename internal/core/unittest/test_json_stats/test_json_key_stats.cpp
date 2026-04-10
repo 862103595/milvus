@@ -9,24 +9,51 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <boost/filesystem/operations.hpp>
+#include <fmt/core.h>
+#include <folly/FBVector.h>
 #include <gtest/gtest.h>
-#include <functional>
-#include <boost/filesystem.hpp>
-#include <unordered_set>
+#include <nlohmann/json.hpp>
+#include <simdjson.h>
+#include <stddef.h>
+#include <cstdint>
+#include <iostream>
 #include <memory>
 #include <random>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "bitset/bitset.h"
+#include "cachinglayer/CacheSlot.h"
+#include "common/Consts.h"
+#include "common/FieldDataInterface.h"
+#include "common/Json.h"
 #include "common/Tracer.h"
-#include "index/BitmapIndex.h"
-#include "milvus-storage/filesystem/fs.h"
-#include "storage/Util.h"
-#include "storage/InsertData.h"
-#include "indexbuilder/IndexFactory.h"
-#include "index/IndexFactory.h"
+#include "common/TracerBase.h"
+#include "common/Types.h"
+#include "common/bson_view.h"
+#include "common/protobuf_utils.h"
+#include "gtest/gtest.h"
+#include "index/IndexInfo.h"
+#include "index/IndexStats.h"
 #include "index/Meta.h"
 #include "index/json_stats/JsonKeyStats.h"
-#include "common/Json.h"
-#include "common/Types.h"
+#include "index/json_stats/bson_inverted.h"
+#include "index/json_stats/utils.h"
+#include "indexbuilder/IndexCreatorBase.h"
+#include "pb/common.pb.h"
+#include "pb/schema.pb.h"
+#include "simdjson/padded_string.h"
+#include "storage/ChunkManager.h"
+#include "storage/FileManager.h"
+#include "storage/InsertData.h"
+#include "storage/PayloadReader.h"
+#include "storage/ThreadPools.h"
+#include "storage/Types.h"
+#include "storage/Util.h"
+#include "test_utils/Constants.h"
 
 using namespace milvus::index;
 using namespace milvus::indexbuilder;
@@ -85,7 +112,7 @@ class JsonKeyStatsTest : public ::testing::TestWithParam<bool> {
         auto index_meta = storage::IndexMeta{
             segment_id, field_id, index_build_id, index_version};
 
-        data_ = std::move(GenerateJsons(size));
+        data_ = GenerateJsons(size);
         auto field_data =
             storage::CreateFieldData(DataType::JSON, DataType::NONE, nullable_);
         if (nullable_) {
@@ -126,7 +153,7 @@ class JsonKeyStatsTest : public ::testing::TestWithParam<bool> {
         auto serialized_bytes = insert_data.Serialize(storage::Remote);
 
         auto log_path = fmt::format("/{}/{}/{}/{}/{}/{}",
-                                    "/tmp/test-jsonkey-stats/",
+                                    TestLocalPath,
                                     collection_id,
                                     partition_id,
                                     segment_id,
@@ -157,8 +184,15 @@ class JsonKeyStatsTest : public ::testing::TestWithParam<bool> {
         config[milvus::LOAD_PRIORITY] =
             milvus::proto::common::LoadPriority::HIGH;
         config[milvus::index::ENABLE_MMAP] = true;
-        config[milvus::index::MMAP_FILE_PATH] =
-            "/tmp/test-jsonkey-stats/mmap-file";
+        config[milvus::index::MMAP_FILE_PATH] = TestLocalPath + "mmap-file";
+        config[STATS_BASE_PATH_KEY] =
+            storage::GenRemoteJsonStatsPathPrefix(chunk_manager_,
+                                                  index_build_id,
+                                                  index_version,
+                                                  collection_id,
+                                                  partition_id,
+                                                  segment_id,
+                                                  field_id);
         index_ = std::make_shared<JsonKeyStats>(ctx, true);
         index_->Load(milvus::tracer::TraceContext{}, config);
     }
@@ -170,35 +204,28 @@ class JsonKeyStatsTest : public ::testing::TestWithParam<bool> {
         int64_t collection_id = 1;
         int64_t partition_id = 2;
         int64_t segment_id = 3;
-        int64_t field_id = 101;
+        field_id_ = 101;
         int64_t index_build_id = GenerateRandomInt64(1, 100000);
         int64_t index_version = 1;
         size_ = 1000;  // Use a larger size for better testing
-        std::string root_path = "/tmp/test-jsonkey-stats/";
-
         storage::StorageConfig storage_config;
         storage_config.storage_type = "local";
-        storage_config.root_path = root_path;
+        storage_config.root_path = TestLocalPath;
         chunk_manager_ = storage::CreateChunkManager(storage_config);
 
-        auto conf = milvus_storage::ArrowFileSystemConfig();
-        conf.storage_type = "local";
-        conf.root_path = "/tmp/test-jsonkey-stats/arrow-fs";
-        milvus_storage::ArrowFileSystemSingleton::GetInstance().Init(conf);
         fs_ = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                   .GetArrowFileSystem();
 
         Init(collection_id,
              partition_id,
              segment_id,
-             field_id,
+             field_id_,
              index_build_id,
              index_version,
              size_);
     }
 
     virtual ~JsonKeyStatsTest() override {
-        boost::filesystem::remove_all(chunk_manager_->GetRootPath());
     }
 
  public:
@@ -206,6 +233,7 @@ class JsonKeyStatsTest : public ::testing::TestWithParam<bool> {
     DataType type_;
     bool nullable_;
     size_t size_;
+    int64_t field_id_;
     FixedVector<bool> valid_data;
     std::vector<milvus::Json> data_;
     std::vector<std::string> json_col;
@@ -231,25 +259,13 @@ TEST_P(JsonKeyStatsTest, TestBasicOperations) {
 TEST_P(JsonKeyStatsTest, TestExecuteForSharedData) {
     std::string path = "/int_shared";
     int count = 0;
+    PinWrapper<BsonInvertedIndex*> bson_index{nullptr};
     index_->ExecuteForSharedData(
-        nullptr, path, [&](BsonView bson, uint32_t row_id, uint32_t offset) {
-            count++;
-        });
+        nullptr,
+        bson_index,
+        path,
+        [&](BsonView bson, uint32_t row_id, uint32_t offset) { count++; });
     std::cout << "count: " << count << std::endl;
-    if (nullable_) {
-        EXPECT_EQ(count, 100);
-    } else {
-        EXPECT_EQ(count, 200);
-    }
-}
-
-TEST_P(JsonKeyStatsTest, TestExecuteExistsPathForSharedData) {
-    std::string path = "/int_shared";
-    TargetBitmap bitset(size_);
-    TargetBitmapView bitset_view(bitset);
-    index_->ExecuteExistsPathForSharedData(path, bitset_view);
-    std::cout << "bitset.count(): " << bitset.count() << std::endl;
-    auto count = bitset.count();
     if (nullable_) {
         EXPECT_EQ(count, 100);
     } else {
@@ -267,10 +283,15 @@ TEST_P(JsonKeyStatsTest, TestExecutorForGettingValid) {
             index_->ExecutorForGettingValid(nullptr, field, valid_res_view);
         EXPECT_EQ(processed_size, size_);
     }
-    if (!index_->CanSkipShared(path)) {
-        std::cout << "can not skip shared" << std::endl;
-        index_->ExecuteExistsPathForSharedData(path, valid_res_view);
-    }
+    std::cout << "can not skip shared" << std::endl;
+    PinWrapper<BsonInvertedIndex*> bson_index{nullptr};
+    index_->ExecuteForSharedData(
+        nullptr,
+        bson_index,
+        path,
+        [&](BsonView bson, uint32_t row_id, uint32_t offset) {
+            valid_res[row_id] = true;
+        });
     std::cout << "valid_res.count(): " << valid_res.count() << std::endl;
     if (nullable_) {
         EXPECT_EQ(valid_res.count(), 400);
@@ -323,15 +344,6 @@ TEST_P(JsonKeyStatsTest, TestGetShreddingFields) {
     EXPECT_FALSE(typed_fields.empty());
 }
 
-TEST_P(JsonKeyStatsTest, TestCanSkipShared) {
-    std::string path = "/int";
-    std::set<JSONType> target_types = {JSONType::INT64};
-    EXPECT_TRUE(index_->CanSkipShared(path, target_types));
-
-    target_types = {JSONType::STRING};
-    EXPECT_TRUE(index_->CanSkipShared(path, target_types));
-}
-
 class JsonKeyStatsUploadLoadTest : public ::testing::Test {
  protected:
     void
@@ -342,24 +354,19 @@ class JsonKeyStatsUploadLoadTest : public ::testing::Test {
         field_id_ = 101;
         index_build_id_ = GenerateRandomInt64(1, 100000);
         index_version_ = 10000;
-        root_path_ = "/tmp/test-jsonkey-stats-upload-load/";
+        root_path_ = TestLocalPath;
 
         storage::StorageConfig storage_config;
         storage_config.storage_type = "local";
         storage_config.root_path = root_path_;
         chunk_manager_ = storage::CreateChunkManager(storage_config);
 
-        auto conf = milvus_storage::ArrowFileSystemConfig();
-        conf.storage_type = "local";
-        conf.root_path = "/tmp/test-jsonkey-stats-upload-load/arrow-fs";
-        milvus_storage::ArrowFileSystemSingleton::GetInstance().Init(conf);
         fs_ = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                   .GetArrowFileSystem();
     }
 
     void
     TearDown() override {
-        boost::filesystem::remove_all(chunk_manager_->GetRootPath());
     }
 
     void
@@ -432,10 +439,17 @@ class JsonKeyStatsUploadLoadTest : public ::testing::Test {
         Config config;
         config["index_files"] = index_files_;
         config[milvus::index::ENABLE_MMAP] = true;
-        config[milvus::index::MMAP_FILE_PATH] =
-            "/tmp/test-jsonkey-stats-upload-load/mmap-file";
+        config[milvus::index::MMAP_FILE_PATH] = TestLocalPath + "mmap-file";
         config[milvus::LOAD_PRIORITY] =
             milvus::proto::common::LoadPriority::HIGH;
+        config[STATS_BASE_PATH_KEY] =
+            storage::GenRemoteJsonStatsPathPrefix(chunk_manager_,
+                                                  index_build_id_,
+                                                  index_version_,
+                                                  collection_id_,
+                                                  partition_id_,
+                                                  segment_id_,
+                                                  field_id_);
         load_index_ = std::make_shared<JsonKeyStats>(ctx, true);
         load_index_->Load(milvus::tracer::TraceContext{}, config);
     }
@@ -451,7 +465,14 @@ class JsonKeyStatsUploadLoadTest : public ::testing::Test {
     VerifyPathInShared(const std::string& path) {
         TargetBitmap bitset(data_.size());
         TargetBitmapView bitset_view(bitset);
-        load_index_->ExecuteExistsPathForSharedData(path, bitset_view);
+        PinWrapper<BsonInvertedIndex*> bson_index{nullptr};
+        load_index_->ExecuteForSharedData(
+            nullptr,
+            bson_index,
+            path,
+            [&](BsonView bson, uint32_t row_id, uint32_t offset) {
+                bitset[row_id] = true;
+            });
         EXPECT_GT(bitset.size(), 0);
     }
 
@@ -570,4 +591,182 @@ TEST_F(JsonKeyStatsUploadLoadTest, TestComplexJson) {
     VerifyJsonType("/user/address/city_STRING", JSONType::STRING);
     VerifyJsonType("/user/address/zip_INT64", JSONType::INT64);
     VerifyJsonType("/timestamp_INT64", JSONType::INT64);
+}
+
+// Test that meta.json file is created and contains correct metadata
+TEST_F(JsonKeyStatsUploadLoadTest, TestMetaFileCreation) {
+    std::vector<std::string> json_strings = {
+        R"({"int": 1, "string": "test1"})",
+        R"({"int": 2, "string": "test2"})",
+        R"({"int": 3, "string": "test3"})"};
+
+    InitContext();
+    PrepareData(json_strings);
+    BuildAndUpload();
+
+    // Verify meta.json is in the index files
+    bool meta_file_found = false;
+    for (const auto& file : index_files_) {
+        if (file.find(JSON_STATS_META_FILE_NAME) != std::string::npos &&
+            file.find(JSON_STATS_SHARED_INDEX_PATH) == std::string::npos &&
+            file.find(JSON_STATS_SHREDDING_DATA_PATH) == std::string::npos) {
+            meta_file_found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(meta_file_found) << "meta.json should be in index files";
+
+    // Load and verify
+    Load();
+    VerifyBasicOperations();
+    VerifyPathInShredding("/int");
+    VerifyPathInShredding("/string");
+}
+
+// Test full pipeline: build -> upload -> load -> query
+TEST_F(JsonKeyStatsUploadLoadTest, TestFullPipelineWithMetaFile) {
+    std::vector<std::string> json_strings;
+    // Generate more data for a comprehensive test
+    for (int i = 0; i < 100; i++) {
+        json_strings.push_back(fmt::format(
+            R"({{"id": {}, "name": "user_{}", "score": {}, "active": {}}})",
+            i,
+            i,
+            i * 1.5,
+            i % 2 == 0 ? "true" : "false"));
+    }
+
+    InitContext();
+    PrepareData(json_strings);
+    BuildAndUpload();
+
+    // Verify index files structure
+    bool has_meta = false;
+    bool has_shredding = false;
+    bool has_shared_index = false;
+    for (const auto& file : index_files_) {
+        if (file.find(JSON_STATS_META_FILE_NAME) != std::string::npos &&
+            file.find(JSON_STATS_SHARED_INDEX_PATH) == std::string::npos &&
+            file.find(JSON_STATS_SHREDDING_DATA_PATH) == std::string::npos) {
+            has_meta = true;
+        }
+        if (file.find(JSON_STATS_SHREDDING_DATA_PATH) != std::string::npos) {
+            has_shredding = true;
+        }
+        if (file.find(JSON_STATS_SHARED_INDEX_PATH) != std::string::npos) {
+            has_shared_index = true;
+        }
+    }
+    EXPECT_TRUE(has_meta) << "Should have meta.json file";
+    EXPECT_TRUE(has_shredding) << "Should have shredding data files";
+    EXPECT_TRUE(has_shared_index) << "Should have shared key index files";
+
+    // Load and verify
+    Load();
+
+    // Verify count
+    EXPECT_EQ(load_index_->Count(), 100);
+
+    // Verify shredding fields exist
+    auto id_fields = load_index_->GetShreddingFields("/id");
+    EXPECT_FALSE(id_fields.empty());
+
+    auto name_fields = load_index_->GetShreddingFields("/name");
+    EXPECT_FALSE(name_fields.empty());
+
+    auto score_fields = load_index_->GetShreddingFields("/score");
+    EXPECT_FALSE(score_fields.empty());
+
+    auto active_fields = load_index_->GetShreddingFields("/active");
+    EXPECT_FALSE(active_fields.empty());
+
+    // Verify types
+    VerifyJsonType("/id_INT64", JSONType::INT64);
+    VerifyJsonType("/name_STRING", JSONType::STRING);
+    VerifyJsonType("/score_DOUBLE", JSONType::DOUBLE);
+    VerifyJsonType("/active_BOOL", JSONType::BOOL);
+}
+
+// Test backward compatibility: load data without meta.json
+// This simulates old format where metadata was stored in parquet files.
+// Note: Since new code doesn't write metadata to parquet anymore, this test
+// verifies that the loading code path handles missing meta.json gracefully
+// and falls back to reading from parquet (even if parquet metadata is empty).
+TEST_F(JsonKeyStatsUploadLoadTest, TestLoadWithoutMetaFile) {
+    std::vector<std::string> json_strings = {
+        R"({"int": 1, "string": "test1"})",
+        R"({"int": 2, "string": "test2"})",
+        R"({"int": 3, "string": "test3"})"};
+
+    InitContext();
+    PrepareData(json_strings);
+    BuildAndUpload();
+
+    // Remove meta.json from index_files to simulate old format
+    std::vector<std::string> index_files_without_meta;
+    for (const auto& file : index_files_) {
+        if (file.find(JSON_STATS_META_FILE_NAME) == std::string::npos ||
+            file.find(JSON_STATS_SHARED_INDEX_PATH) != std::string::npos ||
+            file.find(JSON_STATS_SHREDDING_DATA_PATH) != std::string::npos) {
+            index_files_without_meta.push_back(file);
+        }
+    }
+
+    // Verify we actually removed the meta file
+    EXPECT_LT(index_files_without_meta.size(), index_files_.size());
+
+    // Replace index_files_ with version without meta
+    index_files_ = index_files_without_meta;
+
+    // Load should still work - it will try to read from parquet metadata
+    // (which is empty in new format, but the code path should not crash)
+    Load();
+
+    // Basic operations should still work
+    EXPECT_EQ(load_index_->Count(), data_.size());
+    EXPECT_EQ(load_index_->Size(), data_.size());
+
+    // Note: GetShreddingFields may return empty because key_field_map_ is empty
+    // when both meta.json and parquet metadata are missing/empty.
+    // This is expected behavior for backward compatibility path.
+}
+
+// Test that multiple build-upload-load cycles work correctly
+TEST_F(JsonKeyStatsUploadLoadTest, TestMultipleBuildCycles) {
+    // First cycle
+    {
+        std::vector<std::string> json_strings = {R"({"a": 1, "b": "test1"})",
+                                                 R"({"a": 2, "b": "test2"})"};
+
+        InitContext();
+        PrepareData(json_strings);
+        BuildAndUpload();
+        Load();
+
+        EXPECT_EQ(load_index_->Count(), 2);
+        VerifyPathInShredding("/a");
+        VerifyPathInShredding("/b");
+    }
+
+    // Clean up for second cycle
+    boost::filesystem::remove_all(chunk_manager_->GetRootPath());
+
+    // Second cycle with different schema
+    {
+        index_build_id_ = GenerateRandomInt64(1, 100000);  // New build id
+        std::vector<std::string> json_strings = {
+            R"({"x": 100, "y": 200, "z": "data1"})",
+            R"({"x": 101, "y": 201, "z": "data2"})",
+            R"({"x": 102, "y": 202, "z": "data3"})"};
+
+        InitContext();
+        PrepareData(json_strings);
+        BuildAndUpload();
+        Load();
+
+        EXPECT_EQ(load_index_->Count(), 3);
+        VerifyPathInShredding("/x");
+        VerifyPathInShredding("/y");
+        VerifyPathInShredding("/z");
+    }
 }

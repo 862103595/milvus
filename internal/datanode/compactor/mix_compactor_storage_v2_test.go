@@ -56,20 +56,22 @@ type MixCompactionTaskStorageV2Suite struct {
 }
 
 func (s *MixCompactionTaskStorageV2Suite) SetupTest() {
-	s.setupTest()
-	paramtable.Get().Save("common.storageType", "local")
-	paramtable.Get().Save("common.storage.enableV2", "true")
+	paramtable.Get().Save(paramtable.Get().CommonCfg.StorageType.Key, "local")
+	paramtable.Get().Save(paramtable.Get().CommonCfg.UseLoonFFI.Key, "false")
+	paramtable.Get().Save(paramtable.Get().LocalStorageCfg.Path.Key, s.T().TempDir())
 	initcore.InitStorageV2FileSystem(paramtable.Get())
+	s.setupTest()
 	s.task.compactionParams = compaction.GenParams()
 }
 
 func (s *MixCompactionTaskStorageV2Suite) TearDownTest() {
-	paramtable.Get().Reset(paramtable.Get().CommonCfg.EntityExpirationTTL.Key)
-	paramtable.Get().Reset("common.storageType")
-	paramtable.Get().Reset("common.storage.enableV2")
+	paramtable.Get().Reset(paramtable.Get().CommonCfg.StorageType.Key)
+	paramtable.Get().Reset(paramtable.Get().CommonCfg.UseLoonFFI.Key)
+	paramtable.Get().Reset(paramtable.Get().LocalStorageCfg.Path.Key)
 	os.RemoveAll(paramtable.Get().LocalStorageCfg.Path.GetValue() + "insert_log")
 	os.RemoveAll(paramtable.Get().LocalStorageCfg.Path.GetValue() + "delta_log")
 	os.RemoveAll(paramtable.Get().LocalStorageCfg.Path.GetValue() + "stats_log")
+	initcore.CleanArrowFileSystemSingleton()
 }
 
 func (s *MixCompactionTaskStorageV2Suite) TestCompactDupPK() {
@@ -121,7 +123,7 @@ func (s *MixCompactionTaskStorageV2Suite) TestCompactDupPK_MixToV2Format() {
 
 	v2Segments := []int64{10, 11}
 	for _, segID := range v2Segments {
-		binlogs, _, _, _, _, err := s.initStorageV2Segments(1, segID, alloc)
+		binlogs, _, _, _, _, _, err := s.initStorageV2Segments(1, segID, alloc)
 		s.NoError(err)
 		s.task.plan.SegmentBinlogs = append(s.task.plan.SegmentBinlogs, &datapb.CompactionSegmentBinlogs{
 			CollectionID:   1,
@@ -156,7 +158,7 @@ func (s *MixCompactionTaskStorageV2Suite) TestCompactDupPK_V2ToV2Format() {
 
 	v2Segments := []int64{10, 11}
 	for _, segID := range v2Segments {
-		binlogs, _, _, _, _, err := s.initStorageV2Segments(1, segID, alloc)
+		binlogs, _, _, _, _, _, err := s.initStorageV2Segments(1, segID, alloc)
 		s.NoError(err)
 		s.task.plan.SegmentBinlogs = append(s.task.plan.SegmentBinlogs, &datapb.CompactionSegmentBinlogs{
 			CollectionID:   1,
@@ -178,43 +180,6 @@ func (s *MixCompactionTaskStorageV2Suite) TestCompactDupPK_V2ToV2Format() {
 	s.EqualValues(19531, segment.GetSegmentID())
 	s.EqualValues(2, segment.GetNumOfRows())
 	s.NotEmpty(segment.InsertLogs)
-	s.NotEmpty(segment.Field2StatslogPaths)
-	s.Empty(segment.Deltalogs)
-}
-
-func (s *MixCompactionTaskStorageV2Suite) TestCompactDupPK_V2ToV1Format() {
-	paramtable.Get().Save("common.storage.enableV2", "false")
-	s.task.compactionParams = compaction.GenParams()
-	s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(nil)
-	alloc := allocator.NewLocalAllocator(7777777, math.MaxInt64)
-
-	s.task.plan.SegmentBinlogs = make([]*datapb.CompactionSegmentBinlogs, 0)
-
-	v2Segments := []int64{10, 11}
-	for _, segID := range v2Segments {
-		binlogs, _, _, _, _, err := s.initStorageV2Segments(1, segID, alloc)
-		s.NoError(err)
-		s.task.plan.SegmentBinlogs = append(s.task.plan.SegmentBinlogs, &datapb.CompactionSegmentBinlogs{
-			CollectionID:   1,
-			SegmentID:      segID,
-			FieldBinlogs:   storage.SortFieldBinlogs(binlogs),
-			Deltalogs:      []*datapb.FieldBinlog{},
-			StorageVersion: storage.StorageV2,
-		})
-	}
-
-	result, err := s.task.Compact()
-	s.NoError(err)
-	s.NotNil(result)
-
-	s.Equal(s.task.plan.GetPlanID(), result.GetPlanID())
-	s.Equal(1, len(result.GetSegments()))
-
-	segment := result.GetSegments()[0]
-	s.EqualValues(19531, segment.GetSegmentID())
-	s.EqualValues(2, segment.GetNumOfRows())
-	// each field has only one insert log for storage v1
-	s.EqualValues(len(s.task.plan.Schema.Fields), len(segment.GetInsertLogs()))
 	s.NotEmpty(segment.Field2StatslogPaths)
 	s.Empty(segment.Deltalogs)
 }
@@ -307,6 +272,7 @@ func (s *MixCompactionTaskStorageV2Suite) initStorageV2Segments(rows int, seed i
 	deltas *datapb.FieldBinlog,
 	stats map[int64]*datapb.FieldBinlog,
 	bm25Stats map[int64]*datapb.FieldBinlog,
+	manifest string,
 	size int64,
 	err error,
 ) {

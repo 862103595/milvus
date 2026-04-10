@@ -11,11 +11,15 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <memory>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 
-#include "common/Schema.h"
 #include "common/IndexMeta.h"
+#include "common/Schema.h"
+#include "pb/schema.pb.h"
 
 namespace milvus::segcore {
 
@@ -36,16 +40,38 @@ class Collection {
  public:
     SchemaPtr
     get_schema() {
+        std::shared_lock lock(schema_mutex_);
         return schema_;
     }
 
-    IndexMetaPtr&
+    uint64_t
+    get_schema_version() {
+        std::shared_lock lock(schema_mutex_);
+        return schema_->get_schema_version();
+    }
+
+    void
+    set_schema(SchemaPtr& new_schema) {
+        std::unique_lock lock(schema_mutex_);
+        auto old_schema = schema_;
+        if (new_schema->get_schema_version() > schema_->get_schema_version()) {
+            schema_ = new_schema;
+        }
+
+        if (old_schema) {
+            schema_->UpdateLoadFields(old_schema->load_fields());
+        }
+    }
+
+    IndexMetaPtr
     get_index_meta() {
+        std::shared_lock lock(index_meta_mutex_);
         return index_meta_;
     }
 
     void
     set_index_meta(const IndexMetaPtr index_meta) {
+        std::unique_lock lock(index_meta_mutex_);
         index_meta_ = index_meta;
     }
 
@@ -57,7 +83,9 @@ class Collection {
  private:
     std::string collection_name_;
     SchemaPtr schema_;
+    std::shared_mutex schema_mutex_;
     IndexMetaPtr index_meta_;
+    std::shared_mutex index_meta_mutex_;
 };
 
 using CollectionPtr = std::unique_ptr<Collection>;

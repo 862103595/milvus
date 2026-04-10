@@ -16,18 +16,45 @@
 
 #include "index/VectorDiskIndex.h"
 
+#include <math.h>
+#include <string.h>
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <iosfwd>
+#include <optional>
+#include <stdexcept>
+#include <string>
+
+#include "common/Consts.h"
+#include "common/OffsetMapping.h"
+#include "common/QueryInfo.h"
+#include "common/QueryResult.h"
+#include "common/RangeSearchHelper.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "common/Utils.h"
-#include "config/ConfigKnowhere.h"
+#include "common/protobuf_utils.h"
+#include "filemanager/FileManager.h"
+#include "fmt/core.h"
+#include "glog/logging.h"
 #include "index/Meta.h"
 #include "index/Utils.h"
+#include "knowhere/binaryset.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
+#include "knowhere/index/index_factory.h"
+#include "log/Log.h"
+#include "nlohmann/json.hpp"
+#include "opentelemetry/trace/span.h"
+#include "opentelemetry/trace/tracer.h"
+#include "pb/common.pb.h"
+#include "storage/LocalChunkManager.h"
 #include "storage/LocalChunkManagerSingleton.h"
+#include "storage/ThreadPools.h"
+#include "storage/Types.h"
 #include "storage/Util.h"
-#include "common/Consts.h"
-#include "common/RangeSearchHelper.h"
-#include "indexbuilder/types.h"
-#include "filemanager/FileManager.h"
 
 namespace milvus::index {
 
@@ -92,8 +119,10 @@ VectorDiskAnnIndex<T>::Load(milvus::tracer::TraceContext ctx,
     {
         auto read_file_span =
             milvus::tracer::StartSpan("SegCoreReadDiskIndexFile", &ctx);
+        opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>
+            read_file_nostd_span(read_file_span);
         auto read_scope =
-            milvus::tracer::GetTracer()->WithActiveSpan(read_file_span);
+            opentelemetry::trace::Tracer::WithActiveSpan(read_file_nostd_span);
         auto index_files =
             GetValueFromConfig<std::vector<std::string>>(config, "index_files");
         AssertInfo(index_files.has_value(),
@@ -112,13 +141,35 @@ VectorDiskAnnIndex<T>::Load(milvus::tracer::TraceContext ctx,
     // start engine load index span
     auto span_load_engine =
         milvus::tracer::StartSpan("SegCoreEngineLoadDiskIndex", &ctx);
+    opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>
+        nostd_span_load_engine(span_load_engine);
     auto engine_scope =
-        milvus::tracer::GetTracer()->WithActiveSpan(span_load_engine);
+        opentelemetry::trace::Tracer::WithActiveSpan(nostd_span_load_engine);
     auto stat = index_.Deserialize(knowhere::BinarySet(), load_config);
     if (stat != knowhere::Status::success)
         ThrowInfo(ErrorCode::UnexpectedError,
                   "failed to Deserialize index, " + KnowhereStatusString(stat));
     span_load_engine->End();
+
+    auto local_chunk_manager =
+        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
+
+    auto valid_data_path = local_index_path_prefix + "/" + VALID_DATA_KEY;
+    if (local_chunk_manager->Exist(valid_data_path)) {
+        size_t count;
+        local_chunk_manager->Read(valid_data_path, 0, &count, sizeof(size_t));
+        size_t byte_size = (count + 7) / 8;
+        std::vector<uint8_t> valid_bitmap(byte_size);
+        local_chunk_manager->Read(
+            valid_data_path, sizeof(size_t), valid_bitmap.data(), byte_size);
+        // Convert bitmap to bool array
+        std::unique_ptr<bool[]> valid_data(new bool[count]);
+        for (size_t i = 0; i < count; ++i) {
+            valid_data[i] = (valid_bitmap[i / 8] >> (i % 8)) & 1;
+        }
+        BuildValidData(valid_data.get(), count);
+    }
 
     SetDim(index_.Dim());
 }
@@ -140,6 +191,9 @@ VectorDiskAnnIndex<T>::Upload(const Config& config) {
 template <typename T>
 void
 VectorDiskAnnIndex<T>::Build(const Config& config) {
+    LOG_INFO("start build disk index, build_id: {}",
+             config.value("build_id", "unknown"));
+
     auto local_chunk_manager =
         storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
     knowhere::Json build_config;
@@ -161,6 +215,11 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
         config_with_emb_list[EMB_LIST_OFFSETS_PATH] = offsets_path;
     }
 
+    // Set valid data path to track nullable vector fields
+    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
+    auto valid_data_path = local_index_path_prefix + "/" + VALID_DATA_KEY;
+    config_with_emb_list[VALID_DATA_PATH_KEY] = valid_data_path;
+
     auto local_data_path =
         file_manager_->CacheRawDataToDisk<T>(config_with_emb_list);
     build_config[DISK_ANN_RAW_DATA_PATH] = local_data_path;
@@ -175,7 +234,6 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
         build_config[EMB_LIST_OFFSETS_PATH] = offsets_path;
     }
 
-    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
     build_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
 
     if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
@@ -207,8 +265,16 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
         ThrowInfo(ErrorCode::IndexBuildError,
                   "failed to build disk index, " + KnowhereStatusString(stat));
 
-    local_chunk_manager->RemoveDir(
-        storage::GetSegmentRawDataPathPrefix(local_chunk_manager, segment_id));
+    // Add valid_data file to index if it was created (nullable vector field)
+    if (local_chunk_manager->Exist(valid_data_path)) {
+        file_manager_->AddFile(valid_data_path);
+    }
+
+    local_chunk_manager->RemoveDir(storage::GenFieldRawDataPathPrefix(
+        local_chunk_manager, segment_id, field_id));
+
+    LOG_INFO("build disk index done, build_id: {}",
+             config.value("build_id", "unknown"));
 }
 
 template <typename T>
@@ -298,8 +364,25 @@ VectorDiskAnnIndex<T>::BuildWithDataset(const DatasetPtr& dataset,
     if (stat != knowhere::Status::success)
         ThrowInfo(ErrorCode::IndexBuildError,
                   "failed to build index, " + KnowhereStatusString(stat));
-    local_chunk_manager->RemoveDir(
-        storage::GetSegmentRawDataPathPrefix(local_chunk_manager, segment_id));
+
+    if (HasValidData()) {
+        auto valid_data_path = local_index_path_prefix + "/" + VALID_DATA_KEY;
+        size_t count = offset_mapping_.GetTotalCount();
+        local_chunk_manager->Write(valid_data_path, 0, &count, sizeof(size_t));
+        size_t byte_size = (count + 7) / 8;
+        std::vector<uint8_t> packed_data(byte_size, 0);
+        for (size_t i = 0; i < count; ++i) {
+            if (offset_mapping_.IsValid(i)) {
+                packed_data[i / 8] |= (1 << (i % 8));
+            }
+        }
+        local_chunk_manager->Write(
+            valid_data_path, sizeof(size_t), packed_data.data(), byte_size);
+        file_manager_->AddFile(valid_data_path);
+    }
+
+    local_chunk_manager->RemoveDir(storage::GenFieldRawDataPathPrefix(
+        local_chunk_manager, segment_id, field_id));
 
     // TODO ::
     // SetDim(index_->Dim());

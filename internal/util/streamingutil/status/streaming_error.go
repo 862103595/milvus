@@ -65,6 +65,11 @@ func (e *StreamingError) IsReplicateViolation() bool {
 	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_REPLICATE_VIOLATION
 }
 
+// IsWALNameMismatch returns true if the error is caused by wal name mismatch.
+func (e *StreamingError) IsWALNameMismatch() bool {
+	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_WALNAME_MISMATCH
+}
+
 // IsTxnUnavilable returns true if the transaction is unavailable.
 func (e *StreamingError) IsTxnUnavilable() bool {
 	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_TRANSACTION_EXPIRED ||
@@ -84,6 +89,11 @@ func (e *StreamingError) IsResourceAcquired() bool {
 // IsOnShutdown returns true if the error is caused by on shutdown.
 func (e *StreamingError) IsOnShutdown() bool {
 	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_ON_SHUTDOWN
+}
+
+// IsRateLimitRejected returns true if the error is caused by rate limit rejected.
+func (e *StreamingError) IsRateLimitRejected() bool {
+	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_RATE_LIMIT_REJECTED
 }
 
 // NewOnShutdownError creates a new StreamingError with code STREAMING_CODE_ON_SHUTDOWN.
@@ -151,9 +161,19 @@ func NewReplicateViolation(format string, args ...interface{}) *StreamingError {
 	return New(streamingpb.StreamingCode_STREAMING_CODE_REPLICATE_VIOLATION, format, args...)
 }
 
+// NewWALNameMismatchError creates a new StreamingError with code STREAMING_CODE_WALNAME_MISMATCH.
+func NewWALNameMismatchError(expectedWALName string, actualWALName string) *StreamingError {
+	return New(streamingpb.StreamingCode_STREAMING_CODE_WALNAME_MISMATCH, "wal name mismatch, expected %s, actual %s", expectedWALName, actualWALName)
+}
+
 // NewResourceAcquired creates a new StreamingError with code STREAMING_CODE_RESOURCE_ACQUIRED.
 func NewResourceAcquired(format string, args ...interface{}) *StreamingError {
 	return New(streamingpb.StreamingCode_STREAMING_CODE_RESOURCE_ACQUIRED, format, args...)
+}
+
+// NewRateLimitRejected creates a new StreamingError with code STREAMING_CODE_RATE_LIMIT_REJECTED.
+func NewRateLimitRejected(format string, args ...interface{}) *StreamingError {
+	return New(streamingpb.StreamingCode_STREAMING_CODE_RATE_LIMIT_REJECTED, format, args...)
 }
 
 // New creates a new StreamingError with the given code and cause.

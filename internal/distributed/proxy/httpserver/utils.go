@@ -83,7 +83,7 @@ func ParseUsernamePassword(c *gin.Context) (string, string, bool) {
 	username, password, ok := c.Request.BasicAuth()
 	if !ok {
 		token := GetAuthorization(c)
-		i := strings.IndexAny(token, util.CredentialSeperator)
+		i := strings.IndexAny(token, util.CredentialSeparator)
 		if i != -1 {
 			username = token[:i]
 			password = token[i+1:]
@@ -172,6 +172,81 @@ func checkGetPrimaryKey(coll *schemapb.CollectionSchema, idResult gjson.Result) 
 	}
 	filter := primaryField.Name + " in [" + resultStr + "]"
 	return filter, nil
+}
+
+// convertIDsToSchemapbIDs converts a slice of interface{} (JSON ids) to schemapb.IDs
+// based on the primary key field type
+func convertIDsToSchemapbIDs(ids []interface{}, pkField *schemapb.FieldSchema) (*schemapb.IDs, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("ids array cannot be empty")
+	}
+
+	switch pkField.DataType {
+	case schemapb.DataType_Int64:
+		int64IDs := make([]int64, 0, len(ids))
+		for i, id := range ids {
+			var int64ID int64
+			switch v := id.(type) {
+			case int64:
+				int64ID = v
+			case int:
+				int64ID = int64(v)
+			case float64:
+				// JSON numbers are decoded as float64
+				// Check if the float has a fractional part
+				if v != math.Trunc(v) {
+					return nil, fmt.Errorf("invalid int64 id at index %d: %v has fractional part", i, v)
+				}
+				int64ID = int64(v)
+			case string:
+				// Try to parse string as int64
+				parsed, err := strconv.ParseInt(v, 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid int64 id at index %d: %v, error: %v", i, id, err)
+				}
+				int64ID = parsed
+			default:
+				return nil, fmt.Errorf("invalid id type at index %d: expected int64, got %T", i, id)
+			}
+			int64IDs = append(int64IDs, int64ID)
+		}
+		return &schemapb.IDs{
+			IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: int64IDs,
+				},
+			},
+		}, nil
+
+	case schemapb.DataType_VarChar:
+		stringIDs := make([]string, 0, len(ids))
+		for i, id := range ids {
+			var stringID string
+			switch v := id.(type) {
+			case string:
+				stringID = v
+			case int64, int, float64:
+				// Convert number to string
+				stringID = fmt.Sprintf("%v", v)
+			default:
+				return nil, fmt.Errorf("invalid id type at index %d: expected string, got %T", i, id)
+			}
+			if stringID == "" {
+				return nil, fmt.Errorf("empty string id at index %d", i)
+			}
+			stringIDs = append(stringIDs, stringID)
+		}
+		return &schemapb.IDs{
+			IdField: &schemapb.IDs_StrId{
+				StrId: &schemapb.StringArray{
+					Data: stringIDs,
+				},
+			},
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported primary key type: %s", pkField.DataType.String())
+	}
 }
 
 // --------------------- collection details --------------------- //
@@ -334,11 +409,9 @@ func checkAndSetData(body []byte, collSchema *schemapb.CollectionSchema, partial
 					continue
 				}
 
-				// if field is a function output field, user must not provide data for it
-				if field.GetIsFunctionOutput() {
-					if dataString != "" {
-						return merr.WrapErrParameterInvalid("", "not allowed to provide input data for function output field: "+fieldName), reallyDataArray, validDataMap
-					}
+				// skip function output field if user didn't provide data,
+				// let proxy validate when data is provided
+				if field.GetIsFunctionOutput() && dataString == "" {
 					continue
 				}
 
@@ -439,7 +512,7 @@ func checkAndSetData(body []byte, collSchema *schemapb.CollectionSchema, partial
 						return merr.WrapErrParameterInvalid(schemapb.DataType_name[int32(fieldType)], dataString, err.Error()), reallyDataArray, validDataMap
 					}
 					reallyData[fieldName] = result
-				case schemapb.DataType_Int64, schemapb.DataType_Timestamptz:
+				case schemapb.DataType_Int64:
 					result, err := json.Number(dataString).Int64()
 					if err != nil {
 						return merr.WrapErrParameterInvalid(schemapb.DataType_name[int32(fieldType)], dataString, err.Error()), reallyDataArray, validDataMap
@@ -576,6 +649,8 @@ func checkAndSetData(body []byte, collSchema *schemapb.CollectionSchema, partial
 						return merr.WrapErrParameterInvalid(schemapb.DataType_name[int32(fieldType)], dataString, err.Error()), reallyDataArray, validDataMap
 					}
 					reallyData[fieldName] = result
+				case schemapb.DataType_Timestamptz:
+					reallyData[fieldName] = dataString
 				case schemapb.DataType_VarChar:
 					reallyData[fieldName] = dataString
 				case schemapb.DataType_String:
@@ -748,18 +823,38 @@ func anyToColumns(rows []map[string]interface{}, validDataMap map[string][]bool,
 	}
 
 	isDynamic := sch.EnableDynamicField
+	allowInsertAutoID, _ := common.IsAllowInsertAutoID(sch.GetProperties()...)
+	isAutoIDPK := false
+	pkFieldName := ""
 
 	nameColumns := make(map[string]interface{})
 	nameDims := make(map[string]int64)
 	fieldData := make(map[string]*schemapb.FieldData)
 
+	// Pre-compute the set of field names present across all rows,
+	// so we can skip absent function output fields with a map lookup instead of scanning rows.
+	presentFieldNames := make(map[string]struct{})
+	for _, row := range rows {
+		for name := range row {
+			presentFieldNames[name] = struct{}{}
+		}
+	}
+
 	for _, field := range sch.Fields {
-		if (field.IsPrimaryKey && field.AutoID && inInsert) || field.IsDynamic {
+		if field.IsPrimaryKey {
+			pkFieldName = field.Name
+			if field.AutoID {
+				isAutoIDPK = true
+			}
+		}
+		if (field.IsPrimaryKey && field.AutoID && inInsert && !allowInsertAutoID) || field.IsDynamic {
 			continue
 		}
-		// skip function output field
+		// skip function output field if no row provides data for it
 		if field.GetIsFunctionOutput() {
-			continue
+			if _, ok := presentFieldNames[field.Name]; !ok {
+				continue
+			}
 		}
 		var data interface{}
 		switch field.DataType {
@@ -778,7 +873,7 @@ func anyToColumns(rows []map[string]interface{}, validDataMap map[string][]bool,
 		case schemapb.DataType_Double:
 			data = make([]float64, 0, rowsLen)
 		case schemapb.DataType_Timestamptz:
-			data = make([]int64, 0, rowsLen)
+			data = make([]string, 0, rowsLen)
 		case schemapb.DataType_String:
 			data = make([]string, 0, rowsLen)
 		case schemapb.DataType_VarChar:
@@ -843,19 +938,20 @@ func anyToColumns(rows []map[string]interface{}, validDataMap map[string][]bool,
 			}
 			candi, ok := set[field.Name]
 			if field.IsPrimaryKey && field.AutoID && inInsert {
-				if ok {
+				if !ok {
+					continue
+				}
+				if !allowInsertAutoID {
 					return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("no need to pass pk field(%s) when autoid==true in insert", field.Name))
 				}
-				continue
 			}
 			if (field.Nullable || field.DefaultValue != nil) && !ok {
 				continue
 			}
 			if field.GetIsFunctionOutput() {
-				if ok {
-					return nil, fmt.Errorf("row %d has data provided for function output field %s", idx, field.Name)
+				if _, allocated := nameColumns[field.Name]; !allocated {
+					continue
 				}
-				continue
 			}
 			if !ok {
 				if partialUpdate {
@@ -878,7 +974,7 @@ func anyToColumns(rows []map[string]interface{}, validDataMap map[string][]bool,
 			case schemapb.DataType_Float:
 				nameColumns[field.Name] = append(nameColumns[field.Name].([]float32), candi.v.Interface().(float32))
 			case schemapb.DataType_Timestamptz:
-				nameColumns[field.Name] = append(nameColumns[field.Name].([]int64), candi.v.Interface().(int64))
+				nameColumns[field.Name] = append(nameColumns[field.Name].([]string), candi.v.Interface().(string))
 			case schemapb.DataType_Double:
 				nameColumns[field.Name] = append(nameColumns[field.Name].([]float64), candi.v.Interface().(float64))
 			case schemapb.DataType_String:
@@ -945,6 +1041,9 @@ func anyToColumns(rows []map[string]interface{}, validDataMap map[string][]bool,
 	}
 	columns := make([]*schemapb.FieldData, 0, len(nameColumns))
 	for name, column := range nameColumns {
+		if fieldLen[name] == 0 && name == pkFieldName && isAutoIDPK {
+			continue
+		}
 		if fieldLen[name] == 0 && partialUpdate {
 			// for partial update, skip update for nullable field
 			// cause we cannot distinguish between missing fields and fields explicitly set to null
@@ -1036,9 +1135,9 @@ func anyToColumns(rows []map[string]interface{}, validDataMap map[string][]bool,
 		case schemapb.DataType_Timestamptz:
 			colData.Field = &schemapb.FieldData_Scalars{
 				Scalars: &schemapb.ScalarField{
-					Data: &schemapb.ScalarField_TimestamptzData{
-						TimestamptzData: &schemapb.TimestamptzArray{
-							Data: column.([]int64),
+					Data: &schemapb.ScalarField_StringData{
+						StringData: &schemapb.StringArray{
+							Data: column.([]string),
 						},
 					},
 				},
@@ -1389,7 +1488,7 @@ func buildQueryResp(rowsNum int64, needFields []string, fieldDataList []*schemap
 			case schemapb.DataType_Double:
 				rowsNum = int64(len(fieldDataList[0].GetScalars().GetDoubleData().GetData()))
 			case schemapb.DataType_Timestamptz:
-				rowsNum = int64(len(fieldDataList[0].GetScalars().GetTimestamptzData().GetData()))
+				rowsNum = int64(len(fieldDataList[0].GetScalars().GetStringData().GetData()))
 			case schemapb.DataType_String:
 				rowsNum = int64(len(fieldDataList[0].GetScalars().GetStringData().GetData()))
 			case schemapb.DataType_VarChar:
@@ -1500,7 +1599,7 @@ func buildQueryResp(rowsNum int64, needFields []string, fieldDataList []*schemap
 						row[fieldDataList[j].GetFieldName()] = nil
 						continue
 					}
-					row[fieldDataList[j].FieldName] = fieldDataList[j].GetScalars().GetTimestamptzData().GetData()[i]
+					row[fieldDataList[j].FieldName] = fieldDataList[j].GetScalars().GetStringData().GetData()[i]
 				case schemapb.DataType_String:
 					if len(fieldDataList[j].GetValidData()) != 0 && !fieldDataList[j].GetValidData()[i] {
 						row[fieldDataList[j].GetFieldName()] = nil
@@ -1714,13 +1813,25 @@ func convertDefaultValue(value interface{}, dataType schemapb.DataType) (*schema
 		return data, nil
 
 	case schemapb.DataType_Timestamptz:
-		v, ok := value.(float64)
+		v, ok := value.(string)
 		if !ok {
 			return nil, merr.WrapErrParameterInvalid("string", value, "Wrong defaultValue type")
 		}
 		data := &schemapb.ValueField{
-			Data: &schemapb.ValueField_TimestamptzData{
-				TimestamptzData: int64(v),
+			Data: &schemapb.ValueField_StringData{
+				StringData: v,
+			},
+		}
+		return data, nil
+
+	case schemapb.DataType_Geometry:
+		v, ok := value.(string)
+		if !ok {
+			return nil, merr.WrapErrParameterInvalidMsg(`cannot use "%v"(type: %T) as geometry default value`, value, value)
+		}
+		data := &schemapb.ValueField{
+			Data: &schemapb.ValueField_StringData{
+				StringData: v,
 			},
 		}
 		return data, nil
@@ -1809,30 +1920,61 @@ func MetricsHandlerFunc(c *gin.Context) {
 }
 
 func LoggerHandlerFunc() gin.HandlerFunc {
-	return gin.LoggerWithConfig(gin.LoggerConfig{
-		SkipPaths: proxy.Params.ProxyCfg.GinLogSkipPaths.GetAsStrings(),
-		Formatter: func(param gin.LogFormatterParams) string {
-			if param.Latency > time.Minute {
-				param.Latency = param.Latency.Truncate(time.Second)
-			}
-			traceID, ok := param.Keys["traceID"]
-			if !ok {
-				traceID = ""
-			}
+	notlogged := proxy.Params.ProxyCfg.GinLogSkipPaths.GetAsStrings()
+	var skip map[string]struct{}
+	if length := len(notlogged); length > 0 {
+		skip = make(map[string]struct{}, length)
+		for _, p := range notlogged {
+			skip[p] = struct{}{}
+		}
+	}
 
-			accesslog.SetHTTPParams(&param)
-			return fmt.Sprintf("[%v] [GIN] [%s] [traceID=%s] [code=%3d] [latency=%v] [client=%s] [method=%s] [error=%s]\n",
-				param.TimeStamp.Format("2006/01/02 15:04:05.000 Z07:00"),
-				param.Path,
-				traceID,
-				param.StatusCode,
-				param.Latency,
-				param.ClientIP,
-				param.Method,
-				param.ErrorMessage,
-			)
-		},
-	})
+	return func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		raw := c.Request.URL.RawQuery
+
+		c.Next()
+
+		if _, ok := skip[path]; ok {
+			return
+		}
+
+		param := gin.LogFormatterParams{
+			Request:      c.Request,
+			TimeStamp:    time.Now(),
+			ClientIP:     c.ClientIP(),
+			Method:       c.Request.Method,
+			StatusCode:   c.Writer.Status(),
+			ErrorMessage: c.Errors.ByType(gin.ErrorTypePrivate).String(),
+			BodySize:     c.Writer.Size(),
+		}
+		param.Latency = param.TimeStamp.Sub(start)
+		if param.Latency > time.Minute {
+			param.Latency = param.Latency.Truncate(time.Second)
+		}
+		if raw != "" {
+			path = path + "?" + raw
+		}
+		param.Path = path
+
+		traceID, _ := c.Get("traceID")
+		if traceID == nil {
+			traceID = ""
+		}
+
+		accesslog.SetHTTPParams(c, &param)
+		fmt.Fprintf(gin.DefaultWriter, "[%v] [GIN] [%s] [traceID=%s] [code=%3d] [latency=%v] [client=%s] [method=%s] [error=%s]\n",
+			param.TimeStamp.Format("2006/01/02 15:04:05.000 Z07:00"),
+			param.Path,
+			traceID,
+			param.StatusCode,
+			param.Latency,
+			param.ClientIP,
+			param.Method,
+			param.ErrorMessage,
+		)
+	}
 }
 
 func RequestHandlerFunc(c *gin.Context) {

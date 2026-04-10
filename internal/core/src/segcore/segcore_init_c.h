@@ -11,11 +11,10 @@
 
 #pragma once
 
-#include <stdbool.h>
 #include <stdint.h>
-#include "common/type_c.h"
+#include <stdbool.h>
 
-#include "common/type_c.h"
+#include "common/common_type_c.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +58,12 @@ SegcoreSetDenseVectorInterminIndexRefineQuantType(const char*);
 
 void
 SegcoreSetDenseVectorInterminIndexRefineWithQuantFlag(const bool);
+
+void
+SegcoreSetInterimIndexMemExpansionRate(const float);
+
+void
+SegcoreSetMaxGroupByGroups(const int64_t);
 
 // return value must be freed by the caller
 char*
@@ -121,7 +126,20 @@ ConfigureTieredStorage(
     const float overloaded_memory_threshold_percentage,
     const float loading_resource_factor,
     const float max_disk_usage_percentage,
-    const char* disk_path);
+    const char* disk_path,
+    const int64_t loading_timeout_ms,
+    const int64_t warmup_loading_timeout_ms,
+    // async warmup prefetch pool threads
+    const uint32_t prefetch_pool_threads);
+
+void
+UpdateTieredStorageConfig(const int64_t loading_timeout_ms,
+                          const int64_t warmup_loading_timeout_ms,
+                          const bool storage_usage_tracking_enabled,
+                          const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
+                          const CacheWarmupPolicy vectorFieldCacheWarmupPolicy,
+                          const CacheWarmupPolicy scalarIndexCacheWarmupPolicy,
+                          const CacheWarmupPolicy vectorIndexCacheWarmupPolicy);
 
 #ifdef __cplusplus
 }

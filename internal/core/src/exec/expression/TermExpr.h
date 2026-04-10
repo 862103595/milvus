@@ -24,7 +24,8 @@
 #include "exec/expression/Expr.h"
 #include "exec/expression/Element.h"
 #include "segcore/SegmentInterface.h"
-#include "index/json_stats/JsonKeyStats.h"
+#include "index/json_stats/bson_inverted.h"
+#include "cachinglayer/CacheSlot.h"
 
 namespace milvus {
 namespace exec {
@@ -60,7 +61,8 @@ class PhyTermFilterExpr : public SegmentExpr {
         int64_t active_count,
         milvus::Timestamp timestamp,
         int64_t batch_size,
-        int32_t consistency_level)
+        int32_t consistency_level,
+        const query::PlanOptions& plan_options = {})
         : SegmentExpr(std::move(input),
                       name,
                       op_ctx,
@@ -72,13 +74,19 @@ class PhyTermFilterExpr : public SegmentExpr {
                           : FromValCase(expr->vals_[0].val_case()),
                       active_count,
                       batch_size,
-                      consistency_level),
-          expr_(expr),
-          query_timestamp_(timestamp) {
+                      consistency_level,
+                      false,
+                      false,
+                      plan_options),
+          expr_(expr) {
+        DetermineExecPath();
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
+
+    void
+    DetermineExecPath() override;
 
     bool
     IsSource() const override {
@@ -86,7 +94,7 @@ class PhyTermFilterExpr : public SegmentExpr {
     }
 
     std::string
-    ToString() const {
+    ToString() const override {
         return fmt::format("{}", expr_->ToString());
     }
 
@@ -148,15 +156,13 @@ class PhyTermFilterExpr : public SegmentExpr {
 
  private:
     std::shared_ptr<const milvus::expr::TermFilterExpr> expr_;
-    milvus::Timestamp query_timestamp_;
     bool cached_bits_inited_{false};
     TargetBitmap cached_bits_;
     bool arg_inited_{false};
     std::shared_ptr<MultiElement> arg_set_;
     std::shared_ptr<MultiElement> arg_set_double_;
     SingleElement arg_val_;
-    int32_t consistency_level_ = 0;
-    PinWrapper<index::JsonKeyStats*> pinned_json_stats_{nullptr};
+    PinWrapper<index::BsonInvertedIndex*> bson_index_{nullptr};
 };
 }  //namespace exec
 }  // namespace milvus

@@ -17,13 +17,24 @@
 #pragma once
 
 #include <fmt/core.h>
+#include <stdint.h>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "common/EasyAssert.h"
+#include "cachinglayer/CacheSlot.h"
+#include "common/OpContext.h"
 #include "common/Types.h"
 #include "common/Vector.h"
+#include "common/protobuf_utils.h"
+#include "exec/expression/EvalCtx.h"
 #include "exec/expression/Expr.h"
+#include "expr/ITypeExpr.h"
+#include "index/json_stats/bson_inverted.h"
 #include "segcore/SegmentInterface.h"
-#include "index/json_stats/JsonKeyStats.h"
 
 namespace milvus {
 namespace exec {
@@ -45,7 +56,8 @@ class PhyExistsFilterExpr : public SegmentExpr {
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
         int64_t batch_size,
-        int32_t consistency_level)
+        int32_t consistency_level,
+        const query::PlanOptions& plan_options = {})
         : SegmentExpr(std::move(input),
                       name,
                       op_ctx,
@@ -56,15 +68,18 @@ class PhyExistsFilterExpr : public SegmentExpr {
                       active_count,
                       batch_size,
                       consistency_level,
-                      true),
+                      true,
+                      false,
+                      plan_options),
           expr_(expr) {
+        DetermineExecPath();
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
     std::string
-    ToString() const {
+    ToString() const override {
         return fmt::format("{}", expr_->ToString());
     }
 
@@ -78,6 +93,9 @@ class PhyExistsFilterExpr : public SegmentExpr {
         return expr_->column_;
     }
 
+    void
+    DetermineExecPath() override;
+
  private:
     VectorPtr
     EvalJsonExistsForDataSegment(EvalCtx& context);
@@ -90,7 +108,7 @@ class PhyExistsFilterExpr : public SegmentExpr {
 
  private:
     std::shared_ptr<const milvus::expr::ExistsExpr> expr_;
-    PinWrapper<index::JsonKeyStats*> pinned_json_stats_{nullptr};
+    PinWrapper<index::BsonInvertedIndex*> bson_index_{nullptr};
 };
 }  //namespace exec
 }  // namespace milvus

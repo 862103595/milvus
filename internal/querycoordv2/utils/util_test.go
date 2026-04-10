@@ -17,15 +17,18 @@
 package utils
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/blang/semver/v4"
+	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
@@ -157,6 +160,52 @@ func (suite *UtilTestSuite) TestCheckLeaderAvaliableFailed() {
 		err := CheckDelegatorDataReady(suite.nodeMgr, mockTargetManager, leadview, meta.CurrentTarget)
 		suite.Error(err)
 	})
+
+	suite.Run("catching up streaming data", func() {
+		leadview := &meta.LeaderView{
+			ID:            1,
+			Channel:       "test",
+			Segments:      map[int64]*querypb.SegmentDist{2: {NodeID: 2}},
+			TargetVersion: 1011,
+			Status: &querypb.LeaderViewStatus{
+				Serviceable:             true,
+				CatchingUpStreamingData: true, // still catching up
+			},
+		}
+		// When catching up, function returns early without calling targetMgr
+		// so we can pass nil as targetMgr
+		suite.setNodeAvailable(1, 2)
+		err := CheckDelegatorDataReady(suite.nodeMgr, nil, leadview, meta.CurrentTarget)
+		suite.Error(err)
+		suite.Contains(err.Error(), "catching up streaming data")
+	})
+
+	suite.Run("caught up streaming data", func() {
+		leadview := &meta.LeaderView{
+			ID:            1,
+			Channel:       "test",
+			Segments:      map[int64]*querypb.SegmentDist{2: {NodeID: 2}},
+			TargetVersion: 1011,
+			Status: &querypb.LeaderViewStatus{
+				Serviceable:             true,
+				CatchingUpStreamingData: false, // already caught up
+			},
+		}
+		// Use mockey to mock TargetManager.GetSealedSegmentsByChannel
+		targetMgr := &meta.TargetManager{}
+		mockGetSealedSegments := mockey.Mock(mockey.GetMethod(targetMgr, "GetSealedSegmentsByChannel")).
+			Return(map[int64]*datapb.SegmentInfo{
+				2: {
+					ID:            2,
+					InsertChannel: "test",
+				},
+			}).Build()
+		defer mockGetSealedSegments.UnPatch()
+
+		suite.setNodeAvailable(1, 2)
+		err := CheckDelegatorDataReady(suite.nodeMgr, targetMgr, leadview, meta.CurrentTarget)
+		suite.NoError(err)
+	})
 }
 
 func (suite *UtilTestSuite) TestGetChannelRWAndRONodesFor260() {
@@ -218,6 +267,71 @@ func (suite *UtilTestSuite) TestFilterOutNodeLessThan260() {
 	}))
 	filteredNodes = filterNodeLessThan260(nodes, nodeManager)
 	suite.ElementsMatch(filteredNodes, []int64{1, 4, 5})
+}
+
+func (suite *UtilTestSuite) TestCheckSegmentDataReady_ManifestComparison() {
+	basePath := "/data/insert_log/col/part/seg"
+	collectionID := int64(100)
+	segmentID := int64(200)
+	nodeID := int64(1)
+
+	newDistManager := func(manifestPath string) *meta.DistributionManager {
+		dm := meta.NewDistributionManager(session.NewNodeManager())
+		dm.SegmentDistManager.Update(nodeID, &meta.Segment{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           segmentID,
+				CollectionID: collectionID,
+			},
+			Node:         nodeID,
+			ManifestPath: manifestPath,
+		})
+		return dm
+	}
+
+	newTargetMgr := func(manifestPath string) meta.TargetManagerInterface {
+		m := meta.NewMockTargetManager(suite.T())
+		m.EXPECT().GetSealedSegmentsByCollection(mock.Anything, collectionID, mock.Anything).
+			Return(map[int64]*datapb.SegmentInfo{
+				segmentID: {
+					ID:           segmentID,
+					CollectionID: collectionID,
+					ManifestPath: manifestPath,
+				},
+			}).Maybe()
+		return m
+	}
+
+	suite.Run("same manifest version - ready", func() {
+		manifest := packed.MarshalManifestPath(basePath, 5)
+		err := CheckSegmentDataReady(context.Background(), collectionID, newDistManager(manifest), newTargetMgr(manifest), meta.NextTarget)
+		suite.NoError(err)
+	})
+
+	suite.Run("dist newer than target - ready", func() {
+		distManifest := packed.MarshalManifestPath(basePath, 10)
+		targetManifest := packed.MarshalManifestPath(basePath, 5)
+		err := CheckSegmentDataReady(context.Background(), collectionID, newDistManager(distManifest), newTargetMgr(targetManifest), meta.NextTarget)
+		suite.NoError(err)
+	})
+
+	suite.Run("dist older than target - not ready", func() {
+		distManifest := packed.MarshalManifestPath(basePath, 1)
+		targetManifest := packed.MarshalManifestPath(basePath, 5)
+		err := CheckSegmentDataReady(context.Background(), collectionID, newDistManager(distManifest), newTargetMgr(targetManifest), meta.NextTarget)
+		suite.Error(err)
+	})
+
+	suite.Run("both empty manifest - ready", func() {
+		err := CheckSegmentDataReady(context.Background(), collectionID, newDistManager(""), newTargetMgr(""), meta.NextTarget)
+		suite.NoError(err)
+	})
+
+	suite.Run("segment not in dist - not ready", func() {
+		dm := meta.NewDistributionManager(session.NewNodeManager())
+		targetManifest := packed.MarshalManifestPath(basePath, 5)
+		err := CheckSegmentDataReady(context.Background(), collectionID, dm, newTargetMgr(targetManifest), meta.NextTarget)
+		suite.Error(err)
+	})
 }
 
 func TestUtilSuite(t *testing.T) {

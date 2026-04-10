@@ -18,9 +18,7 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
-	"os"
 	"sync"
 	"time"
 
@@ -155,12 +153,8 @@ func (node *Proxy) GetStateCode() commonpb.StateCode {
 // Register registers proxy at etcd
 func (node *Proxy) Register() error {
 	node.session.Register()
-	metrics.NumNodes.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), typeutil.ProxyRole).Inc()
+	metrics.NumNodes.WithLabelValues(paramtable.GetStringNodeID(), typeutil.ProxyRole).Inc()
 	log.Info("Proxy Register Finished")
-	node.session.LivenessCheck(node.ctx, func() {
-		log.Error("Proxy disconnected from etcd, process will exit", zap.Int64("Server Id", node.session.ServerID))
-		os.Exit(1)
-	})
 	// TODO Reset the logger
 	// Params.initLogCfg()
 	return nil
@@ -172,7 +166,7 @@ func (node *Proxy) initSession() error {
 	if node.session == nil {
 		return errors.New("new session failed, maybe etcd cannot be connected")
 	}
-	node.session.Init(typeutil.ProxyRole, node.address, false, true)
+	node.session.Init(typeutil.ProxyRole, node.address, false)
 	sessionutil.SaveServerInfo(typeutil.ProxyRole, node.session.ServerID)
 	return nil
 }
@@ -185,7 +179,6 @@ func (node *Proxy) initRateCollector() error {
 		return err
 	}
 	rateCol.Register(internalpb.RateType_DMLInsert.String())
-	rateCol.Register(internalpb.RateType_DMLUpsert.String())
 	rateCol.Register(internalpb.RateType_DMLDelete.String())
 	// TODO: add bulkLoad rate
 	rateCol.Register(internalpb.RateType_DQLSearch.String())

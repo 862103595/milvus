@@ -1,3 +1,4 @@
+use crate::analyzer::options::FileResourcePathHelper;
 use crate::error::{Result, TantivyBindingError};
 use lingua::{LanguageDetector, LanguageDetectorBuilder};
 use serde_json as json;
@@ -164,7 +165,11 @@ impl<'a> LangIdentTokenizer<'a> {
 
     pub fn from_json<'b>(
         params: &'b json::Map<String, json::Value>,
-        fc: fn(&json::Map<String, json::Value>) -> Result<TextAnalyzer>,
+        helper: &mut FileResourcePathHelper,
+        fc: fn(
+            &json::Map<String, json::Value>,
+            helper: &mut FileResourcePathHelper,
+        ) -> Result<TextAnalyzer>,
     ) -> Result<LangIdentTokenizer<'a>> {
         // init identfier for tokenizer
         let identifier = params
@@ -188,12 +193,15 @@ impl<'a> LangIdentTokenizer<'a> {
         for (name, params) in sub_analyzers {
             analyzer.add(
                 name,
-                fc(params.as_object().ok_or_else(|| {
-                    TantivyBindingError::InvalidArgument(format!(
-                        "sub analyzer \"{}\" params must be dict",
-                        name
-                    ))
-                })?)?,
+                fc(
+                    params.as_object().ok_or_else(|| {
+                        TantivyBindingError::InvalidArgument(format!(
+                            "sub analyzer \"{}\" params must be dict",
+                            name
+                        ))
+                    })?,
+                    helper,
+                )?,
             );
         }
 
@@ -241,7 +249,6 @@ impl<'a> LangIdentTokenizer<'a> {
     fn tokenize<'b>(&'b mut self, text: &'b str) -> BoxTokenStream<'b> {
         let language: String = self.identifier.0.detect(text);
         let analyzer = self.get_by_language(language.as_str());
-
         analyzer.token_stream(text)
     }
 }
@@ -257,9 +264,11 @@ impl Tokenizer for LangIdentTokenizer<'static> {
 #[cfg(test)]
 mod tests {
     use serde_json as json;
+    use std::sync::Arc;
     use tantivy::tokenizer::Tokenizer;
 
     use super::LangIdentTokenizer;
+    use crate::analyzer::options::{FileResourcePathHelper, ResourceInfo};
     use crate::analyzer::tokenizers::lang_ident_tokenizer::BoxIdentifier;
     use crate::analyzer::{create_analyzer, create_analyzer_by_json};
     use crate::error::Result;
@@ -276,8 +285,8 @@ mod tests {
 
         let mut analyzer = LangIdentTokenizer::new(BoxIdentifier::default());
         let result = || -> Result<()> {
-            analyzer.add("default", create_analyzer(standard_params)?);
-            analyzer.add("cmn", create_analyzer(jieba_params)?);
+            analyzer.add("default", create_analyzer(standard_params, "")?);
+            analyzer.add("Mandarin", create_analyzer(jieba_params, "")?);
             Ok(())
         }();
 
@@ -294,7 +303,7 @@ mod tests {
                 "default": {
                     "tokenizer": "standard"
                 },
-                "cmn": {
+                "Mandarin": {
                     "tokenizer": "jieba"
                 }
             }
@@ -304,6 +313,7 @@ mod tests {
         let builder: std::result::Result<LangIdentTokenizer, crate::error::TantivyBindingError> =
             LangIdentTokenizer::from_json(
                 json_params.as_object().unwrap(),
+                &mut FileResourcePathHelper::new(Arc::new(ResourceInfo::new())),
                 create_analyzer_by_json,
             );
         assert!(builder.is_ok(), "error: {}", builder.err().unwrap());
@@ -328,8 +338,8 @@ mod tests {
                 }
             },
             "mapping": {
-                "cmn": "jieba",
-                "eng": "en"
+                "Mandarin": "jieba",
+                "English": "en"
             }
         }"#;
 
@@ -337,6 +347,7 @@ mod tests {
         let builder: std::result::Result<LangIdentTokenizer, crate::error::TantivyBindingError> =
             LangIdentTokenizer::from_json(
                 json_params.as_object().unwrap(),
+                &mut FileResourcePathHelper::new(Arc::new(ResourceInfo::new())),
                 create_analyzer_by_json,
             );
         assert!(builder.is_ok(), "error: {}", builder.err().unwrap());
@@ -372,6 +383,7 @@ mod tests {
         let builder: std::result::Result<LangIdentTokenizer, crate::error::TantivyBindingError> =
             LangIdentTokenizer::from_json(
                 json_params.as_object().unwrap(),
+                &mut FileResourcePathHelper::new(Arc::new(ResourceInfo::new())),
                 create_analyzer_by_json,
             );
         assert!(builder.is_ok(), "error: {}", builder.err().unwrap());

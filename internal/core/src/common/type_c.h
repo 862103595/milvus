@@ -91,6 +91,9 @@ typedef struct CStorageConfig {
     int64_t requestTimeoutMs;
     const char* gcp_credential_json;
     bool use_custom_part_upload;
+    uint32_t max_connections;
+    const char* tls_min_version;
+    bool use_crc32c_checksum;
 } CStorageConfig;
 
 typedef struct CDiskWriteRateLimiterConfig {
@@ -119,6 +122,7 @@ typedef struct CMmapConfig {
     bool scalar_field_enable_mmap;
     bool vector_index_enable_mmap;
     bool vector_field_enable_mmap;
+    bool mmap_populate;
 } CMmapConfig;
 
 typedef struct CTraceConfig {

@@ -124,15 +124,6 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 		return merr.WrapErrAsInputError(merr.WrapErrParameterTooLarge("insert request size exceeds maxInsertSize"))
 	}
 
-	replicateID, err := GetReplicateID(it.ctx, it.insertMsg.GetDbName(), collectionName)
-	if err != nil {
-		log.Warn("get replicate id failed", zap.String("collectionName", collectionName), zap.Error(err))
-		return merr.WrapErrAsInputError(err)
-	}
-	if replicateID != "" {
-		return merr.WrapErrCollectionReplicateMode("insert")
-	}
-
 	collID, err := globalMetaCache.GetCollectionID(context.Background(), it.insertMsg.GetDbName(), collectionName)
 	if err != nil {
 		log.Ctx(ctx).Warn("fail to get collection id", zap.Error(err))
@@ -145,6 +136,7 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 		log.Ctx(ctx).Warn("fail to get collection info", zap.Error(err))
 		return err
 	}
+
 	if it.schemaTimestamp != 0 {
 		if it.schemaTimestamp != colInfo.updateTimestamp {
 			err := merr.WrapErrCollectionSchemaMisMatch(collectionName)
@@ -174,8 +166,16 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 	var rowIDEnd UniqueID
 	tr := timerecord.NewTimeRecorder("applyPK")
 	clusterID := Params.CommonCfg.ClusterID.GetAsUint64()
-	rowIDBegin, rowIDEnd, _ = common.AllocAutoID(it.idAllocator.Alloc, rowNums, clusterID)
+	rowIDBegin, rowIDEnd, AllocErr := common.AllocAutoID(it.idAllocator.Alloc, rowNums, clusterID)
 	metrics.ProxyApplyPrimaryKeyLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	if AllocErr != nil {
+		log.Ctx(ctx).Warn("failed to allocate auto id",
+			zap.String("collectionName", collectionName),
+			zap.Int64("collectionID", it.collectionID),
+			zap.Uint32("rowNums", rowNums),
+			zap.Error(AllocErr))
+		return AllocErr
+	}
 
 	it.insertMsg.RowIDs = make([]UniqueID, rowNums)
 	for i := rowIDBegin; i < rowIDEnd; i++ {
@@ -203,11 +203,9 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 		}
 	}
 
-	if Params.CommonCfg.EnableNamespace.GetAsBool() {
-		err = addNamespaceData(it.schema, it.insertMsg)
-		if err != nil {
-			return err
-		}
+	err = addNamespaceData(it.schema, it.insertMsg)
+	if err != nil {
+		return err
 	}
 
 	err = checkAndFlattenStructFieldData(it.schema, it.insertMsg)
@@ -235,11 +233,15 @@ func (it *insertTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	// set field ID to insert field data
-	err = fillFieldPropertiesBySchema(it.insertMsg.GetFieldsData(), schema.CollectionSchema)
+	// Validate and set field ID to insert field data
+	err = validateFieldDataColumns(it.insertMsg.GetFieldsData(), schema)
 	if err != nil {
-		log.Info("set fieldID to fieldData failed",
-			zap.Error(err))
+		log.Info("validate field data columns failed", zap.Error(err))
+		return err
+	}
+	err = fillFieldPropertiesOnly(it.insertMsg.GetFieldsData(), schema)
+	if err != nil {
+		log.Info("fill field properties failed", zap.Error(err))
 		return err
 	}
 

@@ -19,6 +19,7 @@
 package embedding
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -39,23 +40,30 @@ type SiliconflowEmbeddingProvider struct {
 
 	maxBatch   int
 	timeoutSec int64
+	extraInfo  *models.ModelExtraInfo
 }
 
-func NewSiliconflowEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, params map[string]string, credentials *credentials.Credentials) (*SiliconflowEmbeddingProvider, error) {
+func NewSiliconflowEmbeddingProvider(fieldSchema *schemapb.FieldSchema, functionSchema *schemapb.FunctionSchema, params map[string]string, credentials *credentials.Credentials, extraInfo *models.ModelExtraInfo) (*SiliconflowEmbeddingProvider, error) {
 	fieldDim, err := typeutil.GetDim(fieldSchema)
 	if err != nil {
 		return nil, err
 	}
-	apiKey, url, err := models.ParseAKAndURL(credentials, functionSchema.Params, params, models.SiliconflowAKEnvStr)
+	apiKey, url, err := models.ParseAKAndURL(credentials, functionSchema.Params, params, models.SiliconflowAKEnvStr, extraInfo)
 	if err != nil {
 		return nil, err
 	}
 	var modelName string
+	var dim int64
 
 	for _, param := range functionSchema.Params {
 		switch strings.ToLower(param.Key) {
 		case models.ModelNameParamKey:
 			modelName = param.Value
+		case models.DimParamKey:
+			dim, err = models.ParseAndCheckFieldDim(param.Value, fieldDim, fieldSchema.Name)
+			if err != nil {
+				return nil, err
+			}
 		default:
 		}
 	}
@@ -70,25 +78,27 @@ func NewSiliconflowEmbeddingProvider(fieldSchema *schemapb.FieldSchema, function
 	}
 
 	provider := SiliconflowEmbeddingProvider{
-		client:     c,
-		url:        url,
-		fieldDim:   fieldDim,
-		modelName:  modelName,
-		maxBatch:   32,
-		timeoutSec: 30,
+		client:        c,
+		url:           url,
+		fieldDim:      fieldDim,
+		modelName:     modelName,
+		embedDimParam: dim,
+		maxBatch:      32,
+		timeoutSec:    30,
+		extraInfo:     extraInfo,
 	}
 	return &provider, nil
 }
 
 func (provider *SiliconflowEmbeddingProvider) MaxBatch() int {
-	return 5 * provider.maxBatch
+	return provider.extraInfo.BatchFactor * provider.maxBatch
 }
 
 func (provider *SiliconflowEmbeddingProvider) FieldDim() int64 {
 	return provider.fieldDim
 }
 
-func (provider *SiliconflowEmbeddingProvider) CallEmbedding(texts []string, _ models.TextEmbeddingMode) (any, error) {
+func (provider *SiliconflowEmbeddingProvider) CallEmbedding(ctx context.Context, texts []string, _ models.TextEmbeddingMode) (any, error) {
 	numRows := len(texts)
 	data := make([][]float32, 0, numRows)
 	for i := 0; i < numRows; i += provider.maxBatch {
@@ -96,7 +106,7 @@ func (provider *SiliconflowEmbeddingProvider) CallEmbedding(texts []string, _ mo
 		if end > numRows {
 			end = numRows
 		}
-		resp, err := provider.client.Embedding(provider.url, provider.modelName, texts[i:end], "float", provider.timeoutSec)
+		resp, err := provider.client.Embedding(provider.url, provider.modelName, texts[i:end], "float", int(provider.embedDimParam), provider.timeoutSec)
 		if err != nil {
 			return nil, err
 		}

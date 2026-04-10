@@ -9,7 +9,7 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include <re2/re2.h>
+#include <mutex>
 
 #include "common/RegexQuery.h"
 
@@ -58,6 +58,42 @@ translate_pattern_match_to_regex(const std::string& pattern) {
             }
         }
     }
+    // Trailing backslash is a parse error - nothing to escape
+    if (escape_mode) {
+        ThrowInfo(ExprInvalid,
+                  "Invalid LIKE pattern: trailing backslash with nothing "
+                  "to escape");
+    }
     return r;
 }
+
+std::string
+extract_fixed_prefix_from_pattern(const std::string& pattern) {
+    std::string prefix;
+    prefix.reserve(pattern.size());
+    bool escape_mode = false;
+
+    for (char c : pattern) {
+        if (escape_mode) {
+            prefix += c;
+            escape_mode = false;
+        } else {
+            if (c == '\\') {
+                escape_mode = true;
+            } else if (c == '%' || c == '_') {
+                break;  // stop at first wildcard
+            } else {
+                prefix += c;
+            }
+        }
+    }
+    // Trailing backslash is a parse error - nothing to escape
+    if (escape_mode) {
+        ThrowInfo(ExprInvalid,
+                  "Invalid LIKE pattern: trailing backslash with nothing "
+                  "to escape");
+    }
+    return prefix;
+}
+
 }  // namespace milvus

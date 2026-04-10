@@ -29,11 +29,9 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/datanode/index"
-	"github.com/milvus-io/milvus/internal/flushcommon/io"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
-	"github.com/milvus-io/milvus/pkg/v2/proto/indexcgopb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -87,7 +85,7 @@ func (node *DataNode) CreateJob(ctx context.Context, req *workerpb.CreateJobRequ
 	}); oldInfo != nil {
 		err := merr.WrapErrIndexDuplicate(req.GetIndexName(), "building index task existed")
 		log.Warn("duplicated index build task", zap.Error(err))
-		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(paramtable.GetStringNodeID(), metrics.FailLabel).Inc()
 		return merr.Status(err), nil
 	}
 	cm, err := node.storageFactory.NewChunkManager(node.ctx, req.GetStorageConfig())
@@ -97,10 +95,10 @@ func (node *DataNode) CreateJob(ctx context.Context, req *workerpb.CreateJobRequ
 			zap.Error(err),
 		)
 		node.taskManager.DeleteIndexTaskInfos(ctx, []index.Key{{ClusterID: req.GetClusterID(), TaskID: req.GetBuildID()}})
-		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(paramtable.GetStringNodeID(), metrics.FailLabel).Inc()
 		return merr.Status(err), nil
 	}
-	pluginContext, err := ParseCPluginContext(req.GetPluginContext(), req.GetCollectionID())
+	pluginContext, err := hookutil.GetCPluginContext(req.GetPluginContext(), req.GetCollectionID())
 	if err != nil {
 		return merr.Status(err), nil
 	}
@@ -113,7 +111,7 @@ func (node *DataNode) CreateJob(ctx context.Context, req *workerpb.CreateJobRequ
 		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.FailLabel).Inc()
 		return ret, nil
 	}
-	metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.SuccessLabel).Inc()
+	metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(paramtable.GetStringNodeID(), metrics.SuccessLabel).Inc()
 	log.Info("DataNode successfully scheduled",
 		zap.String("indexName", req.GetIndexName()))
 	return ret, nil
@@ -155,7 +153,7 @@ func (node *DataNode) QueryJobs(ctx context.Context, req *workerpb.QueryJobsRequ
 			ret.IndexInfos[i].MemSize = info.MemSize
 			ret.IndexInfos[i].FailReason = info.FailReason
 			ret.IndexInfos[i].CurrentIndexVersion = info.CurrentIndexVersion
-			ret.IndexInfos[i].IndexStoreVersion = info.IndexStoreVersion
+			ret.IndexInfos[i].CurrentScalarIndexVersion = info.CurrentScalarIndexVersion
 			log.RatedDebug(5, "querying index build task",
 				zap.Int64("indexBuildID", buildID),
 				zap.String("state", info.State.String()),
@@ -202,7 +200,7 @@ func (node *DataNode) GetJobStats(ctx context.Context, req *workerpb.GetJobStats
 	defer node.lifetime.Done()
 
 	var (
-		totalSlots     = node.totalSlot
+		totalSlots     = index.CalculateNodeSlots()
 		indexStatsUsed = node.taskScheduler.TaskQueue.GetUsingSlot()
 		compactionUsed = node.compactionExecutor.Slots()
 		importUsed     = node.importScheduler.Slots()
@@ -223,7 +221,7 @@ func (node *DataNode) GetJobStats(ctx context.Context, req *workerpb.GetJobStats
 
 	return &workerpb.GetJobStatsResponse{
 		Status:         merr.Success(),
-		TotalSlots:     node.totalSlot,
+		TotalSlots:     totalSlots,
 		AvailableSlots: availableSlots,
 	}, nil
 }
@@ -263,6 +261,8 @@ func (node *DataNode) CreateJobV2(ctx context.Context, req *workerpb.CreateJobV2
 
 func (node *DataNode) createIndexTask(ctx context.Context, req *workerpb.CreateJobRequest) (*commonpb.Status, error) {
 	log.Ctx(ctx).Info("DataNode building index ...",
+		zap.String("clusterID", req.GetClusterID()),
+		zap.Int64("taskID", req.GetBuildID()),
 		zap.Int64("collectionID", req.GetCollectionID()),
 		zap.Int64("partitionID", req.GetPartitionID()),
 		zap.Int64("segmentID", req.GetSegmentID()),
@@ -295,7 +295,7 @@ func (node *DataNode) createIndexTask(ctx context.Context, req *workerpb.CreateJ
 		err := merr.WrapErrTaskDuplicate(indexpb.JobType_JobTypeIndexJob.String(),
 			fmt.Sprintf("building index task existed with %s-%d", req.GetClusterID(), req.GetBuildID()))
 		log.Warn("duplicated index build task", zap.Error(err))
-		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(paramtable.GetStringNodeID(), metrics.FailLabel).Inc()
 		return merr.Status(err), nil
 	}
 	cm, err := node.storageFactory.NewChunkManager(node.ctx, req.GetStorageConfig())
@@ -305,11 +305,11 @@ func (node *DataNode) createIndexTask(ctx context.Context, req *workerpb.CreateJ
 			zap.Error(err),
 		)
 		node.taskManager.DeleteIndexTaskInfos(ctx, []index.Key{{ClusterID: req.GetClusterID(), TaskID: req.GetBuildID()}})
-		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(paramtable.GetStringNodeID(), metrics.FailLabel).Inc()
 		return merr.Status(err), nil
 	}
 
-	pluginContext, err := ParseCPluginContext(req.GetPluginContext(), req.GetCollectionID())
+	pluginContext, err := hookutil.GetCPluginContext(req.GetPluginContext(), req.GetCollectionID())
 	if err != nil {
 		return merr.Status(err), nil
 	}
@@ -323,14 +323,17 @@ func (node *DataNode) createIndexTask(ctx context.Context, req *workerpb.CreateJ
 		metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.FailLabel).Inc()
 		return ret, nil
 	}
-	metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.SuccessLabel).Inc()
+	metrics.DataNodeBuildIndexTaskCounter.WithLabelValues(paramtable.GetStringNodeID(), metrics.SuccessLabel).Inc()
 	log.Info("DataNode index job enqueued successfully",
 		zap.String("indexName", req.GetIndexName()))
 	return ret, nil
 }
 
 func (node *DataNode) createAnalyzeTask(ctx context.Context, req *workerpb.AnalyzeRequest) (*commonpb.Status, error) {
-	log.Ctx(ctx).Info("receive analyze job", zap.Int64("collectionID", req.GetCollectionID()),
+	log.Ctx(ctx).Info("receive analyze job",
+		zap.String("clusterID", req.GetClusterID()),
+		zap.Int64("taskID", req.GetTaskID()),
+		zap.Int64("collectionID", req.GetCollectionID()),
 		zap.Int64("partitionID", req.GetPartitionID()),
 		zap.Int64("fieldID", req.GetFieldID()),
 		zap.String("fieldName", req.GetFieldName()),
@@ -369,7 +372,10 @@ func (node *DataNode) createAnalyzeTask(ctx context.Context, req *workerpb.Analy
 }
 
 func (node *DataNode) createStatsTask(ctx context.Context, req *workerpb.CreateStatsRequest) (*commonpb.Status, error) {
-	log.Ctx(ctx).Info("receive stats job", zap.Int64("collectionID", req.GetCollectionID()),
+	log.Ctx(ctx).Info("receive stats job",
+		zap.String("clusterID", req.GetClusterID()),
+		zap.Int64("taskID", req.GetTaskID()),
+		zap.Int64("collectionID", req.GetCollectionID()),
 		zap.Int64("partitionID", req.GetPartitionID()),
 		zap.Int64("segmentID", req.GetSegmentID()),
 		zap.Int64("numRows", req.GetNumRows()),
@@ -405,7 +411,7 @@ func (node *DataNode) createStatsTask(ctx context.Context, req *workerpb.CreateS
 		return merr.Status(err), nil
 	}
 
-	t := index.NewStatsTask(taskCtx, taskCancel, req, node.taskManager, io.NewBinlogIO(cm))
+	t := index.NewStatsTask(taskCtx, taskCancel, req, node.taskManager, cm)
 	ret := merr.Success()
 	if err := node.taskScheduler.TaskQueue.Enqueue(t); err != nil {
 		log.Warn("DataNode failed to schedule", zap.Error(err))
@@ -610,18 +616,4 @@ func (node *DataNode) DropJobsV2(ctx context.Context, req *workerpb.DropJobsV2Re
 		log.Warn("DataNode receive dropping unknown type jobs")
 		return merr.Status(errors.New("DataNode receive dropping unknown type jobs")), nil
 	}
-}
-
-func ParseCPluginContext(context []*commonpb.KeyValuePair, collectionID int64) (*indexcgopb.StoragePluginContext, error) {
-	pluginContext, err := hookutil.CreateLocalEZByPluginContext(context)
-	if err != nil {
-		return nil, err
-	}
-
-	if pluginContext != nil {
-		pluginContext.CollectionId = collectionID
-		return pluginContext, nil
-	}
-
-	return nil, nil
 }

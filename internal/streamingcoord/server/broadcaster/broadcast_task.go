@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/resource"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
@@ -18,20 +19,24 @@ import (
 
 // newBroadcastTaskFromProto creates a new broadcast task from the proto.
 func newBroadcastTaskFromProto(proto *streamingpb.BroadcastTask, metrics *broadcasterMetrics, ackCallbackScheduler *ackCallbackScheduler) *broadcastTask {
-	m := metrics.NewBroadcastTask(proto.GetState())
 	msg := message.NewBroadcastMutableMessageBeforeAppend(proto.Message.Payload, proto.Message.Properties)
+	m := metrics.NewBroadcastTask(msg.MessageType(), proto.GetState(), msg.BroadcastHeader().ResourceKeys.Collect())
+
+	fixAckInfoFromProto(proto, len(msg.BroadcastHeader().VChannels))
+
 	bt := &broadcastTask{
 		mu:                   sync.Mutex{},
+		taskMetricsGuard:     m,
 		msg:                  msg,
 		task:                 proto,
-		dirty:                true, // the task is recovered from the recovery info, so it's persisted.
-		metrics:              m,
+		dirty:                false, // the task is recovered from the recovery info, so it's persisted.
 		ackCallbackScheduler: ackCallbackScheduler,
 		done:                 make(chan struct{}),
 		allAcked:             make(chan struct{}),
+		allAckedClosed:       false,
 	}
 	if isAllDone(bt.task) {
-		close(bt.allAcked)
+		bt.closeAllAcked()
 	}
 	if proto.State == streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_TOMBSTONE {
 		close(bt.done)
@@ -39,25 +44,44 @@ func newBroadcastTaskFromProto(proto *streamingpb.BroadcastTask, metrics *broadc
 	return bt
 }
 
+// fixAckInfoFromProto fixes the recovery info of the broadcast task.
+// because the zero value of the repeated field and bytes field in proto is ignored or treated as empty value but not nil pointer,
+// so we need to fix the recovery info of the broadcast task from proto to keep the consistency of memory state.
+func fixAckInfoFromProto(proto *streamingpb.BroadcastTask, vchannelCount int) {
+	bitmap := make([]byte, vchannelCount)
+	copy(bitmap, proto.AckedVchannelBitmap)
+
+	checkpoints := make([]*streamingpb.AckedCheckpoint, vchannelCount)
+	for i, cp := range proto.AckedCheckpoints {
+		if cp != nil && cp.TimeTick == 0 {
+			cp = nil
+		}
+		checkpoints[i] = cp
+	}
+	proto.AckedVchannelBitmap = bitmap
+	proto.AckedCheckpoints = checkpoints
+}
+
 // newBroadcastTaskFromBroadcastMessage creates a new broadcast task from the broadcast message.
 func newBroadcastTaskFromBroadcastMessage(msg message.BroadcastMutableMessage, metrics *broadcasterMetrics, ackCallbackScheduler *ackCallbackScheduler) *broadcastTask {
-	m := metrics.NewBroadcastTask(streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_PENDING)
+	m := metrics.NewBroadcastTask(msg.MessageType(), streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_PENDING, msg.BroadcastHeader().ResourceKeys.Collect())
 	header := msg.BroadcastHeader()
 	bt := &broadcastTask{
-		Binder: log.Binder{},
-		mu:     sync.Mutex{},
-		msg:    msg,
+		Binder:           log.Binder{},
+		taskMetricsGuard: m,
+		mu:               sync.Mutex{},
+		msg:              msg,
 		task: &streamingpb.BroadcastTask{
 			Message:             msg.IntoMessageProto(),
 			State:               streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_PENDING,
 			AckedVchannelBitmap: make([]byte, len(header.VChannels)),
 			AckedCheckpoints:    make([]*streamingpb.AckedCheckpoint, len(header.VChannels)),
 		},
-		dirty:                false,
-		metrics:              m,
+		dirty:                true,
 		ackCallbackScheduler: ackCallbackScheduler,
 		done:                 make(chan struct{}),
 		allAcked:             make(chan struct{}),
+		allAckedClosed:       false,
 	}
 	return bt
 }
@@ -68,20 +92,22 @@ func newBroadcastTaskFromImmutableMessage(msg message.ImmutableMessage, metrics 
 	task := newBroadcastTaskFromBroadcastMessage(broadcastMsg, metrics, ackCallbackScheduler)
 	// if the task is created from the immutable message, it already has been broadcasted, so transfer its state into recovered.
 	task.task.State = streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_REPLICATED
-	task.metrics.ToState(streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_REPLICATED)
+	task.ObserveStateChanged(streamingpb.BroadcastTaskState_BROADCAST_TASK_STATE_REPLICATED)
 	return task
 }
 
 // broadcastTask is the state of the broadcast task.
 type broadcastTask struct {
 	log.Binder
+	*taskMetricsGuard
+
 	mu                       sync.Mutex
 	msg                      message.BroadcastMutableMessage
 	task                     *streamingpb.BroadcastTask
 	dirty                    bool // a flag to indicate that the task has been modified and needs to be saved into the recovery info.
-	metrics                  *taskMetricsGuard
 	done                     chan struct{}
 	allAcked                 chan struct{}
+	allAckedClosed           bool
 	guards                   *lockGuards
 	ackCallbackScheduler     *ackCallbackScheduler
 	joinAckCallbackScheduled bool // a flag to indicate that the join ack callback is scheduled.
@@ -175,6 +201,54 @@ func (b *broadcastTask) PendingBroadcastMessages() []message.MutableMessage {
 	return pendingMessages
 }
 
+// IsAlterReplicateConfigMessage returns true if this task is an AlterReplicateConfig message.
+func (b *broadcastTask) IsAlterReplicateConfigMessage() bool {
+	return b.msg.MessageType() == message.MessageTypeAlterReplicateConfig
+}
+
+// IsForcePromoteMessage returns true if this task is a force promote AlterReplicateConfig message.
+func (b *broadcastTask) IsForcePromoteMessage() bool {
+	if b.msg.MessageType() != message.MessageTypeAlterReplicateConfig {
+		return false
+	}
+	alterMsg, err := message.AsMutableAlterReplicateConfigMessageV2(b.msg)
+	if err != nil {
+		return false
+	}
+	return alterMsg.Header().ForcePromote
+}
+
+// MarkIgnoreAndSave marks the task's message header with ignore=true and saves to catalog.
+// This is used for force promote to mark incomplete AlterReplicateConfig messages as ignored.
+func (b *broadcastTask) MarkIgnoreAndSave(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Parse the message as AlterReplicateConfig
+	msg := message.NewBroadcastMutableMessageBeforeAppend(b.task.Message.Payload, b.task.Message.Properties)
+	alterMsg, err := message.AsMutableAlterReplicateConfigMessageV2(msg)
+	if err != nil {
+		return errors.Wrap(err, "failed to parse message as AlterReplicateConfigMessage")
+	}
+
+	// Get current header and set ignore to true
+	header := alterMsg.Header()
+	header.Ignore = true
+	alterMsg.OverwriteHeader(header)
+
+	// Re-create the broadcast message from updated payload and properties
+	// The OverwriteHeader call above modified the underlying messageImpl properties
+	updatedMsg := message.NewBroadcastMutableMessageBeforeAppend(b.task.Message.Payload, b.task.Message.Properties)
+
+	// Update the task's message proto
+	b.task.Message = updatedMsg.IntoMessageProto()
+	b.msg = updatedMsg
+	b.dirty = true
+
+	// Save to catalog
+	return b.saveTaskIfDirty(ctx, b.Logger())
+}
+
 // InitializeRecovery initializes the recovery of the broadcast task.
 func (b *broadcastTask) InitializeRecovery(ctx context.Context) error {
 	b.mu.Lock()
@@ -220,11 +294,11 @@ func (b *broadcastTask) getImmutableMessageFromVChannel(vchannel string, result 
 
 // Ack acknowledges the message at the specified vchannel.
 // return true if all the vchannels are acked at first time, false if not.
-func (b *broadcastTask) Ack(ctx context.Context, msgs ...message.ImmutableMessage) (err error) {
+func (b *broadcastTask) Ack(ctx context.Context, msgs message.ImmutableMessage) (err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	return b.ack(ctx, msgs...)
+	return b.ack(ctx, msgs)
 }
 
 // ack acknowledges the message at the specified vchannel.
@@ -233,10 +307,14 @@ func (b *broadcastTask) ack(ctx context.Context, msgs ...message.ImmutableMessag
 	if !b.dirty {
 		return nil
 	}
+	// because the incoming ack operation is always with one vchannel at a time or with all the vchannels at once,
+	// so we don't need to filter the vchannel that has been acked.
+	if err := registry.CallMessageAckOnceCallbacks(ctx, msgs...); err != nil {
+		return err
+	}
 	if err := b.saveTaskIfDirty(ctx, b.Logger()); err != nil {
 		return err
 	}
-
 	allDone := isAllDone(b.task)
 	if (isControlChannelAcked || allDone) && !b.joinAckCallbackScheduled {
 		// after 2.6.5, the control channel is always broadcasted, it's used to determine the order of the ack callback operations.
@@ -247,10 +325,18 @@ func (b *broadcastTask) ack(ctx context.Context, msgs ...message.ImmutableMessag
 		b.joinAckCallbackScheduled = true
 	}
 	if allDone {
-		close(b.allAcked)
-		b.metrics.ObserveAckAll()
+		b.closeAllAcked()
 	}
 	return nil
+}
+
+// closeAllAcked closes the allAcked channel.
+func (b *broadcastTask) closeAllAcked() {
+	if b.allAckedClosed {
+		return
+	}
+	close(b.allAcked)
+	b.allAckedClosed = true
 }
 
 // hasControlChannel checks if the control channel is broadcasted.
@@ -338,10 +424,16 @@ func findIdxOfVChannel(vchannel string, vchannels []string) (int, error) {
 // FastAck trigger a fast ack operation when the broadcast operation is done.
 func (b *broadcastTask) FastAck(ctx context.Context, broadcastResult map[string]*types.AppendResult) error {
 	// Broadcast operation is done.
-	b.metrics.ObserveBroadcastDone()
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	b.ObserveBroadcastDone()
+
+	if b.Header().AckSyncUp {
+		// Because the ack sync up is enabled, the ack operation want to be synced up at comsuming side of streaming node,
+		// so we can not make a fast ack operation here to speed up the ack operation.
+		return nil
+	}
 
 	// because we need to wait for the streamingnode to ack the message,
 	// however, if the message is already write into wal, the message is determined,
@@ -421,7 +513,7 @@ func (b *broadcastTask) saveTaskIfDirty(ctx context.Context, logger *log.MLogger
 		}
 		return err
 	}
-	b.metrics.ToState(b.task.State)
+	b.ObserveStateChanged(b.task.State)
 	logger.Info("save broadcast task done")
 	return nil
 }

@@ -67,6 +67,7 @@ type StreamingNodeManager struct {
 	cond                *syncutil.ContextCond
 	latestAssignments   map[string]types.PChannelInfoAssigned // The latest assignments info got from streaming coord balance module.
 	nodeChangedNotifier *syncutil.VersionedNotifier           // used to notify that node in streaming node manager has been changed.
+	previousNodeIDs     typeutil.UniqueSet                    // used to store the previous node ids.
 }
 
 // GetBalancer returns the balancer of the streaming node manager.
@@ -149,14 +150,17 @@ func (s *StreamingNodeManager) GetStreamingQueryNodeIDs() typeutil.UniqueSet {
 	if err != nil {
 		panic(err)
 	}
-	streamingNodes, err := balancer.GetAllStreamingNodes(context.Background())
+	streamingNodes, err := balancer.GetAvailableStreamingNodes(context.Background())
 	if err != nil {
-		panic(err)
+		// when the streaming coord is on shutdown, the balancer will return an error,
+		// causing panic, so we need to return the previous node ids.
+		return s.previousNodeIDs
 	}
 	streamingNodeIDs := typeutil.NewUniqueSet()
 	for _, streamingNode := range streamingNodes {
 		streamingNodeIDs.Insert(streamingNode.ServerID)
 	}
+	s.previousNodeIDs = streamingNodeIDs
 	return streamingNodeIDs
 }
 

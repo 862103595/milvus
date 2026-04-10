@@ -21,13 +21,23 @@ import (
 )
 
 type functionConfig struct {
-	TextEmbeddingProviders ParamGroup `refreshable:"true"`
-	RerankModelProviders   ParamGroup `refreshable:"true"`
-	LocalResourcePath      ParamItem  `refreshable:"true"`
-	LinderaDownloadUrls    ParamGroup `refreshable:"true"`
+	BatchFactor                   ParamItem  `refreshable:"true"`
+	TextEmbeddingProviders        ParamGroup `refreshable:"true"`
+	RerankModelProviders          ParamGroup `refreshable:"true"`
+	LocalResourcePath             ParamItem  `refreshable:"true"`
+	LinderaDownloadUrls           ParamGroup `refreshable:"true"`
+	ZillizProviders               ParamGroup `refreshable:"true"`
+	AnalyzerConcurrencyPerCPUCore ParamItem  `refreshable:"true"`
 }
 
 func (p *functionConfig) init(base *BaseTable) {
+	p.BatchFactor = ParamItem{
+		Key:          "function.batch_factor.",
+		Version:      "2.6.7",
+		DefaultValue: "5",
+	}
+	p.BatchFactor.Init(base.mgr)
+
 	p.TextEmbeddingProviders = ParamGroup{
 		KeyPrefix: "function.textEmbedding.providers.",
 		Version:   "2.6.0",
@@ -86,6 +96,18 @@ func (p *functionConfig) init(base *BaseTable) {
 				return "The name in the crendential configuration item"
 			case "vertexai.enable":
 				return "Whether to enable vertexai model service"
+			case "yc.credential":
+				return "The name in the credential configuration item"
+			case "yc.url":
+				return "Your Yandex Cloud text embedding url, Default is the official text embedding url"
+			case "yc.enable":
+				return "Whether to enable Yandex Cloud model service"
+			case "gemini.credential":
+				return "The name in the credential configuration item"
+			case "gemini.url":
+				return "Your Gemini embedding url, Default is the official embedding url"
+			case "gemini.enable":
+				return "Whether to enable Gemini model service"
 			default:
 				return ""
 			}
@@ -145,11 +167,22 @@ func (p *functionConfig) init(base *BaseTable) {
 		Version:   "2.5.16",
 	}
 	p.LinderaDownloadUrls.Init(base.mgr)
-}
 
-const (
-	textEmbeddingKey string = "textEmbedding"
-)
+	p.ZillizProviders = ParamGroup{
+		KeyPrefix: "function.models.zilliz.",
+		Version:   "2.6.5",
+	}
+	p.ZillizProviders.Init(base.mgr)
+
+	p.AnalyzerConcurrencyPerCPUCore = ParamItem{
+		Key:          "function.analyzer.concurrency_per_cpu_core",
+		Version:      "2.6.8",
+		Export:       true,
+		Doc:          "The concurrency per cpu core for analyzer, pipeline not included",
+		DefaultValue: "8",
+	}
+	p.AnalyzerConcurrencyPerCPUCore.Init(base.mgr)
+}
 
 func (p *functionConfig) GetTextEmbeddingProviderConfig(providerName string) map[string]string {
 	matchedParam := make(map[string]string)
@@ -163,6 +196,14 @@ func (p *functionConfig) GetTextEmbeddingProviderConfig(providerName string) map
 		}
 	}
 	return matchedParam
+}
+
+func (p *functionConfig) GetBatchFactor() int {
+	factor := p.BatchFactor.GetAsInt()
+	if factor <= 0 {
+		factor = 1
+	}
+	return factor
 }
 
 func (p *functionConfig) GetRerankModelProviders(providerName string) map[string]string {

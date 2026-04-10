@@ -59,7 +59,6 @@ func (rs ResultSet) Len() int {
 func (rs ResultSet) Slice(start, end int) ResultSet {
 	result := ResultSet{
 		sch: rs.sch,
-		IDs: rs.IDs.Slice(start, end),
 		Fields: lo.Map(rs.Fields, func(column column.Column, _ int) column.Column {
 			return column.Slice(start, end)
 		}),
@@ -67,12 +66,26 @@ func (rs ResultSet) Slice(start, end int) ResultSet {
 		Err: rs.Err,
 	}
 
+	// Handle IDs - may be nil for Query results
+	if rs.IDs != nil {
+		result.IDs = rs.IDs.Slice(start, end)
+		result.ResultCount = result.IDs.Len()
+	} else if len(result.Fields) > 0 {
+		result.ResultCount = result.Fields[0].Len()
+	}
+
 	if rs.GroupByValue != nil {
 		result.GroupByValue = rs.GroupByValue.Slice(start, end)
 	}
 
-	result.ResultCount = result.IDs.Len()
-	result.Scores = rs.Scores[start : start+result.ResultCount]
+	// Handle Scores - may be nil or empty for Query results
+	if len(rs.Scores) > 0 && result.ResultCount > 0 {
+		scoreEnd := start + result.ResultCount
+		if scoreEnd > len(rs.Scores) {
+			scoreEnd = len(rs.Scores)
+		}
+		result.Scores = rs.Scores[start:scoreEnd]
+	}
 
 	return result
 }
@@ -135,7 +148,14 @@ func (sr *ResultSet) fillPKEntry(receiver any) (err error) {
 			if err != nil {
 				return err
 			}
-			row.Field(candi).Set(reflect.ValueOf(val))
+			field := row.Field(candi)
+			if field.Kind() == reflect.Ptr {
+				ptr := reflect.New(field.Type().Elem())
+				ptr.Elem().Set(reflect.ValueOf(val))
+				field.Set(ptr)
+			} else {
+				field.Set(reflect.ValueOf(val))
+			}
 		}
 		rr.Set(rv)
 	default:
@@ -214,12 +234,33 @@ func (ds DataSet) fillData(data reflect.Value, dataType reflect.Type, idx int) e
 			// `strict` mode could be added in the future to return error if any column missing
 			continue
 		}
-		val, err := ds[i].Get(idx)
-		if err != nil {
-			return err
+
+		field := data.Field(fidx)
+		fieldType := dataType.Field(fidx).Type
+
+		if fieldType.Kind() == reflect.Ptr {
+			isNull, err := ds[i].IsNull(idx)
+			if err != nil {
+				return err
+			}
+			if isNull {
+				field.Set(reflect.Zero(fieldType))
+				continue
+			}
+			val, err := ds[i].Get(idx)
+			if err != nil {
+				return err
+			}
+			ptr := reflect.New(fieldType.Elem())
+			ptr.Elem().Set(reflect.ValueOf(val))
+			field.Set(ptr)
+		} else {
+			val, err := ds[i].Get(idx)
+			if err != nil {
+				return err
+			}
+			field.Set(reflect.ValueOf(val))
 		}
-		// TODO check datatype, return error here instead of reflect panicking & recover
-		data.Field(fidx).Set(reflect.ValueOf(val))
 	}
 	return nil
 }

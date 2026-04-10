@@ -254,13 +254,18 @@ func exprWalker(expr *planpb.Expr, filter filterFunc) bool {
 }
 
 func doSparseFilter(seg Segment, plan *planpb.PlanNode) bool {
-	queryPlan := plan.GetQuery()
-	if queryPlan == nil {
-		// do nothing if current plan not the query plan
-		return true
+	var pexpr *planpb.Expr
+
+	// support Query/Retrieve plan
+	if queryPlan := plan.GetQuery(); queryPlan != nil {
+		pexpr = queryPlan.GetPredicates()
 	}
 
-	pexpr := queryPlan.GetPredicates()
+	// support Search plan (VectorAnns)
+	if vectorAnns := plan.GetVectorAnns(); vectorAnns != nil {
+		pexpr = vectorAnns.GetPredicates()
+	}
+
 	if pexpr == nil {
 		return true
 	}
@@ -277,9 +282,9 @@ func doSparseFilter(seg Segment, plan *planpb.PlanNode) bool {
 		switch op {
 		case planpb.OpType_Equal:
 
-			// bloom filter
-			existBF := seg.BloomFilterExist()
-			if existBF {
+			// bloom filter / PK candidate check
+			pkCheckReady := seg.PkCandidateExist()
+			if pkCheckReady {
 				lc := storage.NewLocationsCache(pk)
 				// BloomFilter contains this key, no filter here
 				noFilter = seg.MayPkExist(lc)
@@ -308,7 +313,7 @@ func doSparseFilter(seg Segment, plan *planpb.PlanNode) bool {
 
 type SegmentSparseFilter SegmentType
 
-func WithSparseFilter(plan *planpb.PlanNode) SegmentFilter {
+func WithSparseFilter(plan *planpb.PlanNode, filteredCount *int) SegmentFilter {
 	return SegmentFilterFunc(func(segment Segment) bool {
 		if plan == nil {
 			log.Debug("SparseFilter with nil plan")
@@ -317,10 +322,14 @@ func WithSparseFilter(plan *planpb.PlanNode) SegmentFilter {
 
 		rc := doSparseFilter(segment, plan)
 
+		if !rc && filteredCount != nil {
+			*filteredCount++
+		}
+
 		log.Debug("SparseFilter",
 			zap.Int64("Segment ID", segment.ID()),
 			zap.Bool("No Filter", rc),
-			zap.Bool("Exist BF", segment.BloomFilterExist()))
+			zap.Bool("pkCheckReady", segment.PkCandidateExist()))
 		return rc
 	})
 }

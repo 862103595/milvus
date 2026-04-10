@@ -43,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
 	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_balancer"
 	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_broadcaster"
+	"github.com/milvus-io/milvus/internal/querycoordv2/assign"
 	"github.com/milvus-io/milvus/internal/querycoordv2/balance"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
@@ -244,6 +245,8 @@ func (suite *ServiceSuite) SetupTest() {
 	suite.taskScheduler.EXPECT().GetSegmentTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
 	suite.taskScheduler.EXPECT().GetChannelTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
 	suite.jobScheduler.Start()
+	assign.ResetGlobalAssignPolicyFactoryForTest()
+	assign.InitGlobalAssignPolicyFactory(suite.taskScheduler, suite.nodeMgr, suite.dist, suite.meta, suite.targetMgr)
 	suite.balancer = balance.NewRowCountBasedBalancer(
 		suite.taskScheduler,
 		suite.nodeMgr,
@@ -280,7 +283,6 @@ func (suite *ServiceSuite) SetupTest() {
 		cluster:             suite.cluster,
 		jobScheduler:        suite.jobScheduler,
 		taskScheduler:       suite.taskScheduler,
-		getBalancerFunc:     func() balance.Balance { return suite.balancer },
 		distController:      suite.distController,
 		ctx:                 context.Background(),
 		metricsRequest:      metricsinfo.NewMetricsRequest(),
@@ -295,7 +297,6 @@ func (suite *ServiceSuite) SetupTest() {
 		suite.nodeMgr,
 		suite.taskScheduler,
 		suite.broker,
-		suite.server.getBalancerFunc,
 	)
 
 	suite.server.registerMetricsRequest()
@@ -306,10 +307,11 @@ func (suite *ServiceSuite) SetupTest() {
 		for _, collection := range suite.collections {
 			if collection == collectionID {
 				return &milvuspb.DescribeCollectionResponse{
-					DbName:         util.DefaultDBName,
-					DbId:           1,
-					CollectionID:   collectionID,
-					CollectionName: fmt.Sprintf("collection_%d", collectionID),
+					DbName:              util.DefaultDBName,
+					DbId:                1,
+					CollectionID:        collectionID,
+					CollectionName:      fmt.Sprintf("collection_%d", collectionID),
+					VirtualChannelNames: suite.channels[collectionID],
 					Schema: &schemapb.CollectionSchema{
 						Fields: []*schemapb.FieldSchema{
 							{FieldID: 100},
@@ -458,8 +460,6 @@ func (suite *ServiceSuite) TestLoadCollection() {
 
 	// Test load all collections
 	for _, collection := range suite.collections {
-		suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).
-			Return(nil, nil)
 		suite.expectGetRecoverInfo(collection)
 
 		req := &querypb.LoadCollectionRequest{
@@ -707,7 +707,7 @@ func (suite *ServiceSuite) TestTransferNode() {
 
 	server.resourceObserver = observers.NewResourceObserver(server.meta)
 	server.resourceObserver.Start()
-	server.replicaObserver = observers.NewReplicaObserver(server.meta, server.dist)
+	server.replicaObserver = observers.NewReplicaObserver(server.meta, server.dist, server.targetMgr)
 	server.replicaObserver.Start()
 	defer server.resourceObserver.Stop()
 	defer server.replicaObserver.Stop()
@@ -857,6 +857,7 @@ func (suite *ServiceSuite) TestTransferNode() {
 
 func (suite *ServiceSuite) TestTransferReplica() {
 	ctx := context.Background()
+	suite.loadAll()
 	server := suite.server
 
 	err := server.meta.ResourceManager.AddResourceGroup(ctx, "rg1", &rgpb.ResourceGroupConfig{
@@ -882,7 +883,7 @@ func (suite *ServiceSuite) TestTransferReplica() {
 		NumReplica:          2,
 	})
 	suite.NoError(err)
-	suite.ErrorIs(merr.Error(resp), merr.ErrParameterInvalid)
+	suite.ErrorIs(merr.Error(resp), merr.ErrCollectionNotLoaded)
 
 	resp, err = suite.server.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: "rgg",
@@ -910,22 +911,6 @@ func (suite *ServiceSuite) TestTransferReplica() {
 	})
 	suite.NoError(err)
 	suite.ErrorIs(merr.Error(resp), merr.ErrParameterInvalid)
-
-	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
-		CollectionID:  1,
-		ID:            111,
-		ResourceGroup: meta.DefaultResourceGroupName,
-	}, typeutil.NewUniqueSet(1)))
-	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
-		CollectionID:  1,
-		ID:            222,
-		ResourceGroup: meta.DefaultResourceGroupName,
-	}, typeutil.NewUniqueSet(2)))
-	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
-		CollectionID:  1,
-		ID:            333,
-		ResourceGroup: meta.DefaultResourceGroupName,
-	}, typeutil.NewUniqueSet(3)))
 
 	suite.server.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
 		NodeID:   1001,
@@ -958,62 +943,45 @@ func (suite *ServiceSuite) TestTransferReplica() {
 	suite.server.meta.HandleNodeUp(ctx, 1004)
 	suite.server.meta.HandleNodeUp(ctx, 1005)
 
-	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
-		CollectionID:  2,
-		ID:            444,
-		ResourceGroup: meta.DefaultResourceGroupName,
-	}, typeutil.NewUniqueSet(3)))
-	suite.server.meta.Put(ctx, meta.NewReplica(&querypb.Replica{
-		CollectionID:  2,
-		ID:            555,
-		ResourceGroup: "rg2",
-	}, typeutil.NewUniqueSet(4)))
 	resp, err = suite.server.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: meta.DefaultResourceGroupName,
 		TargetResourceGroup: "rg2",
-		CollectionID:        2,
+		CollectionID:        1001,
 		NumReplica:          1,
 	})
-	suite.NoError(err)
-	// we support dynamically increase replica num in resource group now.
-	suite.Equal(resp.ErrorCode, commonpb.ErrorCode_Success)
+	suite.NoError(merr.CheckRPCCall(resp, err))
 
 	resp, err = suite.server.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: meta.DefaultResourceGroupName,
 		TargetResourceGroup: "rg1",
-		CollectionID:        1,
+		CollectionID:        1001,
 		NumReplica:          1,
 	})
-	suite.NoError(err)
-	// we support transfer replica to resource group load same collection.
-	suite.Equal(resp.ErrorCode, commonpb.ErrorCode_Success)
+	suite.NoError(merr.CheckRPCCall(resp, err))
 
-	replicaNum := len(suite.server.meta.ReplicaManager.GetByCollection(ctx, 1))
+	replicaNum := len(suite.server.meta.ReplicaManager.GetByCollection(ctx, 1001))
 	suite.Equal(3, replicaNum)
 	resp, err = suite.server.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: meta.DefaultResourceGroupName,
 		TargetResourceGroup: "rg3",
-		CollectionID:        1,
-		NumReplica:          2,
+		CollectionID:        1001,
+		NumReplica:          1,
 	})
-	suite.NoError(err)
-	suite.Equal(resp.ErrorCode, commonpb.ErrorCode_Success)
+	suite.NoError(merr.CheckRPCCall(resp, err))
 	resp, err = suite.server.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: "rg1",
 		TargetResourceGroup: "rg3",
-		CollectionID:        1,
+		CollectionID:        1001,
 		NumReplica:          1,
 	})
-	suite.NoError(err)
-	suite.Equal(resp.ErrorCode, commonpb.ErrorCode_Success)
-	suite.Len(suite.server.meta.GetByResourceGroup(ctx, "rg3"), 3)
+	suite.NoError(merr.CheckRPCCall(resp, err))
 
 	// server unhealthy
 	server.UpdateStateCode(commonpb.StateCode_Abnormal)
 	resp, err = suite.server.TransferReplica(ctx, &querypb.TransferReplicaRequest{
 		SourceResourceGroup: meta.DefaultResourceGroupName,
 		TargetResourceGroup: "rg3",
-		CollectionID:        1,
+		CollectionID:        1001,
 		NumReplica:          2,
 	})
 	suite.NoError(err)
@@ -1026,8 +994,6 @@ func (suite *ServiceSuite) TestLoadPartition() {
 
 	// Test load all partitions
 	for _, collection := range suite.collections {
-		suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).
-			Return(nil, nil)
 		suite.expectGetRecoverInfo(collection)
 
 		req := &querypb.LoadPartitionsRequest{
@@ -1628,7 +1594,8 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 		suite.Equal(commonpb.ErrorCode_UnexpectedError, resp.ErrorCode)
 		suite.Contains(resp.Reason, "mock error")
 
-		suite.meta.ReplicaManager.RecoverNodesInCollection(ctx, collection, map[string]typeutil.UniqueSet{meta.DefaultResourceGroupName: typeutil.NewUniqueSet(10)})
+		rgs, _ := suite.meta.ResourceManager.GetResourceGroups(ctx, []string{meta.DefaultResourceGroupName})
+		suite.meta.ReplicaManager.RecoverNodesInCollection(ctx, collection, rgs)
 		req.SourceNodeIDs = []int64{10}
 		resp, err = server.LoadBalance(ctx, req)
 		suite.NoError(err)
@@ -1949,6 +1916,7 @@ func (suite *ServiceSuite) TestHandleNodeUp() {
 	suite.server.replicaObserver = observers.NewReplicaObserver(
 		suite.server.meta,
 		suite.server.dist,
+		suite.server.targetMgr,
 	)
 	suite.server.resourceObserver = observers.NewResourceObserver(
 		suite.server.meta,
@@ -2112,8 +2080,6 @@ func (suite *ServiceSuite) expectGetRecoverInfo(collection int64) {
 }
 
 func (suite *ServiceSuite) expectLoadMetaRPCs() {
-	suite.broker.EXPECT().DescribeCollection(mock.Anything, mock.Anything).
-		Return(nil, nil).Maybe()
 	suite.broker.EXPECT().ListIndexes(mock.Anything, mock.Anything).
 		Return(nil, nil).Maybe()
 }
@@ -2255,10 +2221,50 @@ func (suite *ServiceSuite) fetchHeartbeats(time time.Time) {
 	}
 }
 
+func (suite *ServiceSuite) TestManualUpdateCurrentTarget() {
+	ctx := context.Background()
+	server := suite.server
+	collectionID := suite.collections[0]
+
+	// Test when server is not healthy
+	server.UpdateStateCode(commonpb.StateCode_Initializing)
+	err := server.ManualUpdateCurrentTarget(ctx, collectionID)
+	suite.ErrorIs(err, merr.ErrServiceNotReady)
+
+	// Restore healthy state
+	server.UpdateStateCode(commonpb.StateCode_Healthy)
+
+	// Test collection not loaded case
+	err = server.ManualUpdateCurrentTarget(ctx, collectionID)
+	suite.NoError(err)
+
+	// Load collection for success test cases
+	suite.loadAll()
+
+	// Test success case
+	mockey.PatchConvey("TestManualUpdateCurrentTarget success", suite.T(), func() {
+		m := mockey.Mock(job.WaitCurrentTargetUpdated).Return(nil).Build()
+		defer m.UnPatch()
+
+		err := server.ManualUpdateCurrentTarget(ctx, collectionID)
+		suite.NoError(err)
+	})
+
+	// Test WaitCurrentTargetUpdated error case
+	mockey.PatchConvey("TestManualUpdateCurrentTarget error", suite.T(), func() {
+		m := mockey.Mock(job.WaitCurrentTargetUpdated).Return(errors.New("mock error")).Build()
+		defer m.UnPatch()
+
+		err := server.ManualUpdateCurrentTarget(ctx, collectionID)
+		suite.Error(err)
+	})
+}
+
 func (suite *ServiceSuite) TearDownTest() {
 	suite.targetObserver.Stop()
 	suite.collectionObserver.Stop()
 	suite.jobScheduler.Stop()
+	assign.ResetGlobalAssignPolicyFactoryForTest()
 }
 
 func TestService(t *testing.T) {

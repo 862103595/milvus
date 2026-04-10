@@ -11,6 +11,14 @@
 
 #include "TimestampIndex.h"
 
+#include <assert.h>
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+
+#include "bitset/bitset.h"
+#include "common/EasyAssert.h"
+
 namespace milvus::segcore {
 
 void
@@ -23,9 +31,11 @@ TimestampIndex::build_with(const Timestamp* timestamps, int64_t size) {
     auto num_slice = lengths_.size();
     Assert(num_slice > 0);
     std::vector<int64_t> prefix_sums;
+    prefix_sums.reserve(num_slice + 1);
     int offset = 0;
     prefix_sums.push_back(offset);
     std::vector<Timestamp> timestamp_barriers;
+    timestamp_barriers.reserve(num_slice + 1);
     Timestamp last_max_v = 0;
     for (int slice_id = 0; slice_id < num_slice; ++slice_id) {
         auto length = lengths_[slice_id];
@@ -65,42 +75,6 @@ TimestampIndex::get_active_range(Timestamp query_timestamp) const {
     int block_id = (iter - timestamp_barriers_.begin()) - 1;
     Assert(0 <= block_id && block_id < lengths_.size());
     return {start_locs_[block_id], start_locs_[block_id + 1]};
-}
-
-BitsetType
-TimestampIndex::GenerateBitset(Timestamp query_timestamp,
-                               std::pair<int64_t, int64_t> active_range,
-                               const Timestamp* timestamps,
-                               int64_t size) {
-    auto [beg, end] = active_range;
-    Assert(beg < end);
-    BitsetType bitset;
-    bitset.reserve(size);
-    bitset.resize(beg, false);
-    bitset.resize(size, true);
-    for (int64_t i = beg; i < end; ++i) {
-        bitset[i] = timestamps[i] > query_timestamp;
-    }
-    return bitset;
-}
-
-BitsetType
-TimestampIndex::GenerateTTLBitset(const Timestamp* timestamps,
-                                  int64_t size,
-                                  Timestamp expire_ts,
-                                  std::pair<int64_t, int64_t> active_range) {
-    auto beg = active_range.first;
-    auto end = active_range.second;
-
-    BitsetType bitset;
-    bitset.reserve(size);
-    bitset.resize(beg, true);
-    bitset.resize(size, false);
-
-    for (int64_t i = beg; i < end; ++i) {
-        bitset[i] = timestamps[i] <= expire_ts;
-    }
-    return bitset;
 }
 
 std::vector<int64_t>

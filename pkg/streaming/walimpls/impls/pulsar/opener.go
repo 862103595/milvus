@@ -2,6 +2,7 @@ package pulsar
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/apache/pulsar-client-go/pulsar"
 
@@ -14,13 +15,30 @@ import (
 
 const (
 	truncateCursorSubscriptionName = "truncate-cursor"
+	defaultBacklogSize             = 100 * 1024 * 1024 // default 100MB
 )
 
 var _ walimpls.OpenerImpls = (*openerImpl)(nil)
 
+// tenant is the tenant of pulsar.
+type tenant struct {
+	tenant    string
+	namespace string
+}
+
+// MustGetFullTopicName gets the full topic name of pulsar.
+// If the tenant or namespace or topic is empty, it will panic.
+func (t tenant) MustGetFullTopicName(topic string) string {
+	if len(t.tenant) == 0 || len(t.namespace) == 0 || len(topic) == 0 {
+		panic("tenant or namespace or topic is empty")
+	}
+	return fmt.Sprintf("%s/%s/%s", t.tenant, t.namespace, topic)
+}
+
 // openerImpl is the opener for pulsar wal.
 type openerImpl struct {
-	c pulsar.Client
+	tenant tenant
+	c      pulsar.Client
 }
 
 // Open opens a wal instance.
@@ -32,22 +50,10 @@ func (o *openerImpl) Open(ctx context.Context, opt *walimpls.OpenOption) (walimp
 	var backlogClearHelper *backlogClearHelper
 	if opt.Channel.AccessMode == types.AccessModeRW {
 		backlogAutoClearBytes := paramtable.Get().PulsarCfg.BacklogAutoClearBytes.GetAsSize()
-		if backlogAutoClearBytes > 0 {
-			backlogClearHelper = newBacklogClearHelper(o.c, opt.Channel, backlogAutoClearBytes)
-		} else {
-			// Initialize a persistent cursor to protect the topic from being retention.
-			cursor, err := o.c.Subscribe(pulsar.ConsumerOptions{
-				Topic:                       opt.Channel.Name,
-				SubscriptionName:            truncateCursorSubscriptionName,
-				Type:                        pulsar.Exclusive,
-				MaxPendingChunkedMessage:    0,
-				SubscriptionInitialPosition: pulsar.SubscriptionPositionEarliest,
-			})
-			if err != nil {
-				return nil, err
-			}
-			cursor.Close()
+		if backlogAutoClearBytes <= 0 {
+			backlogAutoClearBytes = defaultBacklogSize
 		}
+		backlogClearHelper = newBacklogClearHelper(o.c, opt.Channel, backlogAutoClearBytes, o.tenant)
 	}
 	w := &walImpl{
 		WALHelper:          helper.NewWALHelper(opt),
@@ -55,6 +61,7 @@ func (o *openerImpl) Open(ctx context.Context, opt *walimpls.OpenOption) (walimp
 		p:                  syncutil.NewFuture[pulsar.Producer](),
 		notifier:           syncutil.NewAsyncTaskNotifier[struct{}](),
 		backlogClearHelper: backlogClearHelper,
+		tenant:             o.tenant,
 	}
 	// because the producer of pulsar cannot be created if the topic is backlog exceeded,
 	// so we need to set the producer at background with backoff retry.

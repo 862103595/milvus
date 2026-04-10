@@ -39,17 +39,16 @@ import (
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/kv"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/testutils"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -61,7 +60,6 @@ type distribution struct {
 
 type TaskSuite struct {
 	suite.Suite
-	testutils.EmbedEtcdUtil
 
 	// Data
 	collection      int64
@@ -147,19 +145,12 @@ func (suite *TaskSuite) SetupTest() {
 
 	config := GenerateEtcdConfig()
 	suite.ctx = context.Background()
-	cli, err := etcd.GetEtcdClient(
-		config.UseEmbedEtcd.GetAsBool(),
-		config.EtcdUseSSL.GetAsBool(),
-		config.Endpoints.GetAsStrings(),
-		config.EtcdTLSCert.GetValue(),
-		config.EtcdTLSKey.GetValue(),
-		config.EtcdTLSCACert.GetValue(),
-		config.EtcdTLSMinVersion.GetValue())
-	suite.Require().NoError(err)
+	cli, _ := kvfactory.GetEtcdAndPath()
 
 	suite.kv = etcdkv.NewEtcdKV(cli, config.MetaRootPath.GetValue())
 	suite.store = querycoord.NewCatalog(suite.kv)
 	suite.meta = meta.NewMeta(RandomIncrementIDAllocator(), suite.store, session.NewNodeManager())
+	suite.meta.ReplicaManager.Put(suite.ctx, suite.replica)
 	suite.nodeMgr = session.NewNodeManager()
 	suite.dist = meta.NewDistributionManager(suite.nodeMgr)
 	suite.broker = meta.NewMockBroker(suite.T())
@@ -189,15 +180,16 @@ func (suite *TaskSuite) BeforeTest(suiteName, testName string) {
 		"TestLoadSegmentTask",
 		"TestLoadSegmentTaskNotIndex",
 		"TestLoadSegmentTaskFailed",
-		"TestSegmentTaskStale",
 		"TestTaskCanceled",
 		"TestMoveSegmentTask",
-		"TestMoveSegmentTaskStale",
 		"TestSubmitDuplicateLoadSegmentTask",
 		"TestSubmitDuplicateSubscribeChannelTask",
 		"TestLeaderTaskSet",
 		"TestLeaderTaskRemove",
-		"TestNoExecutor":
+		"TestNoExecutor",
+		"TestTaskStaleByRONode",
+		"TestTaskStaleBySegmentInDist",
+		"TestLeaderTaskStaleByRONode":
 		suite.meta.PutCollection(suite.ctx, &meta.Collection{
 			CollectionLoadInfo: &querypb.CollectionLoadInfo{
 				CollectionID:  suite.collection,
@@ -974,73 +966,6 @@ func (suite *TaskSuite) TestMoveSegmentTask() {
 	}
 }
 
-func (suite *TaskSuite) TestMoveSegmentTaskStale() {
-	ctx := context.Background()
-	timeout := 10 * time.Second
-	leader := int64(1)
-	sourceNode := int64(2)
-	targetNode := int64(3)
-	channel := &datapb.VchannelInfo{
-		CollectionID: suite.collection,
-		ChannelName:  Params.CommonCfg.RootCoordDml.GetValue() + "-test",
-	}
-
-	vchannel := &datapb.VchannelInfo{
-		CollectionID: suite.collection,
-		ChannelName:  channel.ChannelName,
-	}
-	suite.dist.ChannelDistManager.Update(leader, &meta.DmChannel{
-		VchannelInfo: vchannel,
-		Node:         leader,
-		Version:      1,
-		View: &meta.LeaderView{
-			ID:           leader,
-			CollectionID: suite.collection,
-			Channel:      channel.ChannelName,
-			Status:       &querypb.LeaderViewStatus{Serviceable: true},
-		},
-	})
-	view := &meta.LeaderView{
-		ID:           leader,
-		CollectionID: suite.collection,
-		Channel:      channel.ChannelName,
-		Segments:     make(map[int64]*querypb.SegmentDist),
-	}
-	tasks := []Task{}
-	segmentInfos := make([]*datapb.SegmentInfo, 0)
-	for _, segment := range suite.moveSegments {
-		segmentInfos = append(segmentInfos, &datapb.SegmentInfo{
-			ID:            segment,
-			PartitionID:   1,
-			InsertChannel: channel.ChannelName,
-		})
-		view.Segments[segment] = &querypb.SegmentDist{NodeID: sourceNode, Version: 0}
-
-		task, err := NewSegmentTask(
-			ctx,
-			timeout,
-			WrapIDSource(0),
-			suite.collection,
-			suite.replica,
-			commonpb.LoadPriority_LOW,
-			NewSegmentAction(targetNode, ActionTypeGrow, channel.GetChannelName(), segment),
-			NewSegmentAction(sourceNode, ActionTypeReduce, channel.GetChannelName(), segment),
-		)
-		suite.NoError(err)
-		tasks = append(tasks, task)
-	}
-	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, suite.collection).Return([]*datapb.VchannelInfo{vchannel}, segmentInfos, nil)
-	suite.target.UpdateCollectionNextTarget(ctx, suite.collection)
-	suite.target.UpdateCollectionCurrentTarget(ctx, suite.collection)
-	for _, task := range tasks {
-		err := suite.scheduler.Add(task)
-		suite.Error(err)
-		suite.Equal(TaskStatusCanceled, task.Status())
-		suite.Error(task.Err())
-	}
-	suite.AssertTaskNum(0, 0, 0, 0)
-}
-
 func (suite *TaskSuite) TestTaskCanceled() {
 	ctx := context.Background()
 	timeout := 10 * time.Second
@@ -1134,104 +1059,6 @@ func (suite *TaskSuite) TestTaskCanceled() {
 	for _, task := range tasks {
 		suite.Equal(TaskStatusCanceled, task.Status())
 		suite.Error(task.Err())
-	}
-}
-
-func (suite *TaskSuite) TestSegmentTaskStale() {
-	ctx := context.Background()
-	timeout := 10 * time.Second
-	targetNode := int64(3)
-	partition := int64(100)
-	channel := &datapb.VchannelInfo{
-		CollectionID: suite.collection,
-		ChannelName:  Params.CommonCfg.RootCoordDml.GetValue() + "-test",
-	}
-
-	// Expect
-	suite.broker.EXPECT().DescribeCollection(mock.Anything, suite.collection).RunAndReturn(func(ctx context.Context, i int64) (*milvuspb.DescribeCollectionResponse, error) {
-		return &milvuspb.DescribeCollectionResponse{
-			Schema: &schemapb.CollectionSchema{
-				Name: "TestSegmentTaskStale",
-				Fields: []*schemapb.FieldSchema{
-					{FieldID: 100, Name: "vec", DataType: schemapb.DataType_FloatVector},
-				},
-			},
-		}, nil
-	})
-	suite.broker.EXPECT().ListIndexes(mock.Anything, suite.collection).Return([]*indexpb.IndexInfo{
-		{
-			CollectionID: suite.collection,
-		},
-	}, nil)
-	for _, segment := range suite.loadSegments[1:] {
-		suite.broker.EXPECT().GetSegmentInfo(mock.Anything, segment).Return([]*datapb.SegmentInfo{
-			{
-				ID:            segment,
-				CollectionID:  suite.collection,
-				PartitionID:   partition,
-				InsertChannel: channel.ChannelName,
-			},
-		}, nil)
-		suite.broker.EXPECT().GetIndexInfo(mock.Anything, suite.collection, segment).Return(nil, nil)
-	}
-	suite.cluster.EXPECT().LoadSegments(mock.Anything, targetNode, mock.Anything).Return(merr.Success(), nil)
-
-	// Test load segment task
-	suite.dist.ChannelDistManager.Update(targetNode, &meta.DmChannel{
-		VchannelInfo: &datapb.VchannelInfo{
-			CollectionID: suite.collection,
-			ChannelName:  channel.ChannelName,
-		},
-		Node:    targetNode,
-		Version: 1,
-		View:    &meta.LeaderView{ID: targetNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
-	})
-	tasks := []Task{}
-	for _, segment := range suite.loadSegments {
-		task, err := NewSegmentTask(
-			ctx,
-			timeout,
-			WrapIDSource(0),
-			suite.collection,
-			suite.replica,
-			commonpb.LoadPriority_LOW,
-			NewSegmentAction(targetNode, ActionTypeGrow, channel.GetChannelName(), segment),
-		)
-		suite.NoError(err)
-		tasks = append(tasks, task)
-		err = suite.scheduler.Add(task)
-		suite.NoError(err)
-	}
-
-	segments := make([]*datapb.SegmentInfo, 0)
-	for _, segment := range suite.loadSegments[1:] {
-		segments = append(segments, &datapb.SegmentInfo{
-			ID:            segment,
-			PartitionID:   2,
-			InsertChannel: channel.GetChannelName(),
-		})
-	}
-	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, suite.collection).Return([]*datapb.VchannelInfo{channel}, segments, nil)
-
-	suite.meta.CollectionManager.PutPartition(ctx, utils.CreateTestPartition(suite.collection, 2))
-	suite.target.UpdateCollectionNextTarget(ctx, suite.collection)
-
-	// process done
-	suite.dispatchAndWait(targetNode)
-	suite.AssertTaskNum(1, 0, 0, 1)
-
-	// task removed
-	suite.dispatchAndWait(targetNode)
-	suite.AssertTaskNum(0, 0, 0, 0)
-
-	for i, task := range tasks {
-		if i == 0 {
-			suite.Equal(TaskStatusCanceled, task.Status())
-			suite.Error(task.Err())
-		} else {
-			suite.Equal(TaskStatusSucceeded, task.Status())
-			suite.NoError(task.Err())
-		}
 	}
 }
 
@@ -1965,7 +1792,7 @@ func (suite *TaskSuite) TestTaskDeltaCache() {
 			context.TODO(),
 			10*time.Second,
 			WrapIDSource(0),
-			1,
+			collectionID,
 			suite.replica,
 			NewChannelAction(nodeID, ActionTypeGrow, "channel"),
 		)
@@ -1983,6 +1810,8 @@ func (suite *TaskSuite) TestTaskDeltaCache() {
 		etd.Sub(tasks[i])
 	}
 	suite.Equal(0, etd.Get(nodeID, collectionID))
+	suite.Equal(0, etd.Get(nodeID, -1))
+	suite.Equal(0, etd.Get(-1, -1))
 }
 
 func (suite *TaskSuite) TestRemoveTaskWithError() {
@@ -2013,6 +1842,28 @@ func (suite *TaskSuite) TestRemoveTaskWithError() {
 	// when try to remove task with ErrSegmentNotFound, should trigger UpdateNextTarget
 	scheduler.remove(task1)
 	mockTarget.AssertExpectations(suite.T())
+
+	// test remove task with ErrSegmentRequestResourceFailed
+	task2, err := NewSegmentTask(
+		ctx,
+		10*time.Second,
+		WrapIDSource(0),
+		coll,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentActionWithScope(nodeID, ActionTypeGrow, "", 1, querypb.DataScope_Historical, 100),
+	)
+	suite.NoError(err)
+	err = scheduler.Add(task2)
+	suite.NoError(err)
+
+	task2.Fail(merr.ErrSegmentRequestResourceFailed)
+	paramtable.Get().Save(paramtable.Get().QueryCoordCfg.ResourceExhaustionPenaltyDuration.Key, "3")
+	scheduler.remove(task2)
+	suite.True(suite.nodeMgr.IsResourceExhausted(nodeID))
+	// expect the penalty duration is expired
+	time.Sleep(3 * time.Second)
+	suite.False(suite.nodeMgr.IsResourceExhausted(nodeID))
 }
 
 func TestTask(t *testing.T) {
@@ -2170,7 +2021,8 @@ func (suite *TaskSuite) TestExecutor_MoveSegmentTask() {
 	suite.Equal(int64(-1), moveTask.ShardLeaderID()) // Initial value
 
 	// Set up task executor
-	executor := NewExecutor(suite.meta,
+	executor := NewExecutor(targetNode,
+		suite.meta,
 		suite.dist,
 		suite.broker,
 		suite.target,
@@ -2211,4 +2063,402 @@ func (suite *TaskSuite) TestExecutor_MoveSegmentTask() {
 	executor.executeSegmentAction(moveTask, 1)
 	suite.True(moveTask.actions[1].IsFinished(suite.dist))
 	suite.ErrorContains(moveTask.Err(), "shard leader changed")
+}
+
+func (suite *TaskSuite) TestLeaderTaskStaleByRONode() {
+	ctx := context.Background()
+	leaderNode := int64(1)
+	workerNode := int64(3)
+	channel := &datapb.VchannelInfo{
+		CollectionID: suite.collection,
+		ChannelName:  Params.CommonCfg.RootCoordDml.GetValue() + "-test",
+	}
+
+	// Test case 1: LeaderAction should NOT be stale when worker node is RO but leader is RW
+	// This is the fix for issue #46737: the checkStale should use leaderID instead of Node() for LeaderAction
+	suite.Run("WorkerRONodeLeaderRW", func() {
+		// Create replica with worker node (node 3) as RO node, leader node (node 1) as RW
+		replicaWithRONode := meta.NewReplica(&querypb.Replica{
+			ID:            suite.replica.GetID(),
+			CollectionID:  suite.collection,
+			Nodes:         []int64{1, 2}, // RW nodes (leader is RW)
+			RoNodes:       []int64{3},    // RO nodes (worker is RO)
+			ResourceGroup: meta.DefaultResourceGroupName,
+		}, typeutil.NewUniqueSet(1, 2))
+		suite.meta.ReplicaManager.Put(suite.ctx, replicaWithRONode)
+
+		// Set up channel distribution
+		suite.dist.ChannelDistManager.Update(leaderNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    leaderNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: leaderNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		// Create a LeaderAction that syncs segment from worker (RO node) to leader (RW node)
+		// leaderID=1 (RW), workerID=3 (RO)
+		// Before fix: checkStale used action.Node() which returns workerNode (3, RO), causing false stale
+		// After fix: checkStale uses leaderID (1, RW), task should NOT be stale
+		task := NewLeaderSegmentTask(
+			ctx,
+			WrapIDSource(0),
+			suite.collection,
+			replicaWithRONode,
+			leaderNode,
+			NewLeaderAction(leaderNode, workerNode, ActionTypeGrow, channel.GetChannelName(), suite.loadSegments[0], 0),
+		)
+
+		// Add task should succeed because leader node is RW
+		err := suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Task should NOT be stale because we check leader node status, not worker node
+		suite.Equal(TaskStatusStarted, task.Status())
+		suite.NoError(task.Err())
+
+		// Clean up
+		suite.scheduler.remove(task)
+		suite.meta.ReplicaManager.Put(suite.ctx, utils.CreateTestReplica(suite.replica.GetID(), suite.collection, []int64{1, 2, 3}))
+	})
+
+	// Test case 2: LeaderAction should be stale when leader node becomes RO
+	suite.Run("LeaderRONode", func() {
+		// Set up channel distribution with leader on node 1
+		suite.dist.ChannelDistManager.Update(leaderNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    leaderNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: leaderNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		// Create task with original replica (all RW nodes)
+		task := NewLeaderSegmentTask(
+			ctx,
+			WrapIDSource(0),
+			suite.collection,
+			suite.replica,
+			leaderNode,
+			NewLeaderAction(leaderNode, workerNode, ActionTypeGrow, channel.GetChannelName(), suite.loadSegments[0], 0),
+		)
+
+		// Add task should succeed
+		err := suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Now change replica to make leader node (node 1) as RO node
+		replicaWithLeaderRO := meta.NewReplica(&querypb.Replica{
+			ID:            suite.replica.GetID(),
+			CollectionID:  suite.collection,
+			Nodes:         []int64{2, 3}, // RW nodes
+			RoNodes:       []int64{1},    // Leader becomes RO
+			ResourceGroup: meta.DefaultResourceGroupName,
+		}, typeutil.NewUniqueSet(2, 3))
+		suite.meta.ReplicaManager.Put(suite.ctx, replicaWithLeaderRO)
+
+		// Dispatch will trigger promote which calls checkStale
+		suite.dispatchAndWait(leaderNode)
+
+		// Task should be canceled because leader node is RO
+		suite.Equal(TaskStatusCanceled, task.Status())
+		suite.ErrorContains(task.Err(), "node becomes ro node")
+
+		// Restore original replica
+		suite.meta.ReplicaManager.Put(suite.ctx, utils.CreateTestReplica(suite.replica.GetID(), suite.collection, []int64{1, 2, 3}))
+	})
+
+	// Test case 3: LeaderAction with Reduce type should NOT be affected by RO node
+	suite.Run("LeaderReduceActionNotAffected", func() {
+		// Create replica with leader node as RO
+		replicaWithLeaderRO := meta.NewReplica(&querypb.Replica{
+			ID:            suite.replica.GetID(),
+			CollectionID:  suite.collection,
+			Nodes:         []int64{2, 3}, // RW nodes
+			RoNodes:       []int64{1},    // Leader is RO
+			ResourceGroup: meta.DefaultResourceGroupName,
+		}, typeutil.NewUniqueSet(2, 3))
+		suite.meta.ReplicaManager.Put(suite.ctx, replicaWithLeaderRO)
+
+		// Set up channel distribution
+		suite.dist.ChannelDistManager.Update(leaderNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    leaderNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: leaderNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		// Create LeaderAction with Reduce type
+		task := NewLeaderSegmentTask(
+			ctx,
+			WrapIDSource(0),
+			suite.collection,
+			replicaWithLeaderRO,
+			leaderNode,
+			NewLeaderAction(leaderNode, workerNode, ActionTypeReduce, channel.GetChannelName(), suite.releaseSegments[0], 0),
+		)
+
+		// Add task should succeed because Reduce action is not affected by RO node check
+		err := suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Clean up
+		suite.scheduler.remove(task)
+		suite.meta.ReplicaManager.Put(suite.ctx, utils.CreateTestReplica(suite.replica.GetID(), suite.collection, []int64{1, 2, 3}))
+	})
+}
+
+func (suite *TaskSuite) TestTaskStaleByRONode() {
+	ctx := context.Background()
+	timeout := 10 * time.Second
+	targetNode := int64(3)
+	channel := &datapb.VchannelInfo{
+		CollectionID: suite.collection,
+		ChannelName:  Params.CommonCfg.RootCoordDml.GetValue() + "-test",
+	}
+
+	// Test case 1: Task stale due to target node becomes RO node
+	suite.Run("RONode", func() {
+		// Set up channel distribution first with RW replica
+		suite.dist.ChannelDistManager.Update(targetNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    targetNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: targetNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		// Create task with original replica (all RW nodes)
+		task, err := NewSegmentTask(
+			ctx,
+			timeout,
+			WrapIDSource(0),
+			suite.collection,
+			suite.replica,
+			commonpb.LoadPriority_LOW,
+			NewSegmentAction(targetNode, ActionTypeGrow, channel.GetChannelName(), suite.loadSegments[0]),
+		)
+		suite.NoError(err)
+
+		// Add task should succeed
+		err = suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Now change replica to make node 3 as RO node (simulating node state change)
+		replicaWithRONode := meta.NewReplica(&querypb.Replica{
+			ID:            suite.replica.GetID(),
+			CollectionID:  suite.collection,
+			Nodes:         []int64{1, 2}, // RW nodes
+			RoNodes:       []int64{3},    // RO node
+			ResourceGroup: meta.DefaultResourceGroupName,
+		}, typeutil.NewUniqueSet(1, 2))
+		suite.meta.ReplicaManager.Put(suite.ctx, replicaWithRONode)
+
+		// Dispatch will trigger promote which calls checkStale
+		suite.dispatchAndWait(targetNode)
+
+		// Task should be canceled due to RO node
+		suite.Equal(TaskStatusCanceled, task.Status())
+		suite.ErrorContains(task.Err(), "node becomes ro node")
+
+		// Restore original replica for other tests
+		suite.meta.ReplicaManager.Put(suite.ctx, utils.CreateTestReplica(suite.replica.GetID(), suite.collection, []int64{1, 2, 3}))
+	})
+
+	// Test case 2: Task stale due to target node becomes RO SQ node
+	suite.Run("ROSQNode", func() {
+		// Set up channel distribution
+		suite.dist.ChannelDistManager.Update(targetNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    targetNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: targetNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		// Create task with original replica (all RW nodes)
+		task, err := NewSegmentTask(
+			ctx,
+			timeout,
+			WrapIDSource(0),
+			suite.collection,
+			suite.replica,
+			commonpb.LoadPriority_LOW,
+			NewSegmentAction(targetNode, ActionTypeGrow, channel.GetChannelName(), suite.loadSegments[1]),
+		)
+		suite.NoError(err)
+
+		// Add task should succeed
+		err = suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Now change replica to make node 3 as RO SQ node
+		replicaWithROSQNode := meta.NewReplica(&querypb.Replica{
+			ID:            suite.replica.GetID(),
+			CollectionID:  suite.collection,
+			Nodes:         []int64{1, 2}, // RW nodes
+			RoSqNodes:     []int64{3},    // RO SQ node
+			ResourceGroup: meta.DefaultResourceGroupName,
+		}, typeutil.NewUniqueSet(1, 2))
+		suite.meta.ReplicaManager.Put(suite.ctx, replicaWithROSQNode)
+
+		// Dispatch will trigger promote which calls checkStale
+		suite.dispatchAndWait(targetNode)
+
+		// Task should be canceled due to RO SQ node
+		suite.Equal(TaskStatusCanceled, task.Status())
+		suite.ErrorContains(task.Err(), "node becomes ro node")
+
+		// Restore original replica
+		suite.meta.ReplicaManager.Put(suite.ctx, utils.CreateTestReplica(suite.replica.GetID(), suite.collection, []int64{1, 2, 3}))
+	})
+
+	// Test case 3: ActionTypeReduce should not be affected by RO node
+	suite.Run("ReduceActionNotAffected", func() {
+		// Create replica with node 3 as RO node
+		replicaWithRONode := meta.NewReplica(&querypb.Replica{
+			ID:            suite.replica.GetID(),
+			CollectionID:  suite.collection,
+			Nodes:         []int64{1, 2}, // RW nodes
+			RoNodes:       []int64{3},    // RO node
+			ResourceGroup: meta.DefaultResourceGroupName,
+		}, typeutil.NewUniqueSet(1, 2))
+		suite.meta.ReplicaManager.Put(suite.ctx, replicaWithRONode)
+
+		// Set up channel distribution
+		suite.dist.ChannelDistManager.Update(targetNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    targetNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: targetNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		// Create a segment task with Reduce action targeting the RO node
+		task, err := NewSegmentTask(
+			ctx,
+			timeout,
+			WrapIDSource(0),
+			suite.collection,
+			replicaWithRONode,
+			commonpb.LoadPriority_LOW,
+			NewSegmentAction(targetNode, ActionTypeReduce, channel.GetChannelName(), suite.releaseSegments[0]),
+		)
+		suite.NoError(err)
+
+		// Add task should succeed because Reduce action is not affected by RO node check
+		err = suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Clean up
+		suite.scheduler.remove(task)
+		suite.meta.ReplicaManager.Put(suite.ctx, utils.CreateTestReplica(suite.replica.GetID(), suite.collection, []int64{1, 2, 3}))
+	})
+}
+
+func (suite *TaskSuite) TestTaskStaleBySegmentInDist() {
+	ctx := context.Background()
+	timeout := 10 * time.Second
+	targetNode := int64(3)
+	channel := &datapb.VchannelInfo{
+		CollectionID: suite.collection,
+		ChannelName:  Params.CommonCfg.RootCoordDml.GetValue() + "-test",
+	}
+
+	// Test case: Grow task should be stale when segment already exists in dist
+	suite.Run("SegmentAlreadyInDist", func() {
+		// Set up channel distribution
+		suite.dist.ChannelDistManager.Update(targetNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    targetNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: targetNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		segmentID := suite.loadSegments[0]
+
+		// Create a Grow task for the segment
+		task, err := NewSegmentTask(
+			ctx,
+			timeout,
+			WrapIDSource(0),
+			suite.collection,
+			suite.replica,
+			commonpb.LoadPriority_LOW,
+			NewSegmentAction(targetNode, ActionTypeGrow, channel.GetChannelName(), segmentID),
+		)
+		suite.NoError(err)
+
+		// Add task should succeed (segment not in dist yet)
+		err = suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Now simulate segment being loaded: add segment to dist
+		suite.dist.SegmentDistManager.Update(targetNode, utils.CreateTestSegment(suite.collection, 1, segmentID, targetNode, 1, channel.ChannelName))
+
+		// Dispatch will trigger promote which calls checkStale
+		suite.dispatchAndWait(targetNode)
+
+		// Task should be canceled because segment is already in dist
+		suite.Equal(TaskStatusCanceled, task.Status())
+		suite.ErrorContains(task.Err(), "segment already loaded in dist")
+
+		// Clean up
+		suite.dist.SegmentDistManager.Update(targetNode)
+	})
+
+	// Test case: Reduce task should not be affected by segment in dist check
+	suite.Run("ReduceTaskNotAffected", func() {
+		// Set up channel distribution
+		suite.dist.ChannelDistManager.Update(targetNode, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{
+				CollectionID: suite.collection,
+				ChannelName:  channel.ChannelName,
+			},
+			Node:    targetNode,
+			Version: 1,
+			View:    &meta.LeaderView{ID: targetNode, CollectionID: suite.collection, Channel: channel.ChannelName, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+		})
+
+		segmentID := suite.releaseSegments[0]
+
+		// Add segment to dist first
+		suite.dist.SegmentDistManager.Update(targetNode, utils.CreateTestSegment(suite.collection, 1, segmentID, targetNode, 1, channel.ChannelName))
+
+		// Create a Reduce task for the segment (should not be affected by dist check)
+		task, err := NewSegmentTask(
+			ctx,
+			timeout,
+			WrapIDSource(0),
+			suite.collection,
+			suite.replica,
+			commonpb.LoadPriority_LOW,
+			NewSegmentAction(targetNode, ActionTypeReduce, channel.GetChannelName(), segmentID),
+		)
+		suite.NoError(err)
+
+		// Add task should succeed - Reduce task is not affected by "segment in dist" check
+		err = suite.scheduler.Add(task)
+		suite.NoError(err)
+
+		// Clean up without dispatching (to avoid mock issues)
+		suite.scheduler.remove(task)
+		suite.dist.SegmentDistManager.Update(targetNode)
+	})
 }

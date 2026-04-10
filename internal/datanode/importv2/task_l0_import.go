@@ -173,7 +173,7 @@ func (t *L0ImportTask) Execute() []*conc.Future[any] {
 		}
 
 		var reader binlog.L0Reader
-		reader, err = binlog.NewL0Reader(t.ctx, t.cm, pkField, file, bufferSize, tsStart, tsEnd)
+		reader, err = binlog.NewL0Reader(t.ctx, t.cm, t.req.GetStorageConfig(), pkField, file, bufferSize, tsStart, tsEnd)
 		if err != nil {
 			return
 		}
@@ -253,7 +253,7 @@ func (t *L0ImportTask) syncDelete(delData []*storage.DeleteData) ([]*conc.Future
 		}
 		syncTask, err := NewSyncTask(t.ctx, t.allocator, t.metaCaches, t.req.GetTs(),
 			segmentID, partitionID, t.GetCollectionID(), channel, nil, data,
-			nil, t.req.GetStorageVersion(), t.req.GetStorageConfig())
+			nil, t.req.GetStorageVersion(), false, t.req.GetStorageConfig())
 		if err != nil {
 			return nil, nil, err
 		}

@@ -17,6 +17,8 @@
 package model
 
 import (
+	"slices"
+
 	"github.com/samber/lo"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -49,8 +51,19 @@ type Collection struct {
 	Properties           []*commonpb.KeyValuePair
 	State                pb.CollectionState
 	EnableDynamicField   bool
+	EnableNamespace      bool
 	UpdateTimestamp      uint64
 	SchemaVersion        int32
+	ShardInfos           map[string]*ShardInfo
+	FileResourceIds      []int64
+	ExternalSource       string
+	ExternalSpec         string
+}
+
+type ShardInfo struct {
+	PChannelName         string // the pchannel name of the shard, it is the same with the physical channel name.
+	VChannelName         string // the vchannel name of the shard, it is the same with the virtual channel name.
+	LastTruncateTimeTick uint64 // the last truncate time tick of the shard, if the shard is not truncated, the value is 0.
 }
 
 func (c *Collection) Available() bool {
@@ -79,13 +92,26 @@ func (c *Collection) ShallowClone() *Collection {
 		Properties:           c.Properties,
 		State:                c.State,
 		EnableDynamicField:   c.EnableDynamicField,
+		EnableNamespace:      c.EnableNamespace,
 		Functions:            c.Functions,
 		UpdateTimestamp:      c.UpdateTimestamp,
 		SchemaVersion:        c.SchemaVersion,
+		ShardInfos:           c.ShardInfos,
+		FileResourceIds:      c.FileResourceIds,
+		ExternalSource:       c.ExternalSource,
+		ExternalSpec:         c.ExternalSpec,
 	}
 }
 
 func (c *Collection) Clone() *Collection {
+	shardInfos := make(map[string]*ShardInfo, len(c.ShardInfos))
+	for channelName, shardInfo := range c.ShardInfos {
+		shardInfos[channelName] = &ShardInfo{
+			VChannelName:         channelName,
+			PChannelName:         shardInfo.PChannelName,
+			LastTruncateTimeTick: shardInfo.LastTruncateTimeTick,
+		}
+	}
 	return &Collection{
 		TenantID:             c.TenantID,
 		DBID:                 c.DBID,
@@ -107,9 +133,14 @@ func (c *Collection) Clone() *Collection {
 		Properties:           common.CloneKeyValuePairs(c.Properties),
 		State:                c.State,
 		EnableDynamicField:   c.EnableDynamicField,
+		EnableNamespace:      c.EnableNamespace,
 		Functions:            CloneFunctions(c.Functions),
 		UpdateTimestamp:      c.UpdateTimestamp,
 		SchemaVersion:        c.SchemaVersion,
+		ShardInfos:           shardInfos,
+		FileResourceIds:      slices.Clone(c.FileResourceIds),
+		ExternalSource:       c.ExternalSource,
+		ExternalSpec:         c.ExternalSpec,
 	}
 }
 
@@ -132,7 +163,8 @@ func (c *Collection) Equal(other Collection) bool {
 		c.ShardsNum == other.ShardsNum &&
 		c.ConsistencyLevel == other.ConsistencyLevel &&
 		checkParamsEqual(c.Properties, other.Properties) &&
-		c.EnableDynamicField == other.EnableDynamicField
+		c.EnableDynamicField == other.EnableDynamicField &&
+		c.EnableNamespace == other.EnableNamespace
 }
 
 func (c *Collection) ApplyUpdates(header *message.AlterCollectionMessageHeader, body *message.AlterCollectionMessageBody) {
@@ -155,9 +187,12 @@ func (c *Collection) ApplyUpdates(header *message.AlterCollectionMessageHeader, 
 			c.AutoID = updates.Schema.AutoID
 			c.Fields = UnmarshalFieldModels(updates.Schema.Fields)
 			c.EnableDynamicField = updates.Schema.EnableDynamicField
+			c.EnableNamespace = updates.Schema.EnableNamespace
 			c.Functions = UnmarshalFunctionModels(updates.Schema.Functions)
 			c.StructArrayFields = UnmarshalStructArrayFieldModels(updates.Schema.StructArrayFields)
 			c.SchemaVersion = updates.Schema.Version
+			c.ExternalSource = updates.Schema.ExternalSource
+			c.ExternalSpec = updates.Schema.ExternalSpec
 		}
 	}
 }
@@ -174,6 +209,22 @@ func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
 			PartitionID:               coll.PartitionIDs[idx],
 			PartitionName:             coll.PartitionNames[idx],
 			PartitionCreatedTimestamp: coll.PartitionCreatedTimestamps[idx],
+		}
+	}
+	shardInfos := make(map[string]*ShardInfo, len(coll.VirtualChannelNames))
+	for idx, channelName := range coll.VirtualChannelNames {
+		if len(coll.ShardInfos) == 0 {
+			shardInfos[channelName] = &ShardInfo{
+				VChannelName:         channelName,
+				PChannelName:         coll.PhysicalChannelNames[idx],
+				LastTruncateTimeTick: 0,
+			}
+		} else {
+			shardInfos[channelName] = &ShardInfo{
+				VChannelName:         channelName,
+				PChannelName:         coll.PhysicalChannelNames[idx],
+				LastTruncateTimeTick: coll.ShardInfos[idx].LastTruncateTimeTick,
+			}
 		}
 	}
 
@@ -196,8 +247,13 @@ func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
 		State:                coll.State,
 		Properties:           coll.Properties,
 		EnableDynamicField:   coll.Schema.EnableDynamicField,
+		EnableNamespace:      coll.Schema.EnableNamespace,
 		UpdateTimestamp:      coll.UpdateTimestamp,
 		SchemaVersion:        coll.Schema.Version,
+		ShardInfos:           shardInfos,
+		FileResourceIds:      coll.Schema.GetFileResourceIds(),
+		ExternalSource:       coll.Schema.ExternalSource,
+		ExternalSpec:         coll.Schema.ExternalSpec,
 	}
 }
 
@@ -247,8 +303,12 @@ func marshalCollectionModelWithConfig(coll *Collection, c *config) *pb.Collectio
 		Description:        coll.Description,
 		AutoID:             coll.AutoID,
 		EnableDynamicField: coll.EnableDynamicField,
+		EnableNamespace:    coll.EnableNamespace,
 		DbName:             coll.DBName,
 		Version:            coll.SchemaVersion,
+		FileResourceIds:    coll.FileResourceIds,
+		ExternalSource:     coll.ExternalSource,
+		ExternalSpec:       coll.ExternalSpec,
 	}
 
 	if c.withFields {
@@ -261,6 +321,18 @@ func marshalCollectionModelWithConfig(coll *Collection, c *config) *pb.Collectio
 		collSchema.StructArrayFields = structArrayFields
 	}
 
+	shardInfos := make([]*pb.CollectionShardInfo, len(coll.ShardInfos))
+	for idx, channelName := range coll.VirtualChannelNames {
+		if shard, ok := coll.ShardInfos[channelName]; ok {
+			shardInfos[idx] = &pb.CollectionShardInfo{
+				LastTruncateTimeTick: shard.LastTruncateTimeTick,
+			}
+		} else {
+			shardInfos[idx] = &pb.CollectionShardInfo{
+				LastTruncateTimeTick: 0,
+			}
+		}
+	}
 	collectionPb := &pb.CollectionInfo{
 		ID:                   coll.CollectionID,
 		DbId:                 coll.DBID,
@@ -274,6 +346,7 @@ func marshalCollectionModelWithConfig(coll *Collection, c *config) *pb.Collectio
 		State:                coll.State,
 		Properties:           coll.Properties,
 		UpdateTimestamp:      coll.UpdateTimestamp,
+		ShardInfos:           shardInfos,
 	}
 
 	if c.withPartitions {

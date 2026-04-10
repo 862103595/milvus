@@ -16,7 +16,20 @@
 
 #include "BinaryArithOpEvalRangeExpr.h"
 
+#include <simdjson.h>
+#include <cstdint>
+#include <string_view>
+#include <variant>
+
+#include "common/Array.h"
+#include "common/Json.h"
+#include "common/Tracer.h"
+#include "fmt/core.h"
+#include "opentelemetry/trace/span.h"
+
 namespace milvus {
+class SkipIndex;
+
 namespace exec {
 
 void
@@ -29,7 +42,11 @@ PhyBinaryArithOpEvalRangeExpr::Eval(EvalCtx& context, VectorPtr& result) {
 
     auto input = context.get_offset_input();
     SetHasOffsetInput((input != nullptr));
-    switch (expr_->column_.data_type_) {
+    auto data_type = expr_->column_.data_type_;
+    if (expr_->column_.element_level_) {
+        data_type = expr_->column_.element_type_;
+    }
+    switch (data_type) {
         case DataType::BOOL: {
             result = ExecRangeVisitorImpl<bool>(input);
             break;
@@ -86,12 +103,10 @@ PhyBinaryArithOpEvalRangeExpr::Eval(EvalCtx& context, VectorPtr& result) {
             auto value_type = expr_->value_.val_case();
             switch (value_type) {
                 case proto::plan::GenericValue::ValCase::kInt64Val: {
-                    SetNotUseIndex();
                     result = ExecRangeVisitorImplForArray<int64_t>(input);
                     break;
                 }
                 case proto::plan::GenericValue::ValCase::kFloatVal: {
-                    SetNotUseIndex();
                     result = ExecRangeVisitorImplForArray<double>(input);
                     break;
                 }
@@ -144,6 +159,15 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForJson(
     auto arith_type = expr_->arith_op_type_;
     auto value = value_arg_.GetValue<ValueType>();
     auto right_operand = right_operand_arg_.GetValue<ValueType>();
+
+    // Validate divisor for division/modulo operations
+    if ((arith_type == proto::plan::ArithOpType::Div ||
+         arith_type == proto::plan::ArithOpType::Mod) &&
+        right_operand == 0) {
+        ThrowInfo(
+            ErrorCode::ExprInvalid,
+            "division or modulus by zero in JSON field arithmetic expression");
+    }
 
 #define BinaryArithRangeJSONCompare(cmp)                                \
     do {                                                                \
@@ -231,6 +255,11 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForJson(
             ValueType val,
             ValueType right_operand,
             const std::string& pointer) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // Nothing to do here since the caller has already handled valid_res.
+        if (data == nullptr) {
+            return;
+        }
         switch (op_type) {
             case proto::plan::OpType::Equal: {
                 switch (arith_type) {
@@ -550,6 +579,15 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForArray(
     auto value = value_arg_.GetValue<ValueType>();
     auto right_operand = right_operand_arg_.GetValue<ValueType>();
 
+    // Validate divisor for division/modulo operations
+    if ((arith_type == proto::plan::ArithOpType::Div ||
+         arith_type == proto::plan::ArithOpType::Mod) &&
+        right_operand == 0) {
+        ThrowInfo(
+            ErrorCode::ExprInvalid,
+            "division or modulus by zero in Array field arithmetic expression");
+    }
+
 #define BinaryArithRangeArrayCompare(cmp)                       \
     do {                                                        \
         for (size_t i = 0; i < size; ++i) {                     \
@@ -598,6 +636,11 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForArray(
             ValueType val,
             ValueType right_operand,
             int index) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // Nothing to do here since the caller has already handled valid_res.
+        if (data == nullptr) {
+            return;
+        }
         switch (op_type) {
             case proto::plan::OpType::Equal: {
                 switch (arith_type) {
@@ -885,7 +928,7 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForArray(
 template <typename T>
 VectorPtr
 PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImpl(OffsetVector* input) {
-    if (CanUseIndex<T>()) {
+    if (exec_path_ == ExprExecPath::ScalarIndex) {
         return ExecRangeVisitorImplForIndex<T>(input);
     } else {
         return ExecRangeVisitorImplForData<T>(input);
@@ -903,7 +946,7 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForIndex(
                                T>
         HighPrecisionType;
     auto real_batch_size =
-        has_offset_input_ ? input->size() : GetNextBatchSize();
+        GetNextRealBatchSize(input, expr_->column_.element_level_);
     if (real_batch_size == 0) {
         return nullptr;
     }
@@ -1423,8 +1466,9 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForData(
                                int64_t,
                                T>
         HighPrecisionType;
+
     auto real_batch_size =
-        has_offset_input_ ? input->size() : GetNextBatchSize();
+        GetNextRealBatchSize(input, expr_->column_.element_level_);
     if (real_batch_size == 0) {
         return nullptr;
     }
@@ -1457,6 +1501,11 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForData(
             TargetBitmapView valid_res,
             HighPrecisionType value,
             HighPrecisionType right_operand) {
+        // If data is nullptr, this chunk was skipped by SkipIndex.
+        // Nothing to do here since the caller has already handled valid_res.
+        if (data == nullptr) {
+            return;
+        }
         switch (op_type) {
             case proto::plan::OpType::Equal: {
                 switch (arith_type) {
@@ -1825,20 +1874,42 @@ PhyBinaryArithOpEvalRangeExpr::ExecRangeVisitorImplForData(
 
     int64_t processed_size;
     if (has_offset_input_) {
-        processed_size = ProcessDataByOffsets<T>(execute_sub_batch,
-                                                 skip_index_func,
-                                                 input,
-                                                 res,
-                                                 valid_res,
-                                                 value,
-                                                 right_operand);
+        if (expr_->column_.element_level_) {
+            // For element-level filtering with offset input
+            processed_size = ProcessElementLevelByOffsets<T>(execute_sub_batch,
+                                                             skip_index_func,
+                                                             input,
+                                                             res,
+                                                             valid_res,
+                                                             value,
+                                                             right_operand);
+        } else {
+            processed_size = ProcessDataByOffsets<T>(execute_sub_batch,
+                                                     skip_index_func,
+                                                     input,
+                                                     res,
+                                                     valid_res,
+                                                     value,
+                                                     right_operand);
+        }
     } else {
-        processed_size = ProcessDataChunks<T>(execute_sub_batch,
-                                              skip_index_func,
-                                              res,
-                                              valid_res,
-                                              value,
-                                              right_operand);
+        if (expr_->column_.element_level_) {
+            // For element-level filtering without offset input (brute force)
+            processed_size =
+                ProcessDataChunksForElementLevel<T>(execute_sub_batch,
+                                                    skip_index_func,
+                                                    res,
+                                                    valid_res,
+                                                    value,
+                                                    right_operand);
+        } else {
+            processed_size = ProcessDataChunks<T>(execute_sub_batch,
+                                                  skip_index_func,
+                                                  res,
+                                                  valid_res,
+                                                  value,
+                                                  right_operand);
+        }
     }
     AssertInfo(processed_size == real_batch_size,
                "internal error: expr processed rows {} not equal "

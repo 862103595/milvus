@@ -24,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/internal/querycoordv2/assign"
 	"github.com/milvus-io/milvus/internal/querycoordv2/balance"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
@@ -39,11 +40,15 @@ import (
 // TODO(sunby): have too much similar codes with SegmentChecker
 type ChannelChecker struct {
 	*checkerActivation
-	meta            *meta.Meta
-	dist            *meta.DistributionManager
-	targetMgr       meta.TargetManagerInterface
-	nodeMgr         *session.NodeManager
-	getBalancerFunc GetBalancerFunc
+	meta         *meta.Meta
+	dist         *meta.DistributionManager
+	targetMgr    meta.TargetManagerInterface
+	nodeMgr      *session.NodeManager
+	scheduler    task.Scheduler
+	assignPolicy assign.AssignPolicy
+
+	// version cache for fast skip when nothing changed
+	versionCache map[int64]*collectionVersionCache
 }
 
 func NewChannelChecker(
@@ -51,15 +56,21 @@ func NewChannelChecker(
 	dist *meta.DistributionManager,
 	targetMgr meta.TargetManagerInterface,
 	nodeMgr *session.NodeManager,
-	getBalancerFunc GetBalancerFunc,
+	scheduler task.Scheduler,
 ) *ChannelChecker {
+	// Create RoundRobin assign policy in constructor to maximize loading speed
+	// Note: RoundRobin may break short-term balance but prioritizes loading speed
+	assignPolicy := assign.GetGlobalAssignPolicyFactory().GetPolicy(assign.PolicyTypeRoundRobin)
+
 	return &ChannelChecker{
 		checkerActivation: newCheckerActivation(),
 		meta:              meta,
 		dist:              dist,
 		targetMgr:         targetMgr,
 		nodeMgr:           nodeMgr,
-		getBalancerFunc:   getBalancerFunc,
+		scheduler:         scheduler,
+		assignPolicy:      assignPolicy,
+		versionCache:      make(map[int64]*collectionVersionCache),
 	}
 }
 
@@ -82,16 +93,38 @@ func (c *ChannelChecker) Check(ctx context.Context) []task.Task {
 	if !c.IsActive() {
 		return nil
 	}
+
 	collectionIDs := c.meta.CollectionManager.GetAll(ctx)
 	tasks := make([]task.Task, 0)
 	for _, cid := range collectionIDs {
 		if c.readyToCheck(ctx, cid) {
+			// Fast path: skip if target and dist versions unchanged
+			currentTargetVersion := c.targetMgr.GetCollectionTargetVersion(ctx, cid, meta.NextTarget)
+			currentDistVersion := c.dist.ChannelDistManager.GetVersion()
+			if c.isCollectionSynced(cid, currentTargetVersion, currentDistVersion) {
+				continue
+			}
+
 			replicas := c.meta.ReplicaManager.GetByCollection(ctx, cid)
+			hasTask := false
 			for _, r := range replicas {
-				tasks = append(tasks, c.checkReplica(ctx, r)...)
+				replicaTasks := c.checkReplica(ctx, r)
+				if len(replicaTasks) > 0 {
+					hasTask = true
+					tasks = append(tasks, replicaTasks...)
+				}
+			}
+
+			// Only update version cache if no tasks were generated
+			// If tasks were generated, we need to re-check next time
+			if !hasTask {
+				c.updateVersionCache(cid, currentTargetVersion, currentDistVersion)
 			}
 		}
 	}
+
+	// clean up version cache for released collections
+	c.cleanVersionCache(collectionIDs)
 
 	// clean channel which has been released
 	channels := c.dist.ChannelDistManager.GetByFilter()
@@ -115,6 +148,40 @@ func (c *ChannelChecker) Check(ctx context.Context) []task.Task {
 		}
 	}
 	return tasks
+}
+
+// isCollectionSynced checks if target and dist versions are unchanged since last check
+func (c *ChannelChecker) isCollectionSynced(collectionID int64, targetVersion, channelDistVersion int64) bool {
+	cache, ok := c.versionCache[collectionID]
+	if !ok {
+		return false
+	}
+	return cache.targetVersion == targetVersion && cache.channelDistVersion == channelDistVersion
+}
+
+// updateVersionCache updates the version cache for a collection
+func (c *ChannelChecker) updateVersionCache(collectionID int64, targetVersion, channelDistVersion int64) {
+	c.versionCache[collectionID] = &collectionVersionCache{
+		targetVersion:      targetVersion,
+		channelDistVersion: channelDistVersion,
+	}
+}
+
+// cleanVersionCache removes entries for collections that no longer exist.
+// Only runs when cache has more entries than active collections, meaning stale entries exist.
+func (c *ChannelChecker) cleanVersionCache(activeCollections []int64) {
+	if len(c.versionCache) <= len(activeCollections) {
+		return
+	}
+	activeSet := make(map[int64]struct{}, len(activeCollections))
+	for _, cid := range activeCollections {
+		activeSet[cid] = struct{}{}
+	}
+	for cid := range c.versionCache {
+		if _, ok := activeSet[cid]; !ok {
+			delete(c.versionCache, cid)
+		}
+	}
 }
 
 func (c *ChannelChecker) checkReplica(ctx context.Context, replica *meta.Replica) []task.Task {
@@ -205,7 +272,7 @@ func (c *ChannelChecker) findRepeatedChannels(ctx context.Context, replicaID int
 }
 
 func (c *ChannelChecker) createChannelLoadTask(ctx context.Context, channels []*meta.DmChannel, replica *meta.Replica) []task.Task {
-	plans := make([]balance.ChannelAssignPlan, 0)
+	plans := make([]assign.ChannelAssignPlan, 0)
 	for _, ch := range channels {
 		var rwNodes []int64
 		if streamingutil.IsStreamingServiceEnabled() {
@@ -215,7 +282,7 @@ func (c *ChannelChecker) createChannelLoadTask(ctx context.Context, channels []*
 				rwNodes = replica.GetRWNodes()
 			}
 		}
-		plan := c.getBalancerFunc().AssignChannel(ctx, replica.GetCollectionID(), []*meta.DmChannel{ch}, rwNodes, true)
+		plan := c.assignPolicy.AssignChannel(ctx, replica.GetCollectionID(), []*meta.DmChannel{ch}, rwNodes, true)
 		plans = append(plans, plan...)
 	}
 

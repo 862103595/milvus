@@ -27,7 +27,7 @@ func (rs *recoveryStorageImpl) isDirty() bool {
 
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	return rs.dirtyCounter > 0
+	return rs.dirtyCounter > 0 || rs.pendingSalvageCheckpoint != nil
 }
 
 // TODO: !!! all recovery persist operation should be a compare-and-swap operation to
@@ -133,6 +133,16 @@ func (rs *recoveryStorageImpl) persistDirtySnapshot(ctx context.Context, lvl zap
 		return err
 	}
 
+	// Salvage checkpoint must be persisted before the consume checkpoint to guarantee ordering:
+	// if the node crashes between these two writes, the next snapshot retry will re-persist both.
+	if snapshot.SalvageCheckpoint != nil {
+		if err := rs.retryOperationWithBackoff(ctx, rs.Logger().With(zap.String("op", "persistSalvageCheckpoint")), func(ctx context.Context) error {
+			return resource.Resource().StreamingNodeCatalog().SaveSalvageCheckpoint(ctx, rs.channel.Name, snapshot.SalvageCheckpoint.IntoProto())
+		}); err != nil {
+			return err
+		}
+	}
+
 	// checkpoint updates should always be persisted after other updates success.
 	if err := rs.retryOperationWithBackoff(ctx, rs.Logger().With(zap.String("op", "persistCheckpoint")), func(ctx context.Context) error {
 		return resource.Resource().StreamingNodeCatalog().
@@ -143,20 +153,20 @@ func (rs *recoveryStorageImpl) persistDirtySnapshot(ctx context.Context, lvl zap
 
 	// sample the checkpoint for truncator to make wal truncation.
 	rs.metrics.ObServePersistedMetrics(snapshot.Checkpoint.TimeTick)
-	rs.sampleTruncateCheckpoint(snapshot.Checkpoint)
+	rs.simpleTruncateCheckpoint(ctx, snapshot.Checkpoint)
 	return
 }
 
-func (rs *recoveryStorageImpl) sampleTruncateCheckpoint(checkpoint *WALCheckpoint) {
+func (rs *recoveryStorageImpl) simpleTruncateCheckpoint(ctx context.Context, checkpoint *WALCheckpoint) {
 	flusherCP := rs.getFlusherCheckpoint()
 	if flusherCP == nil {
 		return
 	}
 	// use the smaller one to truncate the wal.
 	if flusherCP.MessageID.LTE(checkpoint.MessageID) {
-		rs.truncator.SampleCheckpoint(flusherCP)
+		_ = rs.truncator.Truncate(ctx, flusherCP.MessageID)
 	} else {
-		rs.truncator.SampleCheckpoint(checkpoint)
+		_ = rs.truncator.Truncate(ctx, checkpoint.MessageID)
 	}
 }
 

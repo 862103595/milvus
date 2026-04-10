@@ -122,7 +122,8 @@ func (s *Server) init() error {
 		etcdConfig.EtcdTLSCert.GetValue(),
 		etcdConfig.EtcdTLSKey.GetValue(),
 		etcdConfig.EtcdTLSCACert.GetValue(),
-		etcdConfig.EtcdTLSMinVersion.GetValue())
+		etcdConfig.EtcdTLSMinVersion.GetValue(),
+		etcdConfig.ClientOptions()...)
 	if err != nil {
 		log.Debug("QueryNode connect to etcd failed", zap.Error(err))
 		return err
@@ -407,6 +408,22 @@ func (s *Server) DropIndex(ctx context.Context, req *querypb.DropIndexRequest) (
 	return s.querynode.DropIndex(ctx, req)
 }
 
-func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*commonpb.Status, error) {
+func (s *Server) UpdateIndex(ctx context.Context, req *querypb.UpdateIndexRequest) (*commonpb.Status, error) {
+	return s.querynode.UpdateIndex(ctx, req)
+}
+
+func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
 	return s.querynode.ValidateAnalyzer(ctx, req)
+}
+
+func (s *Server) GetHighlight(ctx context.Context, req *querypb.GetHighlightRequest) (*querypb.GetHighlightResponse, error) {
+	return s.querynode.GetHighlight(ctx, req)
+}
+
+func (s *Server) SyncFileResource(ctx context.Context, req *internalpb.SyncFileResourceRequest) (*commonpb.Status, error) {
+	return s.querynode.SyncFileResource(ctx, req)
+}
+
+func (s *Server) ComputePhraseMatchSlop(ctx context.Context, req *querypb.ComputePhraseMatchSlopRequest) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	return s.querynode.ComputePhraseMatchSlop(ctx, req)
 }

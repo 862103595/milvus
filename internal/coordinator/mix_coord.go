@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,10 +13,12 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/datacoord"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/kv/tikv"
@@ -74,9 +75,6 @@ type mixCoordImpl struct {
 
 	factory dependency.Factory
 
-	enableActiveStandBy bool
-	activateFunc        func() error
-
 	metricsRequest *metricsinfo.MetricsRequest
 
 	metaKVCreator  func() kv.MetaKv
@@ -87,6 +85,9 @@ type mixCoordImpl struct {
 	posixCleanupWg        sync.WaitGroup
 	posixCleanupStartOnce sync.Once
 	posixCleanupStopOnce  sync.Once
+
+	// file resource observer
+	fileResourceObserver *FileResourceObserver
 }
 
 func NewMixCoordServer(c context.Context, factory dependency.Factory) (*mixCoordImpl, error) {
@@ -96,13 +97,12 @@ func NewMixCoordServer(c context.Context, factory dependency.Factory) (*mixCoord
 	dataCoordServer := datacoord.CreateServer(c, factory)
 
 	return &mixCoordImpl{
-		ctx:                 ctx,
-		cancel:              cancel,
-		rootcoordServer:     rootCoordServer,
-		queryCoordServer:    queryCoordServer,
-		datacoordServer:     dataCoordServer,
-		enableActiveStandBy: Params.MixCoordCfg.EnableActiveStandby.GetAsBool(),
-		factory:             factory,
+		ctx:              ctx,
+		cancel:           cancel,
+		rootcoordServer:  rootCoordServer,
+		queryCoordServer: queryCoordServer,
+		datacoordServer:  dataCoordServer,
+		factory:          factory,
 	}, nil
 }
 
@@ -111,24 +111,20 @@ func (s *mixCoordImpl) Register() error {
 	log := log.Ctx(s.ctx)
 	s.session.Register()
 	afterRegister := func() {
-		metrics.NumNodes.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), typeutil.MixCoordRole).Inc()
+		metrics.NumNodes.WithLabelValues(paramtable.GetStringNodeID(), typeutil.MixCoordRole).Inc()
 		log.Info("MixCoord Register Finished")
-		s.session.LivenessCheck(s.ctx, func() {
-			log.Error("MixCoord disconnected from etcd, process will exit", zap.Int64("serverID", s.session.GetServerID()))
-			os.Exit(1)
-		})
 	}
-	if s.enableActiveStandBy {
-		go func() {
-			if err := s.session.ProcessActiveStandBy(s.activateFunc); err != nil {
-				log.Error("failed to activate standby server", zap.Error(err))
-				panic(err)
+	go func() {
+		if err := s.session.ProcessActiveStandBy(s.activateFunc); err != nil {
+			if s.ctx.Err() == context.Canceled {
+				log.Info("standby process canceled due to server shutdown")
+				return
 			}
-			afterRegister()
-		}()
-	} else {
+			log.Error("failed to activate standby server", zap.Error(err))
+			panic(err)
+		}
 		afterRegister()
-	}
+	}()
 	return nil
 }
 
@@ -141,33 +137,25 @@ func (s *mixCoordImpl) Init() error {
 	s.factory.Init(Params)
 	s.initKVCreator()
 	s.initStreamingCoord()
-	if s.enableActiveStandBy {
-		s.activateFunc = func() error {
-			log.Info("mixCoord switch from standby to active, activating")
+	s.UpdateStateCode(commonpb.StateCode_StandBy)
+	log.Info("MixCoord enter standby mode successfully")
+	return nil
+}
 
-			var err error
-			s.initOnce.Do(func() {
-				if err = s.initInternal(); err != nil {
-					log.Error("mixCoord init failed", zap.Error(err))
-				}
-			})
-			if err != nil {
-				return err
-			}
-			log.Info("mixCoord startup success", zap.String("address", s.session.GetAddress()))
-			s.startAndUpdateHealthy()
-			return err
+func (s *mixCoordImpl) activateFunc() error {
+	log.Info("mixCoord switch from standby to active, activating")
+	var err error
+	s.initOnce.Do(func() {
+		if err = s.initInternal(); err != nil {
+			log.Error("mixCoord init failed", zap.Error(err))
 		}
-		s.UpdateStateCode(commonpb.StateCode_StandBy)
-		log.Info("MixCoord enter standby mode successfully")
-	} else {
-		s.initOnce.Do(func() {
-			if initErr = s.initInternal(); initErr != nil {
-				log.Error("mixCoord init failed", zap.Error(initErr))
-			}
-		})
+	})
+	if err != nil {
+		return err
 	}
-	return initErr
+	log.Info("mixCoord startup success", zap.String("address", s.session.GetAddress()))
+	s.startAndUpdateHealthy()
+	return err
 }
 
 func (s *mixCoordImpl) initInternal() error {
@@ -175,12 +163,17 @@ func (s *mixCoordImpl) initInternal() error {
 	s.rootcoordServer.SetMixCoord(s)
 	s.datacoordServer.SetMixCoord(s)
 	s.queryCoordServer.SetMixCoord(s)
+	s.fileResourceObserver = NewFileResourceObserver(s.ctx)
 
-	if err := s.streamingCoord.Start(s.ctx); err != nil {
+	// Register WAL callbacks
+	RegisterWALCallbacks(s)
+
+	if err := s.streamingCoord.Start(s.ctx, s.fileResourceObserver); err != nil {
 		log.Error("streamCoord start failed", zap.Error(err))
 		return err
 	}
 
+	s.rootcoordServer.SetFileResourceObserver(s.fileResourceObserver)
 	if err := s.rootcoordServer.Init(); err != nil {
 		log.Error("rootCoord init failed", zap.Error(err))
 		return err
@@ -191,25 +184,38 @@ func (s *mixCoordImpl) initInternal() error {
 		return err
 	}
 
-	if err := s.datacoordServer.Init(); err != nil {
-		log.Error("dataCoord init failed", zap.Error(err))
+	// DataCoord and QueryCoord are independent of each other;
+	// both only depend on RootCoord being ready. Initialize and start them in parallel.
+	g, _ := errgroup.WithContext(s.ctx)
+	g.Go(func() error {
+		s.datacoordServer.SetFileResourceObserver(s.fileResourceObserver)
+		if err := s.datacoordServer.Init(); err != nil {
+			log.Error("dataCoord init failed", zap.Error(err))
+			return err
+		}
+		if err := s.datacoordServer.Start(); err != nil {
+			log.Error("dataCoord start failed", zap.Error(err))
+			return err
+		}
+		return nil
+	})
+	g.Go(func() error {
+		s.queryCoordServer.SetFileResourceObserver(s.fileResourceObserver)
+		if err := s.queryCoordServer.Init(); err != nil {
+			log.Error("queryCoord init failed", zap.Error(err))
+			return err
+		}
+		if err := s.queryCoordServer.Start(); err != nil {
+			log.Error("queryCoord start failed", zap.Error(err))
+			return err
+		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
 		return err
 	}
 
-	if err := s.datacoordServer.Start(); err != nil {
-		log.Error("dataCoord start failed", zap.Error(err))
-		return err
-	}
-
-	if err := s.queryCoordServer.Init(); err != nil {
-		log.Error("queryCoord init failed", zap.Error(err))
-		return err
-	}
-
-	if err := s.queryCoordServer.Start(); err != nil {
-		log.Error("queryCoord start failed", zap.Error(err))
-		return err
-	}
+	s.fileResourceObserver.Start()
 	return nil
 }
 
@@ -230,9 +236,6 @@ func (s *mixCoordImpl) initKVCreator() {
 }
 
 func (s *mixCoordImpl) Start() error {
-	if !s.enableActiveStandBy {
-		s.startAndUpdateHealthy()
-	}
 	return nil
 }
 
@@ -356,6 +359,12 @@ func (s *mixCoordImpl) Stop() error {
 	if err := s.rootcoordServer.Stop(); err != nil {
 		log.Error("Failed to stop rootCoord", zap.Error(err))
 	}
+
+	// All coordinators have stopped. Now stop the session.
+	s.session.SetMixCoordMode(false)
+	s.session.Stop()
+
+	s.fileResourceObserver.Stop()
 	s.cancel()
 	return nil
 }
@@ -374,16 +383,16 @@ func (s *mixCoordImpl) initStreamingCoord() {
 
 func (s *mixCoordImpl) initSession() error {
 	s.session = sessionutil.NewSession(s.ctx)
-	s.session.Init(typeutil.MixCoordRole, s.address, true, true)
-	s.session.SetEnableActiveStandBy(s.enableActiveStandBy)
+	s.session.Init(typeutil.MixCoordRole, s.address, true)
+	s.session.SetEnableActiveStandBy(true)
+	// Mark session as MixCoord mode so individual coordinator Stop() calls won't cancel it.
+	// MixCoord owns the session lifecycle and stops it after all coordinators have stopped.
+	s.session.SetMixCoordMode(true)
 	s.rootcoordServer.SetSession(s.session)
 	s.datacoordServer.SetSession(s.session)
 	s.queryCoordServer.SetSession(s.session)
 
 	return nil
-}
-
-func (s *mixCoordImpl) startHealthCheck() {
 }
 
 func (s *mixCoordImpl) SetAddress(address string) {
@@ -463,6 +472,22 @@ func (s *mixCoordImpl) AlterCollectionField(ctx context.Context, req *milvuspb.A
 	return s.rootcoordServer.AlterCollectionField(ctx, req)
 }
 
+func (s *mixCoordImpl) AlterCollectionSchema(ctx context.Context, req *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error) {
+	return s.rootcoordServer.AlterCollectionSchema(ctx, req)
+}
+
+func (s *mixCoordImpl) AddCollectionFunction(ctx context.Context, req *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.AddCollectionFunction(ctx, req)
+}
+
+func (s *mixCoordImpl) AlterCollectionFunction(ctx context.Context, req *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.AlterCollectionFunction(ctx, req)
+}
+
+func (s *mixCoordImpl) DropCollectionFunction(ctx context.Context, req *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.DropCollectionFunction(ctx, req)
+}
+
 func (s *mixCoordImpl) CreatePartition(ctx context.Context, req *milvuspb.CreatePartitionRequest) (*commonpb.Status, error) {
 	return s.rootcoordServer.CreatePartition(ctx, req)
 }
@@ -517,6 +542,10 @@ func (s *mixCoordImpl) CreateAlias(ctx context.Context, in *milvuspb.CreateAlias
 
 func (s *mixCoordImpl) DescribeCollectionInternal(ctx context.Context, in *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
 	return s.rootcoordServer.DescribeCollectionInternal(ctx, in)
+}
+
+func (s *mixCoordImpl) BackupEzk(ctx context.Context, in *internalpb.BackupEzkRequest) (*internalpb.BackupEzkResponse, error) {
+	return s.rootcoordServer.BackupEzk(ctx, in)
 }
 
 // DropAlias drop collection alias
@@ -870,7 +899,14 @@ func (s *mixCoordImpl) GetQcMetrics(ctx context.Context, in *milvuspb.GetMetrics
 	return s.queryCoordServer.GetMetrics(ctx, in)
 }
 
-// QueryCoordServer
+func (s *mixCoordImpl) GetDataCoordTopology(ctx context.Context, req *milvuspb.GetMetricsRequest) (*metricsinfo.DataCoordTopology, error) {
+	return s.datacoordServer.GetDataCoordTopology(ctx, req)
+}
+
+func (s *mixCoordImpl) GetQueryCoordTopology(ctx context.Context, req *milvuspb.GetMetricsRequest) (*metricsinfo.QueryCoordTopology, error) {
+	return s.queryCoordServer.GetQueryCoordTopology(ctx, req)
+}
+
 func (s *mixCoordImpl) ActivateChecker(ctx context.Context, req *querypb.ActivateCheckerRequest) (*commonpb.Status, error) {
 	return s.queryCoordServer.ActivateChecker(ctx, req)
 }
@@ -1197,8 +1233,12 @@ func (s *mixCoordImpl) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzer
 	return s.queryCoordServer.RunAnalyzer(ctx, req)
 }
 
-func (s *mixCoordImpl) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*commonpb.Status, error) {
+func (s *mixCoordImpl) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
 	return s.queryCoordServer.ValidateAnalyzer(ctx, req)
+}
+
+func (s *mixCoordImpl) ComputePhraseMatchSlop(ctx context.Context, req *querypb.ComputePhraseMatchSlopRequest) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	return s.queryCoordServer.ComputePhraseMatchSlop(ctx, req)
 }
 
 func (s *mixCoordImpl) FlushAll(ctx context.Context, req *datapb.FlushAllRequest) (*datapb.FlushAllResponse, error) {
@@ -1207,15 +1247,97 @@ func (s *mixCoordImpl) FlushAll(ctx context.Context, req *datapb.FlushAllRequest
 
 // AddFileResource add file resource
 func (s *mixCoordImpl) AddFileResource(ctx context.Context, req *milvuspb.AddFileResourceRequest) (*commonpb.Status, error) {
-	return s.datacoordServer.AddFileResource(ctx, req)
+	return s.rootcoordServer.AddFileResource(ctx, req)
 }
 
 // RemoveFileResource remove file resource
 func (s *mixCoordImpl) RemoveFileResource(ctx context.Context, req *milvuspb.RemoveFileResourceRequest) (*commonpb.Status, error) {
-	return s.datacoordServer.RemoveFileResource(ctx, req)
+	return s.rootcoordServer.RemoveFileResource(ctx, req)
 }
 
 // ListFileResources list file resources
 func (s *mixCoordImpl) ListFileResources(ctx context.Context, req *milvuspb.ListFileResourcesRequest) (*milvuspb.ListFileResourcesResponse, error) {
-	return s.datacoordServer.ListFileResources(ctx, req)
+	return s.rootcoordServer.ListFileResources(ctx, req)
+}
+
+// CreateExternalCollection creates an external collection
+func (s *mixCoordImpl) CreateExternalCollection(ctx context.Context, req *msgpb.CreateCollectionRequest) (*datapb.CreateExternalCollectionResponse, error) {
+	return s.datacoordServer.CreateExternalCollection(ctx, req)
+}
+
+// TruncateCollection truncate collection
+func (s *mixCoordImpl) TruncateCollection(ctx context.Context, req *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	return s.rootcoordServer.TruncateCollection(ctx, req)
+}
+
+// DropSegmentsByTime drop segments by time for TruncateCollection
+func (s *mixCoordImpl) DropSegmentsByTime(ctx context.Context, collectionID int64, flushTsList map[string]uint64) error {
+	return s.datacoordServer.DropSegmentsByTime(ctx, collectionID, flushTsList)
+}
+
+// ManualUpdateCurrentTarget manually update current target for TruncateCollection
+func (s *mixCoordImpl) ManualUpdateCurrentTarget(ctx context.Context, collectionID int64) error {
+	return s.queryCoordServer.ManualUpdateCurrentTarget(ctx, collectionID)
+}
+
+func (s *mixCoordImpl) CreateSnapshot(ctx context.Context, req *datapb.CreateSnapshotRequest) (*commonpb.Status, error) {
+	return s.datacoordServer.CreateSnapshot(ctx, req)
+}
+
+func (s *mixCoordImpl) DropSnapshot(ctx context.Context, req *datapb.DropSnapshotRequest) (*commonpb.Status, error) {
+	return s.datacoordServer.DropSnapshot(ctx, req)
+}
+
+func (s *mixCoordImpl) DescribeSnapshot(ctx context.Context, req *datapb.DescribeSnapshotRequest) (*datapb.DescribeSnapshotResponse, error) {
+	return s.datacoordServer.DescribeSnapshot(ctx, req)
+}
+
+func (s *mixCoordImpl) RestoreSnapshot(ctx context.Context, req *datapb.RestoreSnapshotRequest) (*datapb.RestoreSnapshotResponse, error) {
+	return s.datacoordServer.RestoreSnapshot(ctx, req)
+}
+
+func (s *mixCoordImpl) GetRestoreSnapshotState(ctx context.Context, req *datapb.GetRestoreSnapshotStateRequest) (*datapb.GetRestoreSnapshotStateResponse, error) {
+	return s.datacoordServer.GetRestoreSnapshotState(ctx, req)
+}
+
+func (s *mixCoordImpl) ListRestoreSnapshotJobs(ctx context.Context, req *datapb.ListRestoreSnapshotJobsRequest) (*datapb.ListRestoreSnapshotJobsResponse, error) {
+	return s.datacoordServer.ListRestoreSnapshotJobs(ctx, req)
+}
+
+func (s *mixCoordImpl) ListSnapshots(ctx context.Context, req *datapb.ListSnapshotsRequest) (*datapb.ListSnapshotsResponse, error) {
+	return s.datacoordServer.ListSnapshots(ctx, req)
+}
+
+func (s *mixCoordImpl) BatchUpdateManifest(ctx context.Context, req *datapb.BatchUpdateManifestRequest) (*commonpb.Status, error) {
+	return s.datacoordServer.BatchUpdateManifest(ctx, req)
+}
+
+// Client Telemetry methods - forwarded to rootcoord
+
+func (s *mixCoordImpl) ClientHeartbeat(ctx context.Context, req *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error) {
+	return s.rootcoordServer.ClientHeartbeat(ctx, req)
+}
+
+func (s *mixCoordImpl) GetClientTelemetry(ctx context.Context, req *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error) {
+	return s.rootcoordServer.GetClientTelemetry(ctx, req)
+}
+
+func (s *mixCoordImpl) PushClientCommand(ctx context.Context, req *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error) {
+	return s.rootcoordServer.PushClientCommand(ctx, req)
+}
+
+func (s *mixCoordImpl) DeleteClientCommand(ctx context.Context, req *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error) {
+	return s.rootcoordServer.DeleteClientCommand(ctx, req)
+}
+
+func (s *mixCoordImpl) RefreshExternalCollection(ctx context.Context, req *datapb.RefreshExternalCollectionRequest) (*datapb.RefreshExternalCollectionResponse, error) {
+	return s.datacoordServer.RefreshExternalCollection(ctx, req)
+}
+
+func (s *mixCoordImpl) GetRefreshExternalCollectionProgress(ctx context.Context, req *datapb.GetRefreshExternalCollectionProgressRequest) (*datapb.GetRefreshExternalCollectionProgressResponse, error) {
+	return s.datacoordServer.GetRefreshExternalCollectionProgress(ctx, req)
+}
+
+func (s *mixCoordImpl) ListRefreshExternalCollectionJobs(ctx context.Context, req *datapb.ListRefreshExternalCollectionJobsRequest) (*datapb.ListRefreshExternalCollectionJobsResponse, error) {
+	return s.datacoordServer.ListRefreshExternalCollectionJobs(ctx, req)
 }

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/blang/semver/v4"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
@@ -50,21 +51,31 @@ const (
 	// DefaultServiceRoot default root path used in kv by Session
 	DefaultServiceRoot = "session/"
 	// DefaultIDKey default id key for Session
-	DefaultIDKey                        = "id"
-	SupportedLabelPrefix                = "MILVUS_SERVER_LABEL_"
-	LabelStreamingNodeEmbeddedQueryNode = "QUERYNODE_STREAMING-EMBEDDED"
-	LabelStandalone                     = "STANDALONE"
-	MilvusNodeIDForTesting              = "MILVUS_NODE_ID_FOR_TESTING"
+	DefaultIDKey           = "id"
+	MilvusNodeIDForTesting = "MILVUS_NODE_ID_FOR_TESTING"
+	// ExitCodeEtcd is the exit code used when the process must terminate due to
+	// an unrecoverable etcd failure (session lease expired, watch channel closed, etc.).
+	// Using a distinctive code (80) so K8s pod status can identify etcd-related crashes.
+	ExitCodeEtcd = 80
+
+	serverVersionKey = "version"
 )
+
+var errSessionVersionCheckFailure = errors.New("session version check failure")
+
+// isNotSessionVersionCheckFailure checks if the error is not a session version check failure.
+func isNotSessionVersionCheckFailure(err error) bool {
+	return !errors.Is(err, errSessionVersionCheckFailure)
+}
 
 // EnableEmbededQueryNodeLabel set server labels for embedded query node.
 func EnableEmbededQueryNodeLabel() {
-	os.Setenv(SupportedLabelPrefix+LabelStreamingNodeEmbeddedQueryNode, "1")
+	os.Setenv(NewServerLabel(typeutil.QueryNodeRole, LabelStreamingNodeEmbeddedQueryNode), "1")
 }
 
 // EnableStandaloneLabel set server labels for standalone.
 func EnableStandaloneLabel() {
-	os.Setenv(SupportedLabelPrefix+LabelStandalone, "1")
+	os.Setenv(NewServerLabel("", LabelStandalone), "1")
 }
 
 // SessionEventType session event type
@@ -102,16 +113,16 @@ const (
 type IndexEngineVersion struct {
 	MinimalIndexVersion int32 `json:"MinimalIndexVersion,omitempty"`
 	CurrentIndexVersion int32 `json:"CurrentIndexVersion,omitempty"`
+	MaximumIndexVersion int32 `json:"MaximumIndexVersion,omitempty"`
 }
 
 // SessionRaw the persistent part of Session.
 type SessionRaw struct {
-	ServerID                 int64  `json:"ServerID,omitempty"`
-	ServerName               string `json:"ServerName,omitempty"`
-	Address                  string `json:"Address,omitempty"`
-	Exclusive                bool   `json:"Exclusive,omitempty"`
-	Stopping                 bool   `json:"Stopping,omitempty"`
-	TriggerKill              bool
+	ServerID                 int64              `json:"ServerID,omitempty"`
+	ServerName               string             `json:"ServerName,omitempty"`
+	Address                  string             `json:"Address,omitempty"`
+	Exclusive                bool               `json:"Exclusive,omitempty"`
+	Stopping                 bool               `json:"Stopping,omitempty"`
 	Version                  string             `json:"Version"`
 	IndexEngineVersion       IndexEngineVersion `json:"IndexEngineVersion,omitempty"`
 	ScalarIndexEngineVersion IndexEngineVersion `json:"ScalarIndexEngineVersion,omitempty"`
@@ -134,47 +145,42 @@ func (s *SessionRaw) GetServerLabel() map[string]string {
 	return s.ServerLabels
 }
 
-func (s *SessionRaw) IsTriggerKill() bool {
-	return s.TriggerKill
-}
-
 // Session is a struct to store service's session, including ServerID, ServerName,
 // Address.
 // Exclusive indicates that this server can only start one.
+// TODO: it's a bad implementation to mix up the service registration and service diescovery into one struct.
+// because the registration is used by server side, but the discovery is used by client side.
+// we should split the service registration and service diescovery.
 type Session struct {
-	ctx context.Context
-	// When outside context done, Session cancels its goroutines first, then uses
-	// keepAliveCancel to cancel the etcd KeepAlive
-	keepAliveLock   sync.Mutex
-	keepAliveCancel context.CancelFunc
-	keepAliveCtx    context.Context
+	log.Binder
+
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	SessionRaw
 
 	Version semver.Version `json:"Version,omitempty"`
-
-	liveChOnce sync.Once
-	liveCh     chan struct{}
 
 	etcdCli           *clientv3.Client
 	watchSessionKeyCh clientv3.WatchChan
 	watchCancel       atomic.Pointer[context.CancelFunc]
 	wg                sync.WaitGroup
 
-	metaRoot string
+	metaRoot       string
+	isMixCoordMode atomic.Bool
 
-	registered   atomic.Value
-	disconnected atomic.Value
+	registered         atomic.Value
+	registeredRevision atomic.Int64
+	disconnected       atomic.Value
 
 	isStandby           atomic.Value
 	enableActiveStandBy bool
 	activeKey           string
+	versionKey          string
 
 	sessionTTL        int64
 	sessionRetryTimes int64
 	reuseNodeID       bool
-
-	isStopped atomic.Bool // set to true if stop method is invoked
 }
 
 type SessionOption func(session *Session)
@@ -192,18 +198,20 @@ func WithResueNodeID(b bool) SessionOption {
 }
 
 // WithIndexEngineVersion should be only used by querynode.
-func WithIndexEngineVersion(minimal, current int32) SessionOption {
+func WithIndexEngineVersion(minimal, current, maximum int32) SessionOption {
 	return func(session *Session) {
 		session.IndexEngineVersion.MinimalIndexVersion = minimal
 		session.IndexEngineVersion.CurrentIndexVersion = current
+		session.IndexEngineVersion.MaximumIndexVersion = maximum
 	}
 }
 
 // WithScalarIndexEngineVersion should be only used by querynode.
-func WithScalarIndexEngineVersion(minimal, current int32) SessionOption {
+func WithScalarIndexEngineVersion(minimal, current, maximum int32) SessionOption {
 	return func(session *Session) {
 		session.ScalarIndexEngineVersion.MinimalIndexVersion = minimal
 		session.ScalarIndexEngineVersion.CurrentIndexVersion = current
+		session.ScalarIndexEngineVersion.MaximumIndexVersion = maximum
 	}
 }
 
@@ -258,8 +266,11 @@ func NewSessionWithEtcd(ctx context.Context, metaRoot string, client *clientv3.C
 		log.Ctx(ctx).Error("get host name fail", zap.Error(hostNameErr))
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
 	session := &Session{
-		ctx:      ctx,
+		ctx:    ctx,
+		cancel: cancel,
+
 		metaRoot: metaRoot,
 		Version:  common.Version,
 
@@ -271,8 +282,8 @@ func NewSessionWithEtcd(ctx context.Context, metaRoot string, client *clientv3.C
 		sessionTTL:        paramtable.Get().CommonCfg.SessionTTL.GetAsInt64(),
 		sessionRetryTimes: paramtable.Get().CommonCfg.SessionRetryTimes.GetAsInt64(),
 		reuseNodeID:       true,
-		isStopped:         *atomic.NewBool(false),
 	}
+	session.registeredRevision.Store(-1)
 
 	// integration test create cluster with different nodeId in one process
 	if paramtable.Get().IntegrationTestCfg.IntegrationMode.GetAsBool() {
@@ -282,42 +293,31 @@ func NewSessionWithEtcd(ctx context.Context, metaRoot string, client *clientv3.C
 	session.apply(opts...)
 
 	session.UpdateRegistered(false)
-
-	connectEtcdFn := func() error {
-		log.Ctx(ctx).Debug("Session try to connect to etcd")
-		ctx2, cancel2 := context.WithTimeout(session.ctx, 5*time.Second)
-		defer cancel2()
-		if _, err := client.Get(ctx2, "health"); err != nil {
-			return err
-		}
-		session.etcdCli = client
-		return nil
-	}
-	err := retry.Do(ctx, connectEtcdFn, retry.Attempts(100))
-	if err != nil {
-		log.Ctx(ctx).Warn("failed to initialize session",
-			zap.Error(err))
-		return nil
-	}
-	log.Ctx(ctx).Debug("Session connect to etcd success")
+	session.etcdCli = client
 	return session
 }
 
 // Init will initialize base struct of the Session, including ServerName, ServerID,
 // Address, Exclusive. ServerID is obtained in getServerID.
-func (s *Session) Init(serverName, address string, exclusive bool, triggerKill bool) {
+func (s *Session) Init(serverName, address string, exclusive bool) {
 	s.ServerName = serverName
 	s.Address = address
 	s.Exclusive = exclusive
-	s.TriggerKill = triggerKill
 	s.checkIDExist()
 	serverID, err := s.getServerID()
 	if err != nil {
 		panic(err)
 	}
 	s.ServerID = serverID
-	s.ServerLabels = GetServerLabelsFromEnv(serverName)
-	log.Info("start server", zap.String("name", serverName), zap.String("address", address), zap.Int64("id", s.ServerID), zap.Any("server_labels", s.ServerLabels))
+	s.ServerLabels = getServerLabelsFromEnv(serverName)
+	s.versionKey = path.Join(s.metaRoot, DefaultServiceRoot, serverVersionKey)
+
+	s.SetLogger(log.With(
+		log.FieldComponent("service-registration"),
+		zap.String("role", serverName),
+		zap.Int64("serverID", s.ServerID),
+		zap.String("address", address),
+	))
 }
 
 // String makes Session struct able to be logged by zap
@@ -327,14 +327,50 @@ func (s *Session) String() string {
 
 // Register will process keepAliveResponse to keep alive with etcd.
 func (s *Session) Register() {
-	ch, err := s.registerService()
+	err := s.registerService()
 	if err != nil {
-		log.Error("Register failed", zap.Error(err))
+		s.Logger().Error("register failed", zap.Error(err))
 		panic(err)
 	}
-	s.liveCh = make(chan struct{})
-	s.processKeepAliveResponse(ch)
 	s.UpdateRegistered(true)
+	s.startKeepAliveLoop()
+}
+
+func (s *Session) GetRegisteredRevision() int64 {
+	revision := s.registeredRevision.Load()
+	if revision < 0 {
+		panic("registeredRevision is used before register")
+	}
+	return revision
+}
+
+// isCoordinator checks if the session needs to check the version.
+func (s *Session) isCoordinator() bool {
+	return s.ServerName == typeutil.MixCoordRole ||
+		s.ServerName == typeutil.QueryCoordRole ||
+		s.ServerName == typeutil.DataCoordRole ||
+		s.ServerName == typeutil.RootCoordRole ||
+		s.ServerName == typeutil.IndexCoordRole
+}
+
+// checkVersion checks the version of the session and returns the error if the version is not found or expired.
+func (s *Session) checkVersionForCoordinator() (*mvccpb.KeyValue, error) {
+	resp, err := s.etcdCli.Get(s.ctx, s.versionKey)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Count <= 0 {
+		// no version key found.
+		return nil, nil
+	}
+	version, err := semver.Parse(string(resp.Kvs[0].Value))
+	if err != nil {
+		return nil, err
+	}
+	if common.Version.Major < version.Major || (common.Version.Major == version.Major && common.Version.Minor < version.Minor) {
+		return nil, errors.Wrapf(errSessionVersionCheckFailure, "current version(%s), session version(%s)", common.Version.String(), version.String())
+	}
+	return resp.Kvs[0], nil
 }
 
 var serverIDMu sync.Mutex
@@ -358,25 +394,6 @@ func (s *Session) getServerID() (int64, error) {
 		paramtable.SetNodeID(nodeID)
 	}
 	return nodeID, nil
-}
-
-func GetServerLabelsFromEnv(role string) map[string]string {
-	ret := make(map[string]string)
-	switch role {
-	case "querynode":
-		for _, value := range os.Environ() {
-			rs := []rune(value)
-			in := strings.Index(value, "=")
-			key := string(rs[0:in])
-			value := string(rs[in+1:])
-
-			if strings.HasPrefix(key, SupportedLabelPrefix) {
-				label := strings.TrimPrefix(key, SupportedLabelPrefix)
-				ret[label] = value
-			}
-		}
-	}
-	return ret
 }
 
 func (s *Session) checkIDExist() {
@@ -438,35 +455,6 @@ func (s *Session) getCompleteKey() string {
 	return path.Join(s.metaRoot, DefaultServiceRoot, key)
 }
 
-func (s *Session) getSessionKey() string {
-	key := s.ServerName
-	if !s.Exclusive {
-		key = fmt.Sprintf("%s-%d", key, s.ServerID)
-	}
-	return path.Join(s.metaRoot, DefaultServiceRoot, key)
-}
-
-func (s *Session) initWatchSessionCh(ctx context.Context) error {
-	var (
-		err     error
-		getResp *clientv3.GetResponse
-	)
-
-	ctx, cancel := context.WithCancel(ctx)
-	s.watchCancel.Store(&cancel)
-
-	err = retry.Do(ctx, func() error {
-		getResp, err = s.etcdCli.Get(ctx, s.getSessionKey())
-		return err
-	}, retry.Attempts(uint(s.sessionRetryTimes)))
-	if err != nil {
-		log.Warn("fail to get the session key from the etcd", zap.Error(err))
-		return err
-	}
-	s.watchSessionKeyCh = s.etcdCli.Watch(ctx, s.getSessionKey(), clientv3.WithRev(getResp.Header.Revision))
-	return nil
-}
-
 // registerService registers the service to etcd so that other services
 // can find that the service is online and issue subsequent operations
 // RegisterService will save a key-value in etcd
@@ -482,186 +470,202 @@ func (s *Session) initWatchSessionCh(ctx context.Context) error {
 //
 // Exclusive means whether this service can exist two at the same time, if so,
 // it is false. Otherwise, set it to true.
-func (s *Session) registerService() (<-chan *clientv3.LeaseKeepAliveResponse, error) {
+func (s *Session) registerService() error {
 	if s.enableActiveStandBy {
 		s.updateStandby(true)
 	}
 	completeKey := s.getCompleteKey()
-	var ch <-chan *clientv3.LeaseKeepAliveResponse
-	log := log.Ctx(s.ctx)
-	log.Debug("service begin to register to etcd", zap.String("serverName", s.ServerName), zap.Int64("ServerID", s.ServerID))
+	s.Logger().Info("service begin to register to etcd")
 
 	registerFn := func() error {
 		resp, err := s.etcdCli.Grant(s.ctx, s.sessionTTL)
 		if err != nil {
-			log.Error("register service", zap.Error(err))
+			s.Logger().Error("register service: failed to grant lease from etcd", zap.Error(err))
 			return err
 		}
 		s.LeaseID = &resp.ID
 
 		sessionJSON, err := json.Marshal(s)
 		if err != nil {
+			s.Logger().Error("register service: failed to marshal session", zap.Error(err))
 			return err
 		}
 
-		txnResp, err := s.etcdCli.Txn(s.ctx).If(
-			clientv3.Compare(
-				clientv3.Version(completeKey),
-				"=",
-				0)).
-			Then(clientv3.OpPut(completeKey, string(sessionJSON), clientv3.WithLease(resp.ID))).Commit()
-		if err != nil {
-			log.Warn("register on etcd error, check the availability of etcd ", zap.Error(err))
-			return err
+		compareOps := []clientv3.Cmp{
+			clientv3.Compare(clientv3.Version(completeKey), "=", 0),
+		}
+		ops := []clientv3.Op{
+			clientv3.OpPut(completeKey, string(sessionJSON), clientv3.WithLease(resp.ID)),
 		}
 
-		if txnResp != nil && !txnResp.Succeeded {
-			s.handleRestart(completeKey)
-			return fmt.Errorf("function CompareAndSwap error for compare is false for key: %s", s.ServerName)
-		}
-		log.Info("put session key into etcd", zap.String("key", completeKey), zap.String("value", string(sessionJSON)))
-
-		keepAliveCtx, keepAliveCancel := context.WithCancel(context.Background())
-		s.keepAliveCtx = keepAliveCtx
-		s.keepAliveCancel = keepAliveCancel
-		ch, err = s.etcdCli.KeepAlive(keepAliveCtx, resp.ID)
-		if err != nil {
-			log.Warn("go error during keeping alive with etcd", zap.Error(err))
-			return err
-		}
-		log.Info("Service registered successfully", zap.String("ServerName", s.ServerName), zap.Int64("serverID", s.ServerID))
-		return nil
-	}
-	err := retry.Do(s.ctx, registerFn, retry.Attempts(uint(s.sessionRetryTimes)))
-	if err != nil {
-		return nil, err
-	}
-	return ch, nil
-}
-
-// Handle restart is fast path to handle node restart.
-// This should be only a fast path for coordinator
-// If we find previous session have same address as current , simply purge the old one so the recovery can be much faster
-func (s *Session) handleRestart(key string) {
-	resp, err := s.etcdCli.Get(s.ctx, key)
-	log := log.With(zap.String("key", key))
-	if err != nil {
-		log.Warn("failed to read old session from etcd, ignore", zap.Error(err))
-		return
-	}
-	for _, kv := range resp.Kvs {
-		session := &Session{}
-		err = json.Unmarshal(kv.Value, session)
-		if err != nil {
-			log.Warn("failed to unmarshal old session from etcd, ignore", zap.Error(err))
-			return
-		}
-
-		if session.Address == s.Address && session.ServerID < s.ServerID {
-			log.Warn("find old session is same as current node, assume it as restart, purge old session", zap.String("key", key),
-				zap.String("address", session.Address))
-			_, err := s.etcdCli.Delete(s.ctx, key)
-			if err != nil {
-				log.Warn("failed to unmarshal old session from etcd, ignore", zap.Error(err))
-				return
+		// if enable active-standby, we don't need to check the version now,
+		// only check the version when the standby is activated.
+		if s.isCoordinator() && !s.enableActiveStandBy {
+			if ops, compareOps, err = s.getOpsForCoordinator(ops, compareOps, sessionJSON); err != nil {
+				return err
 			}
 		}
+
+		txnResp, err := s.etcdCli.Txn(s.ctx).If(compareOps...).Then(ops...).Commit()
+		if err != nil {
+			s.Logger().Warn("register on etcd error, check the availability of etcd", zap.Error(err))
+			return err
+		}
+		if txnResp != nil && !txnResp.Succeeded {
+			return fmt.Errorf("function CompareAndSwap error for compare is false for key: %s", s.ServerName)
+		}
+		if !s.enableActiveStandBy {
+			s.registeredRevision.Store(txnResp.Header.GetRevision())
+		}
+		s.Logger().Info("put session key into etcd, service registered successfully", zap.String("key", completeKey), zap.String("value", string(sessionJSON)))
+		return nil
 	}
+	return retry.Do(s.ctx, registerFn, retry.Attempts(uint(s.sessionRetryTimes)), retry.RetryErr(isNotSessionVersionCheckFailure))
+}
+
+// getOpsForCoordinator gets the ops and compare ops for coordinator.
+func (s *Session) getOpsForCoordinator(ops []clientv3.Op, compareOps []clientv3.Cmp, sessionJSON []byte) ([]clientv3.Op, []clientv3.Cmp, error) {
+	previousVersion, err := s.checkVersionForCoordinator()
+	if err != nil {
+		return nil, nil, err
+	}
+	expectedVersion := int64(0)
+	if previousVersion != nil {
+		expectedVersion = previousVersion.Version
+	}
+	legacyCoord := []string{
+		typeutil.QueryCoordRole,
+		typeutil.DataCoordRole,
+		typeutil.RootCoordRole,
+	}
+	for _, role := range legacyCoord {
+		key := path.Join(s.metaRoot, DefaultServiceRoot, role)
+		var newSession SessionRaw
+		if err := json.Unmarshal(sessionJSON, &newSession); err != nil {
+			return nil, nil, err
+		}
+		newSession.ServerName = role
+		newSessionJSON, err := json.Marshal(newSession)
+		if err != nil {
+			return nil, nil, err
+		}
+		ops = append(ops, clientv3.OpPut(key, string(newSessionJSON), clientv3.WithLease(*s.LeaseID)))
+		compareOps = append(compareOps, clientv3.Compare(clientv3.Version(key), "=", 0))
+	}
+	// promise the legacy coordinator version not available.
+	compareOps = append(compareOps, clientv3.Compare(clientv3.Version(s.versionKey), "=", expectedVersion))
+	// setup the version key if is a coordinator.
+	ops = append(ops, clientv3.OpPut(s.versionKey, common.Version.String()))
+	return ops, compareOps, nil
 }
 
 // processKeepAliveResponse processes the response of etcd keepAlive interface
 // If keepAlive fails for unexpected error, it will send a signal to the channel.
-func (s *Session) processKeepAliveResponse(ch <-chan *clientv3.LeaseKeepAliveResponse) {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		for {
+func (s *Session) processKeepAliveResponse() {
+	defer func() {
+		s.Logger().Info("keep alive loop exited successfully, try to revoke lease right away...")
+		// here the s.ctx may be already done, so we use context.Background() with a timeout to revoke the lease.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := s.etcdCli.Revoke(ctx, *s.LeaseID); err != nil {
+			s.Logger().Error("failed to revoke lease", zap.Error(err), zap.Int64("leaseID", int64(*s.LeaseID)))
+		}
+		s.Logger().Info("lease revoked successfully", zap.Int64("leaseID", int64(*s.LeaseID)))
+		s.wg.Done()
+	}()
+
+	backoff := backoff.NewExponentialBackOff()
+	backoff.InitialInterval = 10 * time.Millisecond
+	backoff.MaxInterval = 100 * time.Second
+	backoff.MaxElapsedTime = 0
+	backoff.Reset()
+
+	var ch <-chan *clientv3.LeaseKeepAliveResponse
+	var lastErr error
+	nextKeepaliveInstant := time.Now().Add(time.Duration(s.sessionTTL) * time.Second)
+
+	for {
+		if s.ctx.Err() != nil {
+			return
+		}
+		if lastErr != nil {
+			nextBackoffInterval := backoff.NextBackOff()
+			s.Logger().Warn("failed to start keep alive, wait for retry...", zap.Error(lastErr), zap.Duration("nextBackoffInterval", nextBackoffInterval))
 			select {
+			case <-time.After(nextBackoffInterval):
 			case <-s.ctx.Done():
-				log.Warn("keep alive", zap.Error(errors.New("context done")))
-				s.cancelKeepAlive()
 				return
-			case resp, ok := <-ch:
-				if !ok {
-					log.Warn("session keepalive channel closed")
-
-					// if keep alive is canceled, keepAliveCtx.Err() will return a non-nil error
-					if s.keepAliveCtx.Err() != nil {
-						s.safeCloseLiveCh()
-						return
-					}
-
-					log.Info("keepAlive channel close caused by etcd, try to KeepAliveOnce", zap.String("serverName", s.ServerName))
-					s.keepAliveLock.Lock()
-					defer s.keepAliveLock.Unlock()
-					// have to KeepAliveOnce before KeepAlive because KeepAlive won't throw error even when lease OT
-					var keepAliveOnceResp *clientv3.LeaseKeepAliveResponse
-					s.keepAliveCancel()
-					s.keepAliveCtx, s.keepAliveCancel = context.WithCancel(context.Background())
-					err := retry.Do(s.ctx, func() error {
-						ctx, cancel := context.WithTimeout(s.keepAliveCtx, time.Second*10)
-						defer cancel()
-						resp, err := s.etcdCli.KeepAliveOnce(ctx, *s.LeaseID)
-						keepAliveOnceResp = resp
-						return err
-					}, retry.Attempts(3))
-					if err != nil {
-						log.Warn("fail to retry keepAliveOnce", zap.String("serverName", s.ServerName), zap.Int64("LeaseID", int64(*s.LeaseID)), zap.Error(err))
-						s.safeCloseLiveCh()
-						return
-					}
-					log.Info("succeed to KeepAliveOnce", zap.String("serverName", s.ServerName), zap.Int64("LeaseID", int64(*s.LeaseID)), zap.Any("resp", keepAliveOnceResp))
-
-					var chNew <-chan *clientv3.LeaseKeepAliveResponse
-					keepAliveFunc := func() error {
-						var err1 error
-						chNew, err1 = s.etcdCli.KeepAlive(s.keepAliveCtx, *s.LeaseID)
-						return err1
-					}
-					err = fnWithTimeout(keepAliveFunc, time.Second*10)
-					if err != nil {
-						log.Warn("fail to retry keepAlive", zap.Error(err))
-						s.safeCloseLiveCh()
-						return
-					}
-					go s.processKeepAliveResponse(chNew)
-					return
-				}
-				if resp == nil {
-					log.Warn("session keepalive response failed")
-					s.safeCloseLiveCh()
-				}
 			}
 		}
-	}()
+
+		if ch == nil {
+			if err := s.checkKeepaliveTTL(nextKeepaliveInstant); err != nil {
+				lastErr = err
+				continue
+			}
+			newCH, err := s.etcdCli.KeepAlive(s.ctx, *s.LeaseID)
+			if err != nil {
+				s.Logger().Error("failed to keep alive with etcd", zap.Error(err))
+				lastErr = errors.Wrap(err, "failed to keep alive")
+				continue
+			}
+			s.Logger().Info("keep alive...", zap.Int64("leaseID", int64(*s.LeaseID)))
+			ch = newCH
+		}
+
+		// Block until the keep alive failure.
+		for range ch {
+		}
+
+		// receive a keep alive response, continue the opeartion.
+		// the keep alive channel may be closed because of network error, we should retry the keep alive.
+		ch = nil
+		nextKeepaliveInstant = time.Now().Add(time.Duration(s.sessionTTL) * time.Second)
+		lastErr = nil
+		backoff.Reset()
+	}
 }
 
-func fnWithTimeout(fn func() error, d time.Duration) error {
-	if d != 0 {
-		resultChan := make(chan bool)
-		var err1 error
-		go func() {
-			err1 = fn()
-			resultChan <- true
-		}()
+// checkKeepaliveTTL checks the TTL of the lease and returns the error if the lease is not found or expired.
+func (s *Session) checkKeepaliveTTL(nextKeepaliveInstant time.Time) error {
+	errSessionExpiredAtClientSide := errors.New("session expired at client side")
+	ctx, cancel := context.WithDeadlineCause(s.ctx, nextKeepaliveInstant, errSessionExpiredAtClientSide)
+	defer cancel()
 
-		select {
-		case <-resultChan:
-			log.Ctx(context.TODO()).Debug("retry func success")
-		case <-time.After(d):
-			return errors.New("func timed out")
+	ttlResp, err := s.etcdCli.TimeToLive(ctx, *s.LeaseID)
+	if err != nil {
+		if errors.Is(err, v3rpc.ErrLeaseNotFound) {
+			s.Logger().Error("confirm the lease is not found, the session is expired without activing closing", zap.Error(err))
+			log.Cleanup()
+			os.Exit(ExitCodeEtcd)
 		}
-		return err1
+		if ctx.Err() != nil && errors.Is(context.Cause(ctx), errSessionExpiredAtClientSide) {
+			s.Logger().Error("session expired at client side, the session is expired without activing closing", zap.Error(err))
+			log.Cleanup()
+			os.Exit(ExitCodeEtcd)
+		}
+		return errors.Wrap(err, "failed to check TTL")
 	}
-	return fn()
+	if ttlResp.TTL <= 0 {
+		s.Logger().Error("confirm the lease is expired, the session is expired without activing closing", zap.Error(err))
+		log.Cleanup()
+		os.Exit(ExitCodeEtcd)
+	}
+	s.Logger().Info("check TTL success, try to keep alive...", zap.Int64("ttl", ttlResp.TTL))
+	return nil
+}
+
+func (s *Session) startKeepAliveLoop() {
+	s.wg.Add(1)
+	go s.processKeepAliveResponse()
 }
 
 // GetSessions will get all sessions registered in etcd.
 // Revision is returned for WatchServices to prevent key events from being missed.
-func (s *Session) GetSessions(prefix string) (map[string]*Session, int64, error) {
+func (s *Session) GetSessions(ctx context.Context, prefix string) (map[string]*Session, int64, error) {
 	res := make(map[string]*Session)
 	key := path.Join(s.metaRoot, DefaultServiceRoot, prefix)
-	resp, err := s.etcdCli.Get(s.ctx, key, clientv3.WithPrefix(),
+	resp, err := s.etcdCli.Get(ctx, key, clientv3.WithPrefix(),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
 	if err != nil {
 		return nil, 0, err
@@ -724,7 +728,7 @@ func (s *Session) GoingStop() error {
 	completeKey := s.getCompleteKey()
 	resp, err := s.etcdCli.Get(s.ctx, completeKey, clientv3.WithCountOnly())
 	if err != nil {
-		log.Error("fail to get the session", zap.String("key", completeKey), zap.Error(err))
+		s.Logger().Error("fail to get the session", zap.String("key", completeKey), zap.Error(err))
 		return err
 	}
 	if resp.Count == 0 {
@@ -733,12 +737,12 @@ func (s *Session) GoingStop() error {
 	s.Stopping = true
 	sessionJSON, err := json.Marshal(s)
 	if err != nil {
-		log.Error("fail to marshal the session", zap.String("key", completeKey))
+		s.Logger().Error("fail to marshal the session", zap.String("key", completeKey))
 		return err
 	}
 	_, err = s.etcdCli.Put(s.ctx, completeKey, string(sessionJSON), clientv3.WithLease(*s.LeaseID))
 	if err != nil {
-		log.Error("fail to update the session to stopping state", zap.String("key", completeKey))
+		s.Logger().Error("fail to update the session to stopping state", zap.String("key", completeKey))
 		return err
 	}
 	return nil
@@ -754,22 +758,34 @@ type SessionEvent struct {
 }
 
 type sessionWatcher struct {
-	s        *Session
-	rch      clientv3.WatchChan
-	eventCh  chan *SessionEvent
-	prefix   string
-	rewatch  Rewatch
-	validate func(*Session) bool
+	s         *Session
+	cancel    context.CancelFunc
+	rch       clientv3.WatchChan
+	eventCh   chan *SessionEvent
+	prefix    string
+	rewatch   Rewatch
+	validate  func(*Session) bool
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
-func (w *sessionWatcher) start() {
+func (w *sessionWatcher) closeEventCh() {
+	w.closeOnce.Do(func() {
+		close(w.eventCh)
+	})
+}
+
+func (w *sessionWatcher) start(ctx context.Context) {
+	w.wg.Add(1)
 	go func() {
+		defer w.wg.Done()
 		for {
 			select {
-			case <-w.s.ctx.Done():
+			case <-ctx.Done():
 				return
 			case wresp, ok := <-w.rch:
 				if !ok {
+					w.closeEventCh()
 					log.Warn("session watch channel closed")
 					return
 				}
@@ -779,6 +795,25 @@ func (w *sessionWatcher) start() {
 	}()
 }
 
+func (w *sessionWatcher) Stop() {
+	w.cancel()
+	w.wg.Wait()
+}
+
+// EmptySessionWatcher returns a place holder for IndexNodeBinding mode datacoord
+func EmptySessionWatcher() SessionWatcher {
+	return emptySessionWatcher{}
+}
+
+// emptySessionWatcher is a place holder for IndexNodeBinding mode datacoord
+type emptySessionWatcher struct{}
+
+func (emptySessionWatcher) EventChannel() <-chan *SessionEvent {
+	return nil
+}
+
+func (emptySessionWatcher) Stop() {}
+
 // WatchServices watches the service's up and down in etcd, and sends event to
 // eventChannel.
 // prefix is a parameter to know which service to watch and can be obtained in
@@ -787,17 +822,19 @@ func (w *sessionWatcher) start() {
 // in GetSessions.
 // If a server up, an event will be add to channel with eventType SessionAddType.
 // If a server down, an event will be add to channel with eventType SessionDelType.
-func (s *Session) WatchServices(prefix string, revision int64, rewatch Rewatch) (eventChannel <-chan *SessionEvent) {
+func (s *Session) WatchServices(prefix string, revision int64, rewatch Rewatch) (watcher SessionWatcher) {
+	ctx, cancel := context.WithCancel(s.ctx)
 	w := &sessionWatcher{
 		s:        s,
+		cancel:   cancel,
 		eventCh:  make(chan *SessionEvent, 100),
 		rch:      s.etcdCli.Watch(s.ctx, path.Join(s.metaRoot, DefaultServiceRoot, prefix), clientv3.WithPrefix(), clientv3.WithPrevKV(), clientv3.WithRev(revision)),
 		prefix:   prefix,
 		rewatch:  rewatch,
 		validate: func(s *Session) bool { return true },
 	}
-	w.start()
-	return w.eventCh
+	w.start(ctx)
+	return w
 }
 
 // WatchServicesWithVersionRange watches the service's up and down in etcd, and sends event to event Channel.
@@ -806,17 +843,19 @@ func (s *Session) WatchServices(prefix string, revision int64, rewatch Rewatch) 
 // revision is a etcd reversion to prevent missing key events and can be obtained in GetSessions.
 // If a server up, an event will be add to channel with eventType SessionAddType.
 // If a server down, an event will be add to channel with eventType SessionDelType.
-func (s *Session) WatchServicesWithVersionRange(prefix string, r semver.Range, revision int64, rewatch Rewatch) (eventChannel <-chan *SessionEvent) {
+func (s *Session) WatchServicesWithVersionRange(prefix string, r semver.Range, revision int64, rewatch Rewatch) (watcher SessionWatcher) {
+	ctx, cancel := context.WithCancel(s.ctx)
 	w := &sessionWatcher{
 		s:        s,
+		cancel:   cancel,
 		eventCh:  make(chan *SessionEvent, 100),
 		rch:      s.etcdCli.Watch(s.ctx, path.Join(s.metaRoot, DefaultServiceRoot, prefix), clientv3.WithPrefix(), clientv3.WithPrevKV(), clientv3.WithRev(revision)),
 		prefix:   prefix,
 		rewatch:  rewatch,
 		validate: func(s *Session) bool { return r(s.Version) },
 	}
-	w.start()
-	return w.eventCh
+	w.start(ctx)
+	return w
 }
 
 func (w *sessionWatcher) handleWatchResponse(wresp clientv3.WatchResponse) {
@@ -875,14 +914,14 @@ func (w *sessionWatcher) handleWatchErr(err error) error {
 	if err != v3rpc.ErrCompacted {
 		// close event channel
 		log.Warn("Watch service found error", zap.Error(err))
-		close(w.eventCh)
+		w.closeEventCh()
 		return err
 	}
 
-	sessions, revision, err := w.s.GetSessions(w.prefix)
+	sessions, revision, err := w.s.GetSessions(w.s.ctx, w.prefix)
 	if err != nil {
 		log.Warn("GetSession before rewatch failed", zap.String("prefix", w.prefix), zap.Error(err))
-		close(w.eventCh)
+		w.closeEventCh()
 		return err
 	}
 	// rewatch is nil, no logic to handle
@@ -893,7 +932,7 @@ func (w *sessionWatcher) handleWatchErr(err error) error {
 	}
 	if err != nil {
 		log.Warn("WatchServices rewatch failed", zap.String("prefix", w.prefix), zap.Error(err))
-		close(w.eventCh)
+		w.closeEventCh()
 		return err
 	}
 
@@ -901,127 +940,27 @@ func (w *sessionWatcher) handleWatchErr(err error) error {
 	return nil
 }
 
-// LivenessCheck performs liveness check with provided context and channel
-// ctx controls the liveness check loop
-// ch is the liveness signal channel, ch is closed only when the session is expired
-// callback must be called before liveness check exit, to close the session's owner component
-func (s *Session) LivenessCheck(ctx context.Context, callback func()) {
-	err := s.initWatchSessionCh(ctx)
-	if err != nil {
-		log.Error("failed to get session for liveness check", zap.Error(err))
-		s.cancelKeepAlive()
-		if callback != nil {
-			go callback()
-		}
-		return
-	}
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		if callback != nil {
-			// before exit liveness check, callback to exit the session owner
-			defer func() {
-				// the callback method will not be invoked if session is stopped.
-				if ctx.Err() == nil && !s.isStopped.Load() {
-					go callback()
-				}
-			}()
-		}
-		defer s.SetDisconnected(true)
-		for {
-			select {
-			case _, ok := <-s.liveCh:
-				// ok, still alive
-				if ok {
-					continue
-				}
-				// not ok, connection lost
-				log.Warn("connection lost detected, shuting down")
-				return
-			case <-ctx.Done():
-				log.Warn("liveness exits due to context done")
-				// cancel the etcd keepAlive context
-				s.cancelKeepAlive()
-				return
-			case resp, ok := <-s.watchSessionKeyCh:
-				if !ok {
-					log.Warn("watch session key channel closed")
-					s.cancelKeepAlive()
-					return
-				}
-				if resp.Err() != nil {
-					// if not ErrCompacted, just close the channel
-					if resp.Err() != v3rpc.ErrCompacted {
-						// close event channel
-						log.Warn("Watch service found error", zap.Error(resp.Err()))
-						s.cancelKeepAlive()
-						return
-					}
-					log.Warn("Watch service found compacted error", zap.Error(resp.Err()))
-					err := s.initWatchSessionCh(ctx)
-					if err != nil {
-						log.Warn("failed to get session during reconnecting", zap.Error(err))
-						s.cancelKeepAlive()
-					}
-					continue
-				}
-				for _, event := range resp.Events {
-					switch event.Type {
-					case mvccpb.PUT:
-						log.Info("register session success", zap.String("role", s.ServerName), zap.String("key", string(event.Kv.Key)))
-					case mvccpb.DELETE:
-						log.Info("session key is deleted, exit...", zap.String("role", s.ServerName), zap.String("key", string(event.Kv.Key)))
-						s.cancelKeepAlive()
-					}
-				}
-			}
-		}
-	}()
+func (w *sessionWatcher) EventChannel() <-chan *SessionEvent {
+	return w.eventCh
 }
 
-func (s *Session) cancelKeepAlive() {
-	s.keepAliveLock.Lock()
-	defer s.keepAliveLock.Unlock()
-	if s.keepAliveCancel != nil {
-		s.keepAliveCancel()
-	}
+// SetMixCoordMode marks this session as shared across multiple coordinators in MixCoord mode.
+// When in MixCoord mode, Stop() is a no-op — MixCoord is responsible for calling Stop() after
+// clearing the flag.
+func (s *Session) SetMixCoordMode(enable bool) {
+	s.isMixCoordMode.Store(enable)
 }
 
 func (s *Session) Stop() {
-	s.isStopped.Store(true)
-	s.Revoke(time.Second)
-	s.cancelKeepAlive()
+	if s.isMixCoordMode.Load() {
+		log.Info("session stop skipped, session is in MixCoord mode", zap.String("serverName", s.ServerName))
+		return
+	}
+	log.Info("session stopping", zap.String("serverName", s.ServerName))
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.wg.Wait()
-}
-
-// Revoke revokes the internal LeaseID for the session key
-func (s *Session) Revoke(timeout time.Duration) {
-	if s == nil {
-		return
-	}
-	log.Info("start to revoke session", zap.String("sessionKey", s.activeKey))
-	if s.etcdCli == nil || s.LeaseID == nil {
-		log.Warn("skip remove session",
-			zap.String("sessionKey", s.activeKey),
-			zap.Bool("etcdCliIsNil", s.etcdCli == nil),
-			zap.Bool("LeaseIDIsNil", s.LeaseID == nil),
-		)
-		return
-	}
-	if s.Disconnected() {
-		log.Warn("skip remove session, connection is disconnected", zap.String("sessionKey", s.activeKey))
-		return
-	}
-	// can NOT use s.ctx, it may be Done here
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	// ignores resp & error, just do best effort to revoke
-	_, err := s.etcdCli.Revoke(ctx, *s.LeaseID)
-	if err != nil {
-		log.Warn("failed to revoke session", zap.String("sessionKey", s.activeKey), zap.Error(err))
-	}
-	log.Info("revoke session successfully", zap.String("sessionKey", s.activeKey))
 }
 
 // UpdateRegistered update the state of registered.
@@ -1058,15 +997,6 @@ func (s *Session) updateStandby(b bool) {
 	s.isStandby.Store(b)
 }
 
-func (s *Session) safeCloseLiveCh() {
-	s.liveChOnce.Do(func() {
-		close(s.liveCh)
-		if s.watchCancel.Load() != nil {
-			(*s.watchCancel.Load())()
-		}
-	})
-}
-
 // ProcessActiveStandBy is used by coordinators to do active-standby mechanism.
 // coordinator enabled active-standby will first call Register and then call ProcessActiveStandBy.
 // steps:
@@ -1094,7 +1024,7 @@ func (s *Session) ProcessActiveStandBy(activateFunc func() error) error {
 
 	registerActiveFn := func() (bool, int64, error) {
 		for _, role := range oldRoles {
-			sessions, _, err := s.GetSessions(role)
+			sessions, _, err := s.GetSessions(s.ctx, role)
 			if err != nil {
 				log.Debug("failed to get old sessions", zap.String("role", role), zap.Error(err))
 				continue
@@ -1111,23 +1041,33 @@ func (s *Session) ProcessActiveStandBy(activateFunc func() error) error {
 			log.Error("json marshal error", zap.Error(err))
 			return false, -1, err
 		}
-		txnResp, err := s.etcdCli.Txn(s.ctx).If(
-			clientv3.Compare(
-				clientv3.Version(s.activeKey),
-				"=",
-				0)).
-			Then(clientv3.OpPut(s.activeKey, string(sessionJSON), clientv3.WithLease(*s.LeaseID))).Commit()
+
+		compareOps := []clientv3.Cmp{
+			clientv3.Compare(clientv3.Version(s.activeKey), "=", 0),
+		}
+		ops := []clientv3.Op{
+			clientv3.OpPut(s.activeKey, string(sessionJSON), clientv3.WithLease(*s.LeaseID)),
+		}
+
+		if s.isCoordinator() {
+			if ops, compareOps, err = s.getOpsForCoordinator(ops, compareOps, sessionJSON); err != nil {
+				return false, -1, err
+			}
+		}
+
+		txnResp, err := s.etcdCli.Txn(s.ctx).If(compareOps...).Then(ops...).Commit()
 		if err != nil {
 			log.Error("register active key to etcd failed", zap.Error(err))
 			return false, -1, err
 		}
 		doRegistered := txnResp.Succeeded
+		revision := txnResp.Header.GetRevision()
 		if doRegistered {
-			log.Info(fmt.Sprintf("register ACTIVE %s", s.ServerName))
+			s.registeredRevision.Store(revision)
+			log.Info(fmt.Sprintf("register ACTIVE %s", s.ServerName), zap.Int64("revision", revision))
 		} else {
 			log.Info(fmt.Sprintf("ACTIVE %s has already been registered", s.ServerName))
 		}
-		revision := txnResp.Header.GetRevision()
 		return doRegistered, revision, nil
 	}
 	s.updateStandby(true)
@@ -1181,73 +1121,6 @@ func (s *Session) ProcessActiveStandBy(activateFunc func() error) error {
 		log.Info(fmt.Sprintf("stop watching ACTIVE key %v", s.activeKey))
 	}
 
-	s.updateStandby(false)
-	log.Info(fmt.Sprintf("serverName: %v quit STANDBY mode, this node will become ACTIVE, ID: %d", s.ServerName, s.ServerID))
-	if activateFunc != nil {
-		return activateFunc()
-	}
-	return nil
-}
-
-func (s *Session) ForceActiveStandby(activateFunc func() error) error {
-	s.activeKey = path.Join(s.metaRoot, DefaultServiceRoot, s.ServerName)
-
-	// force register to the active_key.
-	forceRegisterActiveFn := func() error {
-		log.Info(fmt.Sprintf("try to register as ACTIVE %v service...", s.ServerName))
-		sessionJSON, err := json.Marshal(s)
-		if err != nil {
-			log.Error("json marshal error", zap.Error(err))
-			return err
-		}
-
-		// try to release old session first
-		sessions, _, err := s.GetSessions(s.ServerName)
-		if err != nil {
-			return err
-		}
-
-		if len(sessions) != 0 {
-			activeSess := sessions[s.ServerName]
-			if activeSess == nil || activeSess.LeaseID == nil {
-				// force delete all old sessions
-				s.etcdCli.Delete(s.ctx, s.activeKey)
-				for _, sess := range sessions {
-					if sess.ServerID != s.ServerID {
-						sess.getCompleteKey()
-						key := path.Join(s.metaRoot, DefaultServiceRoot, fmt.Sprintf("%s-%d", sess.ServerName, sess.ServerID))
-						s.etcdCli.Delete(s.ctx, key)
-					}
-				}
-			} else {
-				// force release old active session
-				_, _ = s.etcdCli.Revoke(s.ctx, *activeSess.LeaseID)
-			}
-		}
-
-		// then try to register as active
-		resp, err := s.etcdCli.Txn(s.ctx).If(
-			clientv3.Compare(
-				clientv3.Version(s.activeKey),
-				"=",
-				0)).
-			Then(clientv3.OpPut(s.activeKey, string(sessionJSON), clientv3.WithLease(*s.LeaseID))).Commit()
-
-		if err != nil || !resp.Succeeded {
-			msg := fmt.Sprintf("failed to force register ACTIVE %s", s.ServerName)
-			log.Error(msg, zap.Error(err), zap.Any("resp", resp))
-			return errors.New(msg)
-		}
-
-		log.Info(fmt.Sprintf("force register ACTIVE %s", s.ServerName))
-		return nil
-	}
-
-	err := retry.Do(s.ctx, forceRegisterActiveFn, retry.Attempts(uint(s.sessionRetryTimes)))
-	if err != nil {
-		log.Warn(fmt.Sprintf("failed to force register ACTIVE %s", s.ServerName))
-		return err
-	}
 	s.updateStandby(false)
 	log.Info(fmt.Sprintf("serverName: %v quit STANDBY mode, this node will become ACTIVE, ID: %d", s.ServerName, s.ServerID))
 	if activateFunc != nil {

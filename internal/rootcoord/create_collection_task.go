@@ -20,10 +20,9 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/twpayne/go-geom/encoding/wkb"
-	"github.com/twpayne/go-geom/encoding/wkt"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -40,14 +39,17 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type createCollectionTask struct {
 	*Core
-	Req    *milvuspb.CreateCollectionRequest
-	header *message.CreateCollectionMessageHeader
-	body   *message.CreateCollectionRequest
+	Req             *milvuspb.CreateCollectionRequest
+	header          *message.CreateCollectionMessageHeader
+	body            *message.CreateCollectionRequest
+	preserveFieldID bool
 }
 
 func (t *createCollectionTask) validate(ctx context.Context) error {
@@ -139,81 +141,11 @@ func (t *createCollectionTask) checkMaxCollectionsPerDB(ctx context.Context, db2
 }
 
 func checkGeometryDefaultValue(value string) error {
-	geomT, err := wkt.Unmarshal(value)
-	if err != nil {
-		log.Warn("invalid default value for geometry field", zap.Error(err))
-		return merr.WrapErrParameterInvalidMsg("invalid default value for geometry field")
-	}
-	_, err = wkb.Marshal(geomT, wkb.NDR)
-	if err != nil {
+	if _, err := common.ConvertWKTToWKB(value); err != nil {
 		log.Warn("invalid default value for geometry field", zap.Error(err))
 		return merr.WrapErrParameterInvalidMsg("invalid default value for geometry field")
 	}
 
-	return nil
-}
-
-// checkAndRewriteTimestampTzDefaultValue processes the collection schema to validate
-// and rewrite default values for TIMESTAMPTZ fields.
-//
-// Background:
-//  1. TIMESTAMPTZ default values are initially stored as user-provided ISO 8601 strings
-//     (in ValueField.GetStringData()).
-//  2. Milvus stores TIMESTAMPTZ data internally as UTC microseconds (int64).
-//
-// Logic:
-// The function iterates through all fields of type DataType_Timestamptz. For each field
-// with a default value:
-//  1. It retrieves the collection's default timezone if no offset is present in the string.
-//  2. It calls ValidateAndReturnUnixMicroTz to validate the string (including the UTC
-//     offset range check) and convert it to the absolute UTC microsecond (int64) value.
-//  3. It rewrites the ValueField, setting the LongData field with the calculated int64
-//     value, thereby replacing the initial string representation.
-func checkAndRewriteTimestampTzDefaultValue(schema *schemapb.CollectionSchema) error {
-	// 1. Get the collection-level default timezone.
-	// Assuming common.TimezoneKey and common.DefaultTimezone are defined constants.
-	timezone, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, schema.GetProperties())
-	if !exist {
-		timezone = common.DefaultTimezone
-	}
-
-	for _, fieldSchema := range schema.GetFields() {
-		// Only process TIMESTAMPTZ fields.
-		if fieldSchema.GetDataType() != schemapb.DataType_Timestamptz {
-			continue
-		}
-
-		defaultValue := fieldSchema.GetDefaultValue()
-		if defaultValue == nil {
-			continue
-		}
-
-		// 2. Read the default value as a string (the input format).
-		// We expect the default value to be set in string_data initially.
-		stringTz := defaultValue.GetStringData()
-		if stringTz == "" {
-			// Skip or handle empty string default values if necessary.
-			continue
-		}
-
-		// 3. Validate the string and convert it to UTC microsecond (int64).
-		// This also performs the critical UTC offset range validation.
-		utcMicro, err := funcutil.ValidateAndReturnUnixMicroTz(stringTz, timezone)
-		if err != nil {
-			// If validation fails (e.g., invalid format or illegal offset), return error immediately.
-			return err
-		}
-
-		// 4. Rewrite the default value to store the UTC microsecond (int64).
-		// By setting ValueField_LongData, the oneof field in the protobuf structure
-		// automatically switches from string_data to long_data.
-		defaultValue.Data = &schemapb.ValueField_LongData{
-			LongData: utcMicro,
-		}
-
-		// The original string_data field is now cleared due to the oneof nature,
-		// and the default value is correctly represented as an int64 microsecond value.
-	}
 	return nil
 }
 
@@ -239,11 +171,15 @@ func (t *createCollectionTask) validateSchema(ctx context.Context, schema *schem
 	}
 
 	// Validate default
-	if err := checkAndRewriteTimestampTzDefaultValue(schema); err != nil {
+	if err := timestamptz.CheckAndRewriteTimestampTzDefaultValue(schema); err != nil {
 		return err
 	}
 
 	if err := checkStructArrayFieldSchema(schema.GetStructArrayFields()); err != nil {
+		return err
+	}
+
+	if err := typeutil.ValidateExternalCollectionSchema(schema); err != nil {
 		return err
 	}
 
@@ -271,7 +207,21 @@ func (t *createCollectionTask) validateSchema(ctx context.Context, schema *schem
 	}
 
 	// validate analyzer params at any streaming node
+	// and set file resource ids to schema
 	if len(analyzerInfos) > 0 {
+		err := retry.Do(ctx, func() error {
+			if t.fileResourceObserver == nil {
+				return nil
+			}
+			if err := t.fileResourceObserver.CheckAllQnReady(); err != nil {
+				return err
+			}
+			return nil
+		}, retry.Attempts(10), retry.Sleep(3*time.Second))
+		if err != nil {
+			return err
+		}
+
 		resp, err := t.mixCoord.ValidateAnalyzer(t.ctx, &querypb.ValidateAnalyzerRequest{
 			AnalyzerInfos: analyzerInfos,
 		})
@@ -279,9 +229,10 @@ func (t *createCollectionTask) validateSchema(ctx context.Context, schema *schem
 			return err
 		}
 
-		if err := merr.Error(resp); err != nil {
+		if err := merr.Error(resp.GetStatus()); err != nil {
 			return err
 		}
+		schema.FileResourceIds = resp.GetResourceIds()
 	}
 
 	return validateFieldDataType(schema.GetFields())
@@ -340,6 +291,12 @@ func (t *createCollectionTask) appendDynamicField(ctx context.Context, schema *s
 			Description: "dynamic schema",
 			DataType:    schemapb.DataType_JSON,
 			IsDynamic:   true,
+			Nullable:    true,
+			DefaultValue: &schemapb.ValueField{
+				Data: &schemapb.ValueField_BytesData{
+					BytesData: []byte("{}"),
+				},
+			},
 		})
 		log.Ctx(ctx).Info("append dynamic field", zap.String("collection", schema.Name))
 	}
@@ -364,19 +321,15 @@ func (t *createCollectionTask) appendConsistecyLevel() {
 }
 
 func (t *createCollectionTask) handleNamespaceField(ctx context.Context, schema *schemapb.CollectionSchema) error {
-	if !Params.CommonCfg.EnableNamespace.GetAsBool() {
-		return nil
-	}
-
 	hasIsolation := hasIsolationProperty(t.Req.Properties...)
 	_, err := typeutil.GetPartitionKeyFieldSchema(schema)
 	hasPartitionKey := err == nil
-	enabled, has, err := common.ParseNamespaceProp(t.Req.Properties...)
-	if err != nil {
-		return err
-	}
-	if !has || !enabled {
+	if !schema.GetEnableNamespace() {
 		return nil
+	}
+
+	if typeutil.IsExternalCollection(schema) {
+		return merr.WrapErrParameterInvalidMsg("external collection does not support namespace field")
 	}
 
 	if hasIsolation {
@@ -439,22 +392,66 @@ func (t *createCollectionTask) appendSysFields(schema *schemapb.CollectionSchema
 }
 
 func (t *createCollectionTask) prepareSchema(ctx context.Context) error {
+	// if schema comes from restore snapshot
+	preservedDynamicFieldID := int64(-1)
+	preservedNamespaceFieldID := int64(-1)
+	if t.preserveFieldID {
+		log.Ctx(ctx).Info("preserve field IDs from schema during create collection", zap.String("collection", t.Req.CollectionName))
+		fields := make([]*schemapb.FieldSchema, 0)
+		// filter out system fields
+		for _, field := range t.body.CollectionSchema.Fields {
+			if field.Name != RowIDFieldName && field.GetFieldID() == 0 {
+				log.Info("field id 0 is not allowed when preserve field ids", zap.String("field", field.Name))
+				return merr.WrapErrParameterInvalidMsg(fmt.Sprintf("field id 0 is not allowed when preserve field ids, field: %s", field.Name))
+			}
+
+			if field.GetName() == MetaFieldName {
+				preservedDynamicFieldID = field.GetFieldID()
+				continue
+			}
+			if field.GetName() == NamespaceFieldName {
+				preservedNamespaceFieldID = field.GetFieldID()
+				continue
+			}
+			if field.GetName() == TimeStampFieldName || field.GetName() == RowIDFieldName {
+				continue
+			}
+			fields = append(fields, field)
+		}
+		t.body.CollectionSchema.Fields = fields
+	}
+
 	if err := t.validateSchema(ctx, t.body.CollectionSchema); err != nil {
 		return err
 	}
+
 	t.appendConsistecyLevel()
 	t.appendDynamicField(ctx, t.body.CollectionSchema)
 	if err := t.handleNamespaceField(ctx, t.body.CollectionSchema); err != nil {
 		return err
 	}
 
-	if err := t.assignFieldAndFunctionID(t.body.CollectionSchema); err != nil {
-		return err
+	if t.preserveFieldID {
+		// cause dynamic field is system field without internal id allocation
+		// we need to restore its field id here
+		for _, field := range t.body.CollectionSchema.Fields {
+			if field.GetName() == MetaFieldName {
+				field.FieldID = preservedDynamicFieldID
+			}
+
+			if field.GetName() == NamespaceFieldName {
+				field.FieldID = preservedNamespaceFieldID
+			}
+		}
+	} else {
+		if err := t.assignFieldAndFunctionID(t.body.CollectionSchema); err != nil {
+			return err
+		}
 	}
 
 	// Validate timezone
 	tz, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, t.Req.GetProperties())
-	if exist && !funcutil.IsTimezoneValid(tz) {
+	if exist && !timestamptz.IsTimezoneValid(tz) {
 		return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", tz)
 	}
 
@@ -557,9 +554,7 @@ func (t *createCollectionTask) Prepare(ctx context.Context) error {
 		t.Req.Properties = append(properties, timezoneKV)
 	}
 
-	if hookutil.GetEzPropByDBProperties(db.Properties) != nil {
-		t.Req.Properties = append(t.Req.Properties, hookutil.GetEzPropByDBProperties(db.Properties))
-	}
+	t.Req.Properties = hookutil.TidyCollPropsByDBProps(t.Req.Properties, db.Properties)
 
 	t.header.DbId = db.ID
 	t.body.DbID = t.header.DbId

@@ -13,11 +13,13 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -139,6 +141,16 @@ func cloneStructArrayFields(fields []*schemapb.StructArrayFieldSchema) []*schema
 func (node *CachedProxyServiceProvider) DescribeCollection(ctx context.Context,
 	request *milvuspb.DescribeCollectionRequest,
 ) (resp *milvuspb.DescribeCollectionResponse, err error) {
+	log := log.Ctx(ctx).With(
+		zap.String("role", typeutil.ProxyRole),
+		zap.String("db", request.GetDbName()),
+		zap.String("collection", request.GetCollectionName()),
+		zap.Int64("collectionID", request.GetCollectionID()),
+		zap.Uint64("timestamp", request.GetTimeStamp()),
+	)
+
+	log.Debug("DescribeCollection received")
+
 	resp = &milvuspb.DescribeCollectionResponse{
 		Status:         merr.Success(),
 		CollectionName: request.CollectionName,
@@ -192,18 +204,26 @@ func (node *CachedProxyServiceProvider) DescribeCollection(ctx context.Context,
 		Description: c.schema.CollectionSchema.Description,
 		AutoID:      c.schema.CollectionSchema.AutoID,
 		Fields: lo.Filter(c.schema.CollectionSchema.Fields, func(field *schemapb.FieldSchema, _ int) bool {
-			return !field.IsDynamic
+			return !field.IsDynamic && field.Name != common.NamespaceFieldName
 		}),
 		StructArrayFields:  cloneStructArrayFields(c.schema.CollectionSchema.StructArrayFields),
 		EnableDynamicField: c.schema.CollectionSchema.EnableDynamicField,
 		Properties:         c.schema.CollectionSchema.Properties,
 		Functions:          c.schema.CollectionSchema.Functions,
 		DbName:             c.schema.CollectionSchema.DbName,
+		ExternalSource:     c.schema.CollectionSchema.ExternalSource,
+		ExternalSpec:       c.schema.CollectionSchema.ExternalSpec,
 	}
 
 	// Restore struct field names from internal format (structName[fieldName]) to original format
 	if err := restoreStructFieldNames(resp.Schema); err != nil {
 		log.Error("failed to restore struct field names", zap.Error(err))
+		return nil, err
+	}
+
+	err = timestamptz.RewriteTimestampTzDefaultValueToString(resp.Schema)
+	if err != nil {
+		log.Info("failed to rewrite timestamp value", zap.Error(err))
 		return nil, err
 	}
 
@@ -219,6 +239,11 @@ func (node *CachedProxyServiceProvider) DescribeCollection(ctx context.Context,
 	resp.ShardsNum = c.shardsNum
 	resp.Aliases = c.aliases
 	resp.Properties = c.properties
+
+	log.Debug("DescribeCollection done",
+		zap.Int64("collectionID", resp.GetCollectionID()),
+		zap.Any("schema", resp.GetSchema()),
+	)
 
 	return resp, nil
 }
@@ -273,8 +298,6 @@ func (node *RemoteProxyServiceProvider) DescribeCollection(ctx context.Context,
 	log.Debug("DescribeCollection done",
 		zap.Uint64("BeginTS", dct.BeginTs()),
 		zap.Uint64("EndTS", dct.EndTs()),
-		zap.String("db", request.DbName),
-		zap.String("collection", request.CollectionName),
 	)
 
 	return dct.result, nil

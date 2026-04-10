@@ -606,28 +606,64 @@ func TestValidateMultipleVectorFields(t *testing.T) {
 }
 
 func TestFillFieldIDBySchema(t *testing.T) {
-	schema := &schemapb.CollectionSchema{}
-	columns := []*schemapb.FieldData{
-		{
-			FieldName: "TestFillFieldIDBySchema",
-		},
-	}
-
-	// length mismatch
-	assert.Error(t, fillFieldPropertiesBySchema(columns, schema))
-	schema = &schemapb.CollectionSchema{
-		Fields: []*schemapb.FieldSchema{
+	t.Run("column count mismatch", func(t *testing.T) {
+		collSchema := &schemapb.CollectionSchema{}
+		schema := newSchemaInfo(collSchema)
+		columns := []*schemapb.FieldData{
 			{
-				Name:     "TestFillFieldIDBySchema",
-				DataType: schemapb.DataType_Int64,
-				FieldID:  1,
+				FieldName: "TestFillFieldIDBySchema",
 			},
-		},
-	}
-	assert.NoError(t, fillFieldPropertiesBySchema(columns, schema))
-	assert.Equal(t, "TestFillFieldIDBySchema", columns[0].FieldName)
-	assert.Equal(t, schemapb.DataType_Int64, columns[0].Type)
-	assert.Equal(t, int64(1), columns[0].FieldId)
+		}
+		// Validation should fail due to column count mismatch
+		assert.Error(t, validateFieldDataColumns(columns, schema))
+	})
+
+	t.Run("successful validation and fill", func(t *testing.T) {
+		collSchema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:     "TestFillFieldIDBySchema",
+					DataType: schemapb.DataType_Int64,
+					FieldID:  1,
+				},
+			},
+		}
+		schema := newSchemaInfo(collSchema)
+		columns := []*schemapb.FieldData{
+			{
+				FieldName: "TestFillFieldIDBySchema",
+			},
+		}
+		// Validation should succeed
+		assert.NoError(t, validateFieldDataColumns(columns, schema))
+		// Fill properties should succeed
+		assert.NoError(t, fillFieldPropertiesOnly(columns, schema))
+		assert.Equal(t, "TestFillFieldIDBySchema", columns[0].FieldName)
+		assert.Equal(t, schemapb.DataType_Int64, columns[0].Type)
+		assert.Equal(t, int64(1), columns[0].FieldId)
+	})
+
+	t.Run("field not in schema", func(t *testing.T) {
+		collSchema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:     "FieldA",
+					DataType: schemapb.DataType_Int64,
+					FieldID:  1,
+				},
+			},
+		}
+		schema := newSchemaInfo(collSchema)
+		columns := []*schemapb.FieldData{
+			{
+				FieldName: "FieldB",
+			},
+		}
+		// Validation should fail because FieldB is not in schema
+		err := validateFieldDataColumns(columns, schema)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not exist in collection schema")
+	})
 }
 
 func TestValidateUsername(t *testing.T) {
@@ -766,7 +802,7 @@ func TestGetCurUserFromContext(t *testing.T) {
 
 	root := "root"
 	password := "123456"
-	username, err := GetCurUserFromContext(GetContext(context.Background(), fmt.Sprintf("%s%s%s", root, util.CredentialSeperator, password)))
+	username, err := GetCurUserFromContext(GetContext(context.Background(), fmt.Sprintf("%s%s%s", root, util.CredentialSeparator, password)))
 	assert.NoError(t, err)
 	assert.Equal(t, "root", username)
 }
@@ -2082,19 +2118,41 @@ func Test_NQLimit(t *testing.T) {
 
 func Test_TopKLimit(t *testing.T) {
 	paramtable.Init()
-	assert.Nil(t, validateLimit(16384))
-	assert.Nil(t, validateLimit(1))
-	assert.Error(t, validateLimit(16385))
-	assert.Error(t, validateLimit(0))
+	assert.Nil(t, validateLimit(16384, false))
+	assert.Nil(t, validateLimit(1, false))
+	assert.Error(t, validateLimit(16385, false))
+	assert.Error(t, validateLimit(0, false))
+}
+
+func Test_LargeTopKLimit(t *testing.T) {
+	paramtable.Init()
+	Params.Save(Params.QuotaConfig.TopKLimit.Key, "100")
+	Params.Save(Params.QuotaConfig.LargeTopKLimit.Key, "200")
+	defer Params.Reset(Params.QuotaConfig.TopKLimit.Key)
+	defer Params.Reset(Params.QuotaConfig.LargeTopKLimit.Key)
+
+	assert.Nil(t, validateLimit(100, false))
+	assert.Error(t, validateLimit(101, false))
+
+	assert.Nil(t, validateLimit(200, true))
+	assert.Nil(t, validateLimit(150, true))
+	assert.Error(t, validateLimit(201, true))
+	assert.Error(t, validateLimit(0, true))
 }
 
 func Test_MaxQueryResultWindow(t *testing.T) {
 	paramtable.Init()
-	assert.Nil(t, validateMaxQueryResultWindow(0, 16384))
-	assert.Nil(t, validateMaxQueryResultWindow(0, 1))
-	assert.Error(t, validateMaxQueryResultWindow(0, 16385))
-	assert.Error(t, validateMaxQueryResultWindow(0, 0))
-	assert.Error(t, validateMaxQueryResultWindow(1, 0))
+	assert.Nil(t, validateMaxQueryResultWindow(0, 16384, false))
+	assert.Nil(t, validateMaxQueryResultWindow(0, 1, false))
+	assert.Error(t, validateMaxQueryResultWindow(0, 16385, false))
+	assert.Error(t, validateMaxQueryResultWindow(0, 0, false))
+	assert.Error(t, validateMaxQueryResultWindow(1, 0, false))
+
+	Params.Save(Params.QuotaConfig.LargeMaxQueryResultWindow.Key, "1000000")
+	defer Params.Reset(Params.QuotaConfig.LargeMaxQueryResultWindow.Key)
+	assert.Nil(t, validateMaxQueryResultWindow(0, 16385, true))
+	assert.Nil(t, validateMaxQueryResultWindow(0, 1000000, true))
+	assert.Error(t, validateMaxQueryResultWindow(0, 1000001, true))
 }
 
 func Test_GetPartitionProgressFailed(t *testing.T) {
@@ -2337,6 +2395,63 @@ func TestAppendUserInfoForRPC(t *testing.T) {
 	assert.Equal(t, expectAuth, authorization[0])
 }
 
+func TestNewContextWithMetadata(t *testing.T) {
+	t.Run("with username and dbName", func(t *testing.T) {
+		ctx := context.Background()
+		ctx = NewContextWithMetadata(ctx, "testuser", "testdb")
+
+		md, ok := metadata.FromIncomingContext(ctx)
+		assert.True(t, ok)
+
+		// Check dbName
+		dbNameKey := strings.ToLower(util.HeaderDBName)
+		dbNameVal, ok := md[dbNameKey]
+		assert.True(t, ok)
+		assert.Equal(t, "testdb", dbNameVal[0])
+
+		// Check authorization
+		authKey := strings.ToLower(util.HeaderAuthorize)
+		authVal, ok := md[authKey]
+		assert.True(t, ok)
+		expectedAuth := crypto.Base64Encode("testuser:testuser")
+		assert.Equal(t, expectedAuth, authVal[0])
+	})
+
+	t.Run("with empty username", func(t *testing.T) {
+		ctx := context.Background()
+		ctx = NewContextWithMetadata(ctx, "", "testdb")
+
+		md, ok := metadata.FromIncomingContext(ctx)
+		assert.True(t, ok)
+
+		// Check dbName is set
+		dbNameKey := strings.ToLower(util.HeaderDBName)
+		dbNameVal, ok := md[dbNameKey]
+		assert.True(t, ok)
+		assert.Equal(t, "testdb", dbNameVal[0])
+
+		// Check authorization is not set
+		authKey := strings.ToLower(util.HeaderAuthorize)
+		_, ok = md[authKey]
+		assert.False(t, ok)
+	})
+
+	t.Run("with empty dbName", func(t *testing.T) {
+		ctx := context.Background()
+		ctx = NewContextWithMetadata(ctx, "testuser", "")
+
+		md, ok := metadata.FromIncomingContext(ctx)
+		assert.True(t, ok)
+
+		// Check authorization is set
+		authKey := strings.ToLower(util.HeaderAuthorize)
+		authVal, ok := md[authKey]
+		assert.True(t, ok)
+		expectedAuth := crypto.Base64Encode("testuser:testuser")
+		assert.Equal(t, expectedAuth, authVal[0])
+	})
+}
+
 func TestGetCostValue(t *testing.T) {
 	t.Run("empty status", func(t *testing.T) {
 		{
@@ -2546,7 +2661,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.NoError(t, err)
 	})
 
@@ -2571,7 +2686,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "duplicate function name")
 	})
@@ -2590,7 +2705,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "input field not found")
 	})
@@ -2609,7 +2724,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "output field not found")
 	})
@@ -2629,7 +2744,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.NoError(t, err)
 	})
 
@@ -2648,7 +2763,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "function output field cannot be primary key")
 	})
@@ -2668,7 +2783,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "function output field cannot be partition key or clustering key")
 	})
@@ -2688,7 +2803,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "function output field cannot be partition key or clustering key")
 	})
@@ -2708,7 +2823,7 @@ func TestValidateFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "function output field cannot be nullable")
 	})
@@ -2739,6 +2854,12 @@ func TestValidateModelFunction(t *testing.T) {
 						{Key: "dim", Value: "4"},
 					},
 				},
+				{
+					Name: "output_dense_field2", DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: "dim", Value: "4"},
+					},
+				},
 			},
 			Functions: []*schemapb.FunctionSchema{
 				{
@@ -2748,7 +2869,7 @@ func TestValidateModelFunction(t *testing.T) {
 					OutputFieldNames: []string{"output_field"},
 				},
 				{
-					Name:             "text_embedding_func",
+					Name:             "f1",
 					Type:             schemapb.FunctionType_TextEmbedding,
 					InputFieldNames:  []string{"input_field"},
 					OutputFieldNames: []string{"output_dense_field"},
@@ -2759,10 +2880,28 @@ func TestValidateModelFunction(t *testing.T) {
 						{Key: "dim", Value: "4"},
 					},
 				},
+				{
+					Name:             "f2",
+					Type:             schemapb.FunctionType_TextEmbedding,
+					InputFieldNames:  []string{"input_field"},
+					OutputFieldNames: []string{"output_dense_field2"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "provider", Value: "unknown_provider"},
+						{Key: "model_name", Value: "text-embedding-ada-002"},
+						{Key: "credential", Value: "mock"},
+						{Key: "dim", Value: "4"},
+					},
+				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "f1", false)
 		assert.NoError(t, err)
+
+		err = validateFunction(schema, "f2", false)
+		assert.Error(t, err)
+
+		err = validateFunction(schema, "", false)
+		assert.Error(t, err)
 	})
 
 	t.Run("Invalid function schema - Invalid function info ", func(t *testing.T) {
@@ -2794,7 +2933,7 @@ func TestValidateModelFunction(t *testing.T) {
 				},
 			},
 		}
-		err := validateFunction(schema)
+		err := validateFunction(schema, "", false)
 		assert.Error(t, err)
 	})
 }
@@ -3245,6 +3384,71 @@ func TestComputeRecall(t *testing.T) {
 
 		err := computeRecall(result1, gt)
 		assert.Error(t, err)
+	})
+
+	t.Run("empty result with nil ids", func(t *testing.T) {
+		result := &schemapb.SearchResultData{
+			NumQueries: 2,
+			Topks:      []int64{0, 0},
+		}
+		gt := &schemapb.SearchResultData{
+			NumQueries: 2,
+			Ids: &schemapb.IDs{
+				IdField: &schemapb.IDs_IntId{
+					IntId: &schemapb.LongArray{
+						Data: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+					},
+				},
+			},
+			Scores: []float32{1.0, 0.9, 0.8, 0.7, 0.6, 1.0, 0.9, 0.8, 0.7, 0.6},
+			Topks:  []int64{5, 5},
+		}
+
+		err := computeRecall(result, gt)
+		assert.NoError(t, err)
+		assert.Equal(t, 2, len(result.Recalls))
+		assert.Equal(t, float32(0), result.Recalls[0])
+		assert.Equal(t, float32(0), result.Recalls[1])
+	})
+
+	t.Run("empty gt with nil ids", func(t *testing.T) {
+		result := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Ids: &schemapb.IDs{
+				IdField: &schemapb.IDs_IntId{
+					IntId: &schemapb.LongArray{
+						Data: []int64{1, 2, 3},
+					},
+				},
+			},
+			Scores: []float32{1.0, 0.9, 0.8},
+			Topks:  []int64{3},
+		}
+		gt := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Topks:      []int64{0},
+		}
+
+		err := computeRecall(result, gt)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(result.Recalls))
+		assert.Equal(t, float32(0), result.Recalls[0])
+	})
+
+	t.Run("both empty results", func(t *testing.T) {
+		result := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Topks:      []int64{0},
+		}
+		gt := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Topks:      []int64{0},
+		}
+
+		err := computeRecall(result, gt)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(result.Recalls))
+		assert.Equal(t, float32(0), result.Recalls[0])
 	})
 }
 
@@ -3938,7 +4142,7 @@ func TestValidateFieldsInStruct(t *testing.T) {
 		}
 		err := ValidateFieldsInStruct(field, schema)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "Unsupported element type of array field array_vector_with_scalar, now only float vector is supported")
+		assert.Contains(t, err.Error(), "only fixed dimension vector types are supported")
 	})
 
 	t.Run("array of vector missing dimension", func(t *testing.T) {
@@ -4079,7 +4283,7 @@ func TestValidateFieldsInStruct(t *testing.T) {
 	})
 }
 
-func Test_reconstructStructFieldDataCommon(t *testing.T) {
+func Test_reconstructStructFieldData(t *testing.T) {
 	t.Run("count(*) query - should return early", func(t *testing.T) {
 		fieldsData := []*schemapb.FieldData{
 			{
@@ -4112,7 +4316,7 @@ func Test_reconstructStructFieldDataCommon(t *testing.T) {
 		originalOutputFields := make([]string, len(outputFields))
 		copy(originalOutputFields, outputFields)
 
-		resultFieldsData, resultOutputFields := reconstructStructFieldDataCommon(fieldsData, outputFields, schema)
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
 
 		// Should not modify anything for count(*) query
 		assert.Equal(t, originalFieldsData, resultFieldsData)
@@ -4162,7 +4366,7 @@ func Test_reconstructStructFieldDataCommon(t *testing.T) {
 			},
 		}
 
-		resultFieldsData, resultOutputFields := reconstructStructFieldDataCommon(fieldsData, outputFields, schema)
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
 
 		// Should reconstruct the struct field with the restored field name
 		assert.Len(t, resultFieldsData, 1)
@@ -4203,7 +4407,7 @@ func Test_reconstructStructFieldDataCommon(t *testing.T) {
 		originalOutputFields := make([]string, len(outputFields))
 		copy(originalOutputFields, outputFields)
 
-		resultFieldsData, resultOutputFields := reconstructStructFieldDataCommon(fieldsData, outputFields, schema)
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
 
 		// Should not modify anything when no struct array fields
 		assert.Equal(t, originalFieldsData, resultFieldsData)
@@ -4290,7 +4494,7 @@ func Test_reconstructStructFieldDataCommon(t *testing.T) {
 			},
 		}
 
-		resultFieldsData, resultOutputFields := reconstructStructFieldDataCommon(fieldsData, outputFields, schema)
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
 
 		// Check result
 		assert.Len(t, resultFieldsData, 1, "Should only have one reconstructed struct field")
@@ -4390,7 +4594,7 @@ func Test_reconstructStructFieldDataCommon(t *testing.T) {
 			},
 		}
 
-		resultFieldsData, resultOutputFields := reconstructStructFieldDataCommon(fieldsData, outputFields, schema)
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
 
 		// Check result: should have 2 fields (1 regular + 1 reconstructed struct)
 		assert.Len(t, resultFieldsData, 2)
@@ -4509,7 +4713,7 @@ func Test_reconstructStructFieldDataCommon(t *testing.T) {
 			},
 		}
 
-		resultFieldsData, resultOutputFields := reconstructStructFieldDataCommon(fieldsData, outputFields, schema)
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
 
 		// Check result: should have 2 struct fields
 		assert.Len(t, resultFieldsData, 2)
@@ -4611,7 +4815,7 @@ func Test_reconstructStructFieldDataCommon(t *testing.T) {
 			},
 		}
 
-		resultFieldsData, resultOutputFields := reconstructStructFieldDataCommon(fieldsData, outputFields, schema)
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
 
 		// Check result
 		assert.Len(t, resultFieldsData, 1, "Should have one reconstructed struct field")
@@ -4828,5 +5032,452 @@ func TestGetStorageCost(t *testing.T) {
 		assert.Equal(t, int64(456), total)
 		assert.InDelta(t, 0.27, ratio, 1e-9)
 		assert.True(t, ok)
+	})
+}
+
+func TestMinHashFunction(t *testing.T) {
+	t.Run("MinHash function without permutations ", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{
+					Name:     "minhash_output",
+					DataType: schemapb.DataType_BinaryVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{
+							Key:   common.DimKey,
+							Value: "4096",
+						},
+					},
+				},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "num_hashes", Value: "128"},
+						{Key: "shingle_size", Value: "3"},
+						{Key: "hash_function", Value: "xxhash64"},
+						{Key: "seed", Value: "42"},
+					},
+				},
+			},
+		}
+
+		err := validateFunction(schema, "", false)
+		assert.NoError(t, err)
+	})
+
+	t.Run("miss num_hashes", func(t *testing.T) {
+		createSchema := func() *schemapb.CollectionSchema {
+			return &schemapb.CollectionSchema{
+				Fields: []*schemapb.FieldSchema{
+					{Name: "text_field", DataType: schemapb.DataType_VarChar},
+					{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "4096"},
+					}},
+				},
+				Functions: []*schemapb.FunctionSchema{
+					{
+						Name:             "text_to_minhash",
+						Type:             schemapb.FunctionType_MinHash,
+						InputFieldNames:  []string{"text_field"},
+						OutputFieldNames: []string{"minhash_output"},
+						Params: []*commonpb.KeyValuePair{
+							{Key: "seed", Value: "999"},
+						},
+					},
+				},
+			}
+		}
+
+		schema1 := createSchema()
+
+		// Inject permutations in both schemas
+		err := validateFunction(schema1, "", false)
+		assert.NoError(t, err)
+	})
+
+	t.Run("num_hashes * 32 != dim", func(t *testing.T) {
+		createSchema := func() *schemapb.CollectionSchema {
+			return &schemapb.CollectionSchema{
+				Fields: []*schemapb.FieldSchema{
+					{Name: "text_field", DataType: schemapb.DataType_VarChar},
+					{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "4096"},
+					}},
+				},
+				Functions: []*schemapb.FunctionSchema{
+					{
+						Name:             "text_to_minhash",
+						Type:             schemapb.FunctionType_MinHash,
+						InputFieldNames:  []string{"text_field"},
+						OutputFieldNames: []string{"minhash_output"},
+						Params: []*commonpb.KeyValuePair{
+							{Key: "num_hashes", Value: "9999"},
+							{Key: "seed", Value: "999"},
+						},
+					},
+				},
+			}
+		}
+
+		schema1 := createSchema()
+
+		// Inject permutations in both schemas
+		err := validateFunction(schema1, "", false)
+		assert.Error(t, err)
+	})
+
+	t.Run("invalid num_hashes string value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "num_hashes", Value: "abc"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "num_hashes")
+		assert.Contains(t, err.Error(), "not a number")
+	})
+
+	t.Run("invalid num_hashes negative value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "num_hashes", Value: "-1"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "num_hashes")
+		assert.Contains(t, err.Error(), "positive")
+	})
+
+	t.Run("invalid shingle_size string value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "shingle_size", Value: "abc"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "shingle_size")
+		assert.Contains(t, err.Error(), "not a number")
+	})
+
+	t.Run("invalid shingle_size zero value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "shingle_size", Value: "0"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "shingle_size")
+		assert.Contains(t, err.Error(), "positive")
+	})
+
+	t.Run("invalid hash_function value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "hash_function", Value: "md5"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Unknown hash function")
+	})
+
+	t.Run("invalid hash_function empty value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "hash_function", Value: ""},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Unknown hash function")
+	})
+
+	t.Run("invalid token_level value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "token_level", Value: "sentence"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Unknown token_level")
+	})
+
+	t.Run("invalid token_level empty value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "token_level", Value: ""},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Unknown token_level")
+	})
+
+	t.Run("invalid seed string value", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "seed", Value: "abc"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "seed")
+		assert.Contains(t, err.Error(), "not a number")
+	})
+
+	t.Run("valid token_level char", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "token_level", Value: "char"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid hash_function sha1", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text_field", DataType: schemapb.DataType_VarChar},
+				{Name: "minhash_output", DataType: schemapb.DataType_BinaryVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "4096"},
+				}},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{
+					Name:             "text_to_minhash",
+					Type:             schemapb.FunctionType_MinHash,
+					InputFieldNames:  []string{"text_field"},
+					OutputFieldNames: []string{"minhash_output"},
+					Params: []*commonpb.KeyValuePair{
+						{Key: "hash_function", Value: "sha1"},
+					},
+				},
+			},
+		}
+		err := validateFunction(schema, "", false)
+		assert.NoError(t, err)
+	})
+}
+
+func TestInjectVirtualPKForExternalCollection(t *testing.T) {
+	t.Run("NoPKExists_InjectsVirtualPK", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:           "test_ext_coll",
+			ExternalSource: "s3://bucket/data",
+			Fields: []*schemapb.FieldSchema{
+				{Name: "text", DataType: schemapb.DataType_VarChar, ExternalField: "text_col"},
+				{Name: "vec", DataType: schemapb.DataType_FloatVector, ExternalField: "vec_col"},
+			},
+		}
+
+		err := injectVirtualPKForExternalCollection(schema)
+		assert.NoError(t, err)
+
+		// Virtual PK should be prepended as first field
+		assert.Len(t, schema.Fields, 3)
+		vpk := schema.Fields[0]
+		assert.Equal(t, common.VirtualPKFieldName, vpk.Name)
+		assert.Equal(t, schemapb.DataType_Int64, vpk.DataType)
+		assert.True(t, vpk.IsPrimaryKey)
+		assert.True(t, vpk.AutoID)
+
+		// Original fields remain unchanged
+		assert.Equal(t, "text", schema.Fields[1].Name)
+		assert.Equal(t, "vec", schema.Fields[2].Name)
+	})
+
+	t.Run("PKAlreadyExists_NoInjection", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "my_pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+				{Name: "vec", DataType: schemapb.DataType_FloatVector},
+			},
+		}
+
+		err := injectVirtualPKForExternalCollection(schema)
+		assert.NoError(t, err)
+
+		// No virtual PK injected — only 2 fields remain
+		assert.Len(t, schema.Fields, 2)
+		assert.Equal(t, "my_pk", schema.Fields[0].Name)
+	})
+
+	t.Run("EmptyFields_InjectsVirtualPK", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{},
+		}
+
+		err := injectVirtualPKForExternalCollection(schema)
+		assert.NoError(t, err)
+
+		assert.Len(t, schema.Fields, 1)
+		assert.Equal(t, common.VirtualPKFieldName, schema.Fields[0].Name)
+		assert.True(t, schema.Fields[0].IsPrimaryKey)
+	})
+
+	t.Run("VirtualPKFieldID_IsZero", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{Name: "vec", DataType: schemapb.DataType_FloatVector, ExternalField: "vec_col"},
+			},
+		}
+
+		err := injectVirtualPKForExternalCollection(schema)
+		assert.NoError(t, err)
+
+		// FieldID should be 0 (assigned by RootCoord later)
+		assert.Equal(t, int64(0), schema.Fields[0].FieldID)
 	})
 }

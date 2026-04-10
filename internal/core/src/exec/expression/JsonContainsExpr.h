@@ -26,6 +26,8 @@
 #include "segcore/SegmentInterface.h"
 #include "common/bson_view.h"
 #include "exec/expression/Utils.h"
+#include "index/json_stats/bson_inverted.h"
+#include "cachinglayer/CacheSlot.h"
 
 namespace milvus {
 namespace exec {
@@ -454,7 +456,8 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
         const segcore::SegmentInternalInterface* segment,
         int64_t active_count,
         int64_t batch_size,
-        int32_t consistency_level)
+        int32_t consistency_level,
+        const query::PlanOptions& plan_options = {})
         : SegmentExpr(std::move(input),
                       name,
                       op_ctx,
@@ -468,15 +471,17 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
                       batch_size,
                       consistency_level,
                       false,
-                      true),
+                      true,
+                      plan_options),
           expr_(expr) {
+        DetermineExecPath();
     }
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
     std::string
-    ToString() const {
+    ToString() const override {
         return fmt::format("{}", expr_->ToString());
     }
 
@@ -488,6 +493,15 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
     std::optional<milvus::expr::ColumnInfo>
     GetColumnInfo() const override {
         return expr_->column_;
+    }
+
+    void
+    DetermineExecPath() override {
+        if (CanUseJsonStatsAtInit()) {
+            exec_path_ = ExprExecPath::JsonStats;
+            return;
+        }
+        SegmentExpr::DetermineExecPath();
     }
 
  private:
@@ -554,7 +568,9 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
     bool arg_inited_{false};
     std::shared_ptr<MultiElement> arg_set_;
     std::shared_ptr<MultiElement> arg_set_double_;
-    PinWrapper<index::JsonKeyStats*> pinned_json_stats_{nullptr};
+    std::shared_ptr<void>
+        arg_cached_set_;  // For caching std::set<T> or std::vector<T>
+    PinWrapper<index::BsonInvertedIndex*> bson_index_{nullptr};
 };
 }  //namespace exec
 }  // namespace milvus

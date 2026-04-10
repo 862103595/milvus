@@ -10,13 +10,33 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "GISFunctionFilterExpr.h"
+
+#include <fmt/core.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <iosfwd>
+#include <string_view>
+
+#include "bitset/bitset.h"
+#include "bitset/detail/element_vectorized.h"
 #include "common/EasyAssert.h"
 #include "common/Geometry.h"
+#include "common/GeometryCache.h"
+#include "common/OpContext.h"
+#include "common/PreparedGeometry.h"
 #include "common/Types.h"
+#include "geos_c.h"
+#include "index/Index.h"
+#include "index/Meta.h"
+#include "index/ScalarIndex.h"
+#include "knowhere/dataset.h"
 #include "pb/plan.pb.h"
-#include <cmath>
-#include <fmt/core.h>
+#include "pb/schema.pb.h"
+#include "storage/MmapManager.h"
+#include "storage/Types.h"
+
 namespace milvus {
 namespace exec {
 
@@ -120,12 +140,75 @@ namespace exec {
                processed_size,                                                 \
                real_batch_size);                                               \
     return res_vec;
+
+// Macro for unary operations (like IsValid) that don't need a right_source
+#define GEOMETRY_EXECUTE_SUB_BATCH_UNARY(_DataType, method)                  \
+    auto execute_sub_batch = [this](const _DataType* data,                   \
+                                    const bool* valid_data,                  \
+                                    const int32_t* offsets,                  \
+                                    const int32_t* segment_offsets,          \
+                                    const int size,                          \
+                                    TargetBitmapView res,                    \
+                                    TargetBitmapView valid_res) {            \
+        AssertInfo(segment_offsets != nullptr,                               \
+                   "segment_offsets should not be nullptr");                 \
+        auto* geometry_cache =                                               \
+            SimpleGeometryCacheManager::Instance().GetCache(                 \
+                this->segment_->get_segment_id(), field_id_);                \
+        if (geometry_cache) {                                                \
+            auto cache_lock = geometry_cache->AcquireReadLock();             \
+            for (int i = 0; i < size; ++i) {                                 \
+                if (valid_data != nullptr && !valid_data[i]) {               \
+                    res[i] = valid_res[i] = false;                           \
+                    continue;                                                \
+                }                                                            \
+                auto absolute_offset = segment_offsets[i];                   \
+                auto cached_geometry =                                       \
+                    geometry_cache->GetByOffsetUnsafe(absolute_offset);      \
+                AssertInfo(cached_geometry != nullptr,                       \
+                           "cached geometry is nullptr");                    \
+                res[i] = cached_geometry->method();                          \
+            }                                                                \
+        } else {                                                             \
+            GEOSContextHandle_t ctx_ = GEOS_init_r();                        \
+            for (int i = 0; i < size; ++i) {                                 \
+                if (valid_data != nullptr && !valid_data[i]) {               \
+                    res[i] = valid_res[i] = false;                           \
+                    continue;                                                \
+                }                                                            \
+                res[i] =                                                     \
+                    Geometry(ctx_, data[i].data(), data[i].size()).method(); \
+            }                                                                \
+            GEOS_finish_r(ctx_);                                             \
+        }                                                                    \
+    };                                                                       \
+    int64_t processed_size = ProcessDataChunks<_DataType, true>(             \
+        execute_sub_batch, std::nullptr_t{}, res, valid_res);                \
+    AssertInfo(processed_size == real_batch_size,                            \
+               "internal error: expr processed rows {} not equal "           \
+               "expect batch size {}",                                       \
+               processed_size,                                               \
+               real_batch_size);                                             \
+    return res_vec;
+
+void
+PhyGISFunctionFilterExpr::DetermineExecPath() {
+    SegmentExpr::DetermineExecPath();
+    if (exec_path_ != ExprExecPath::ScalarIndex) {
+        return;
+    }
+    // STIsValid operation cannot use index
+    if (expr_->op_ == proto::plan::GISFunctionFilterExpr_GISOp_STIsValid) {
+        exec_path_ = ExprExecPath::RawData;
+    }
+}
+
 void
 PhyGISFunctionFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     AssertInfo(expr_->column_.data_type_ == DataType::GEOMETRY,
                "unsupported data type: {}",
                expr_->column_.data_type_);
-    if (SegmentExpr::CanUseIndex()) {
+    if (exec_path_ == ExprExecPath::ScalarIndex) {
         result = EvalForIndexSegment();
     } else {
         result = EvalForDataSegment();
@@ -144,8 +227,20 @@ PhyGISFunctionFilterExpr::EvalForDataSegment() {
     TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
     valid_res.set();
 
+    if (expr_->op_ == proto::plan::GISFunctionFilterExpr_GISOp_STIsValid) {
+        if (segment_->type() == SegmentType::Growing &&
+            !storage::MmapManager::GetInstance()
+                 .GetMmapConfig()
+                 .growing_enable_mmap) {
+            GEOMETRY_EXECUTE_SUB_BATCH_UNARY(std::string, is_valid);
+        } else {
+            GEOMETRY_EXECUTE_SUB_BATCH_UNARY(std::string_view, is_valid);
+        }
+        return res_vec;
+    }
+
     auto right_source =
-        Geometry(segment_->get_ctx(), expr_->geometry_wkt_.c_str());
+        Geometry(GetThreadLocalGEOSContext(), expr_->geometry_wkt_.c_str());
 
     // Choose underlying data type according to segment type to avoid element
     // size mismatch: Sealed segments and growing segments with mmap use std::string_view;
@@ -248,7 +343,7 @@ PhyGISFunctionFilterExpr::EvalForDataSegment() {
         default: {
             ThrowInfo(NotImplemented,
                       "internal error: unknown GIS op : {}",
-                      expr_->op_);
+                      static_cast<int>(expr_->op_));
         }
     }
     return res_vec;
@@ -310,35 +405,57 @@ PhyGISFunctionFilterExpr::EvalForIndexSegment() {
         return nullptr;
     }
 
-    Geometry query_geometry =
-        Geometry(segment_->get_ctx(), expr_->geometry_wkt_.c_str());
+    // Use thread-local GEOS context for thread safety - segment_->get_ctx() is shared
+    // and not safe for concurrent access from multiple query threads
+    GEOSContextHandle_t ctx = GetThreadLocalGEOSContext();
+
+    Geometry query_geometry = Geometry(ctx, expr_->geometry_wkt_.c_str());
+
+    // Prepare the query geometry once for accelerated repeated predicate evaluation.
+    PreparedGeometry prepared_query(ctx, query_geometry);
 
     /* ------------------------------------------------------------------
      * Prefetch: if coarse results are not cached yet, run a single R-Tree
      * query for all index chunks and cache their coarse bitmaps.
      * ------------------------------------------------------------------*/
 
-    auto evaluate_geometry = [this](const Geometry& left,
-                                    const Geometry& query_geometry) -> bool {
+    // Evaluate geometry operation using PreparedGeometry for supported operations.
+    // Note on predicate semantics when using prepared query:
+    // - Symmetric predicates (intersects, touches, overlaps, crosses): prepared_query.op(left) == left.op(query)
+    // - contains/within swap: left.contains(query) == prepared_query.within(left)
+    //                         left.within(query) == prepared_query.contains(left)
+    // - equals, dwithin: no prepared version, fall back to regular Geometry
+    auto evaluate_geometry_prepared =
+        [this, &prepared_query, &query_geometry](const Geometry& left) -> bool {
         switch (expr_->op_) {
-            case proto::plan::GISFunctionFilterExpr_GISOp_Equals:
-                return left.equals(query_geometry);
-            case proto::plan::GISFunctionFilterExpr_GISOp_Touches:
-                return left.touches(query_geometry);
-            case proto::plan::GISFunctionFilterExpr_GISOp_Overlaps:
-                return left.overlaps(query_geometry);
-            case proto::plan::GISFunctionFilterExpr_GISOp_Crosses:
-                return left.crosses(query_geometry);
-            case proto::plan::GISFunctionFilterExpr_GISOp_Contains:
-                return left.contains(query_geometry);
             case proto::plan::GISFunctionFilterExpr_GISOp_Intersects:
-                return left.intersects(query_geometry);
+                // Symmetric: prepared_query.intersects(left) == left.intersects(query)
+                return prepared_query.intersects(left);
+            case proto::plan::GISFunctionFilterExpr_GISOp_Touches:
+                // Symmetric
+                return prepared_query.touches(left);
+            case proto::plan::GISFunctionFilterExpr_GISOp_Overlaps:
+                // Symmetric
+                return prepared_query.overlaps(left);
+            case proto::plan::GISFunctionFilterExpr_GISOp_Crosses:
+                // Symmetric
+                return prepared_query.crosses(left);
+            case proto::plan::GISFunctionFilterExpr_GISOp_Contains:
+                // left.contains(query) == query.within(left)
+                return prepared_query.within(left);
             case proto::plan::GISFunctionFilterExpr_GISOp_Within:
-                return left.within(query_geometry);
+                // left.within(query) == query.contains(left)
+                return prepared_query.contains(left);
+            case proto::plan::GISFunctionFilterExpr_GISOp_Equals:
+                // No prepared version - fall back to regular geometry
+                return left.equals(query_geometry);
             case proto::plan::GISFunctionFilterExpr_GISOp_DWithin:
+                // Distance-based operation - no prepared version
                 return left.dwithin(query_geometry, expr_->distance_);
             default:
-                ThrowInfo(NotImplemented, "unknown GIS op : {}", expr_->op_);
+                ThrowInfo(NotImplemented,
+                          "unknown GIS op : {}",
+                          static_cast<int>(expr_->op_));
         }
     };
 
@@ -357,16 +474,15 @@ PhyGISFunctionFilterExpr::EvalForIndexSegment() {
         if (expr_->op_ == proto::plan::GISFunctionFilterExpr_GISOp_DWithin) {
             // Create bounding box geometry for index coarse filtering
             Geometry bbox_geometry = create_bounding_box_for_dwithin(
-                segment_->get_ctx(), query_geometry, expr_->distance_);
+                ctx, query_geometry, expr_->distance_);
 
             ds->Set(milvus::index::MATCH_VALUE, bbox_geometry);
 
             // Note: Distance is not used for bounding box intersection query
         } else {
             // For other operations, use original geometry
-            ds->Set(
-                milvus::index::MATCH_VALUE,
-                Geometry(segment_->get_ctx(), expr_->geometry_wkt_.c_str()));
+            ds->Set(milvus::index::MATCH_VALUE,
+                    Geometry(ctx, expr_->geometry_wkt_.c_str()));
         }
 
         // Query segment-level R-Tree index **once** since each chunk shares the same index
@@ -388,7 +504,6 @@ PhyGISFunctionFilterExpr::EvalForIndexSegment() {
     if (cached_index_chunk_res_ == nullptr) {
         // Reuse segment-level coarse cache directly
         auto& coarse = coarse_global_;
-        auto& chunk_valid = coarse_valid_global_;
         // Exact refinement with lambda functions for code reuse
         TargetBitmap refined(coarse.size());
 
@@ -427,8 +542,8 @@ PhyGISFunctionFilterExpr::EvalForIndexSegment() {
                     if (cached_geometry == nullptr) {
                         continue;
                     }
-                    bool result =
-                        evaluate_geometry(*cached_geometry, query_geometry);
+                    // Use prepared geometry for faster evaluation
+                    bool result = evaluate_geometry_prepared(*cached_geometry);
 
                     if (result) {
                         refined.set(pos);
@@ -444,7 +559,7 @@ PhyGISFunctionFilterExpr::EvalForIndexSegment() {
                         &data_array->scalars().geometry_data());
                 const auto& valid_data = data_array->valid_data();
 
-                GEOSContextHandle_t ctx = GEOS_init_r();
+                GEOSContextHandle_t local_ctx = GetThreadLocalGEOSContext();
                 for (size_t i = 0; i < hit_offsets.size(); ++i) {
                     const auto pos = hit_offsets[i];
 
@@ -454,14 +569,14 @@ PhyGISFunctionFilterExpr::EvalForIndexSegment() {
                     }
 
                     const auto& wkb_data = geometry_array->data(i);
-                    Geometry left(ctx, wkb_data.data(), wkb_data.size());
-                    bool result = evaluate_geometry(left, query_geometry);
+                    Geometry left(local_ctx, wkb_data.data(), wkb_data.size());
+                    // Use prepared geometry for faster evaluation
+                    bool result = evaluate_geometry_prepared(left);
 
                     if (result) {
                         refined.set(pos);
                     }
                 }
-                GEOS_finish_r(ctx);
             }
         };
 
@@ -474,14 +589,15 @@ PhyGISFunctionFilterExpr::EvalForIndexSegment() {
     }
 
     if (segment_->type() == SegmentType::Sealed) {
-        auto size = ProcessIndexOneChunk(batch_result,
-                                         batch_valid,
-                                         0,
-                                         *cached_index_chunk_res_,
-                                         coarse_valid_global_,
-                                         processed_rows);
+        auto data_pos = current_index_chunk_pos_;
+        auto size = std::min(
+            std::min(size_per_chunk_ - data_pos, batch_size_ - processed_rows),
+            int64_t(cached_index_chunk_res_->size()));
+
+        batch_result.append(*cached_index_chunk_res_, data_pos, size);
+        batch_valid.append(coarse_valid_global_, data_pos, size);
         processed_rows += size;
-        current_index_chunk_pos_ = current_index_chunk_pos_ + size;
+        current_index_chunk_pos_ += size;
     } else {
         for (size_t i = current_data_chunk_; i < num_data_chunk_; i++) {
             auto data_pos =

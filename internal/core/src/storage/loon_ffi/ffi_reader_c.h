@@ -18,9 +18,10 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 #include "common/common_type_c.h"
 #include "common/type_c.h"
-#include <arrow/c/abi.h>
 #include "milvus-storage/ffi_c.h"
 
 /**
@@ -30,7 +31,7 @@ extern "C" {
  * from storage in Milvus. The reader supports Arrow-based data access
  * through the FFI (Foreign Function Interface) layer.
  */
-typedef ReaderHandle CFFIPackedReader;
+typedef void* CFFIPackedReader;
 
 /**
  * @brief Creates a new packed FFI reader from a manifest file path.
@@ -78,9 +79,7 @@ NewPackedFFIReader(const char* manifest_path,
  * as a string instead of reading from a file path. This is useful when the
  * manifest has already been loaded or is generated dynamically.
  *
- * @param manifest_content      The manifest content as a null-terminated string.
- *                              Must be valid JSON or protobuf text format containing
- *                              the manifest data.
+ * @param loon_manifest         Loon Manifest to open FFI reader with
  * @param schema                Arrow schema defining the structure of the data.
  *                              Must be a valid ArrowSchema pointer conforming to
  *                              the Arrow C data interface specification.
@@ -105,11 +104,11 @@ NewPackedFFIReader(const char* manifest_path,
  *       be freed after this call returns.
  */
 CStatus
-NewPackedFFIReaderWithManifest(const char* manifest_content,
+NewPackedFFIReaderWithManifest(const LoonManifest* loon_manifest,
                                struct ArrowSchema* schema,
                                char** needed_columns,
                                int64_t needed_columns_size,
-                               CFFIPackedReader* c_packed_reader,
+                               CFFIPackedReader* c_loon_reader,
                                CStorageConfig c_storage_config,
                                CPluginContext* c_plugin_context);
 

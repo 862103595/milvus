@@ -95,6 +95,124 @@ func (_c *MockRootCoord_AddCollectionField_Call) RunAndReturn(run func(context.C
 	return _c
 }
 
+// AddCollectionFunction provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) AddCollectionFunction(_a0 context.Context, _a1 *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for AddCollectionFunction")
+	}
+
+	var r0 *commonpb.Status
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AddCollectionFunctionRequest) *commonpb.Status); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*commonpb.Status)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.AddCollectionFunctionRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_AddCollectionFunction_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'AddCollectionFunction'
+type MockRootCoord_AddCollectionFunction_Call struct {
+	*mock.Call
+}
+
+// AddCollectionFunction is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.AddCollectionFunctionRequest
+func (_e *MockRootCoord_Expecter) AddCollectionFunction(_a0 interface{}, _a1 interface{}) *MockRootCoord_AddCollectionFunction_Call {
+	return &MockRootCoord_AddCollectionFunction_Call{Call: _e.mock.On("AddCollectionFunction", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_AddCollectionFunction_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.AddCollectionFunctionRequest)) *MockRootCoord_AddCollectionFunction_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.AddCollectionFunctionRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_AddCollectionFunction_Call) Return(_a0 *commonpb.Status, _a1 error) *MockRootCoord_AddCollectionFunction_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_AddCollectionFunction_Call) RunAndReturn(run func(context.Context, *milvuspb.AddCollectionFunctionRequest) (*commonpb.Status, error)) *MockRootCoord_AddCollectionFunction_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// AddFileResource provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) AddFileResource(_a0 context.Context, _a1 *milvuspb.AddFileResourceRequest) (*commonpb.Status, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for AddFileResource")
+	}
+
+	var r0 *commonpb.Status
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AddFileResourceRequest) (*commonpb.Status, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AddFileResourceRequest) *commonpb.Status); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*commonpb.Status)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.AddFileResourceRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_AddFileResource_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'AddFileResource'
+type MockRootCoord_AddFileResource_Call struct {
+	*mock.Call
+}
+
+// AddFileResource is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.AddFileResourceRequest
+func (_e *MockRootCoord_Expecter) AddFileResource(_a0 interface{}, _a1 interface{}) *MockRootCoord_AddFileResource_Call {
+	return &MockRootCoord_AddFileResource_Call{Call: _e.mock.On("AddFileResource", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_AddFileResource_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.AddFileResourceRequest)) *MockRootCoord_AddFileResource_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.AddFileResourceRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_AddFileResource_Call) Return(_a0 *commonpb.Status, _a1 error) *MockRootCoord_AddFileResource_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_AddFileResource_Call) RunAndReturn(run func(context.Context, *milvuspb.AddFileResourceRequest) (*commonpb.Status, error)) *MockRootCoord_AddFileResource_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // AllocID provides a mock function with given fields: _a0, _a1
 func (_m *MockRootCoord) AllocID(_a0 context.Context, _a1 *rootcoordpb.AllocIDRequest) (*rootcoordpb.AllocIDResponse, error) {
 	ret := _m.Called(_a0, _a1)
@@ -390,6 +508,124 @@ func (_c *MockRootCoord_AlterCollectionField_Call) RunAndReturn(run func(context
 	return _c
 }
 
+// AlterCollectionFunction provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) AlterCollectionFunction(_a0 context.Context, _a1 *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for AlterCollectionFunction")
+	}
+
+	var r0 *commonpb.Status
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AlterCollectionFunctionRequest) *commonpb.Status); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*commonpb.Status)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.AlterCollectionFunctionRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_AlterCollectionFunction_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'AlterCollectionFunction'
+type MockRootCoord_AlterCollectionFunction_Call struct {
+	*mock.Call
+}
+
+// AlterCollectionFunction is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.AlterCollectionFunctionRequest
+func (_e *MockRootCoord_Expecter) AlterCollectionFunction(_a0 interface{}, _a1 interface{}) *MockRootCoord_AlterCollectionFunction_Call {
+	return &MockRootCoord_AlterCollectionFunction_Call{Call: _e.mock.On("AlterCollectionFunction", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_AlterCollectionFunction_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.AlterCollectionFunctionRequest)) *MockRootCoord_AlterCollectionFunction_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.AlterCollectionFunctionRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_AlterCollectionFunction_Call) Return(_a0 *commonpb.Status, _a1 error) *MockRootCoord_AlterCollectionFunction_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_AlterCollectionFunction_Call) RunAndReturn(run func(context.Context, *milvuspb.AlterCollectionFunctionRequest) (*commonpb.Status, error)) *MockRootCoord_AlterCollectionFunction_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// AlterCollectionSchema provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) AlterCollectionSchema(_a0 context.Context, _a1 *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for AlterCollectionSchema")
+	}
+
+	var r0 *milvuspb.AlterCollectionSchemaResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.AlterCollectionSchemaRequest) *milvuspb.AlterCollectionSchemaResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*milvuspb.AlterCollectionSchemaResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.AlterCollectionSchemaRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_AlterCollectionSchema_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'AlterCollectionSchema'
+type MockRootCoord_AlterCollectionSchema_Call struct {
+	*mock.Call
+}
+
+// AlterCollectionSchema is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.AlterCollectionSchemaRequest
+func (_e *MockRootCoord_Expecter) AlterCollectionSchema(_a0 interface{}, _a1 interface{}) *MockRootCoord_AlterCollectionSchema_Call {
+	return &MockRootCoord_AlterCollectionSchema_Call{Call: _e.mock.On("AlterCollectionSchema", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_AlterCollectionSchema_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.AlterCollectionSchemaRequest)) *MockRootCoord_AlterCollectionSchema_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.AlterCollectionSchemaRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_AlterCollectionSchema_Call) Return(_a0 *milvuspb.AlterCollectionSchemaResponse, _a1 error) *MockRootCoord_AlterCollectionSchema_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_AlterCollectionSchema_Call) RunAndReturn(run func(context.Context, *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error)) *MockRootCoord_AlterCollectionSchema_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // AlterDatabase provides a mock function with given fields: _a0, _a1
 func (_m *MockRootCoord) AlterDatabase(_a0 context.Context, _a1 *rootcoordpb.AlterDatabaseRequest) (*commonpb.Status, error) {
 	ret := _m.Called(_a0, _a1)
@@ -445,6 +681,65 @@ func (_c *MockRootCoord_AlterDatabase_Call) Return(_a0 *commonpb.Status, _a1 err
 }
 
 func (_c *MockRootCoord_AlterDatabase_Call) RunAndReturn(run func(context.Context, *rootcoordpb.AlterDatabaseRequest) (*commonpb.Status, error)) *MockRootCoord_AlterDatabase_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// BackupEzk provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) BackupEzk(_a0 context.Context, _a1 *internalpb.BackupEzkRequest) (*internalpb.BackupEzkResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for BackupEzk")
+	}
+
+	var r0 *internalpb.BackupEzkResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *internalpb.BackupEzkRequest) (*internalpb.BackupEzkResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *internalpb.BackupEzkRequest) *internalpb.BackupEzkResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*internalpb.BackupEzkResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *internalpb.BackupEzkRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_BackupEzk_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'BackupEzk'
+type MockRootCoord_BackupEzk_Call struct {
+	*mock.Call
+}
+
+// BackupEzk is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *internalpb.BackupEzkRequest
+func (_e *MockRootCoord_Expecter) BackupEzk(_a0 interface{}, _a1 interface{}) *MockRootCoord_BackupEzk_Call {
+	return &MockRootCoord_BackupEzk_Call{Call: _e.mock.On("BackupEzk", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_BackupEzk_Call) Run(run func(_a0 context.Context, _a1 *internalpb.BackupEzkRequest)) *MockRootCoord_BackupEzk_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*internalpb.BackupEzkRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_BackupEzk_Call) Return(_a0 *internalpb.BackupEzkResponse, _a1 error) *MockRootCoord_BackupEzk_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_BackupEzk_Call) RunAndReturn(run func(context.Context, *internalpb.BackupEzkRequest) (*internalpb.BackupEzkResponse, error)) *MockRootCoord_BackupEzk_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -563,6 +858,65 @@ func (_c *MockRootCoord_CheckHealth_Call) Return(_a0 *milvuspb.CheckHealthRespon
 }
 
 func (_c *MockRootCoord_CheckHealth_Call) RunAndReturn(run func(context.Context, *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error)) *MockRootCoord_CheckHealth_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// ClientHeartbeat provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) ClientHeartbeat(_a0 context.Context, _a1 *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ClientHeartbeat")
+	}
+
+	var r0 *milvuspb.ClientHeartbeatResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.ClientHeartbeatRequest) *milvuspb.ClientHeartbeatResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*milvuspb.ClientHeartbeatResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.ClientHeartbeatRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_ClientHeartbeat_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ClientHeartbeat'
+type MockRootCoord_ClientHeartbeat_Call struct {
+	*mock.Call
+}
+
+// ClientHeartbeat is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.ClientHeartbeatRequest
+func (_e *MockRootCoord_Expecter) ClientHeartbeat(_a0 interface{}, _a1 interface{}) *MockRootCoord_ClientHeartbeat_Call {
+	return &MockRootCoord_ClientHeartbeat_Call{Call: _e.mock.On("ClientHeartbeat", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_ClientHeartbeat_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.ClientHeartbeatRequest)) *MockRootCoord_ClientHeartbeat_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.ClientHeartbeatRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_ClientHeartbeat_Call) Return(_a0 *milvuspb.ClientHeartbeatResponse, _a1 error) *MockRootCoord_ClientHeartbeat_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_ClientHeartbeat_Call) RunAndReturn(run func(context.Context, *milvuspb.ClientHeartbeatRequest) (*milvuspb.ClientHeartbeatResponse, error)) *MockRootCoord_ClientHeartbeat_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -980,6 +1334,65 @@ func (_c *MockRootCoord_CreateRole_Call) RunAndReturn(run func(context.Context, 
 	return _c
 }
 
+// DeleteClientCommand provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) DeleteClientCommand(_a0 context.Context, _a1 *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DeleteClientCommand")
+	}
+
+	var r0 *milvuspb.DeleteClientCommandResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.DeleteClientCommandRequest) *milvuspb.DeleteClientCommandResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*milvuspb.DeleteClientCommandResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.DeleteClientCommandRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_DeleteClientCommand_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DeleteClientCommand'
+type MockRootCoord_DeleteClientCommand_Call struct {
+	*mock.Call
+}
+
+// DeleteClientCommand is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.DeleteClientCommandRequest
+func (_e *MockRootCoord_Expecter) DeleteClientCommand(_a0 interface{}, _a1 interface{}) *MockRootCoord_DeleteClientCommand_Call {
+	return &MockRootCoord_DeleteClientCommand_Call{Call: _e.mock.On("DeleteClientCommand", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_DeleteClientCommand_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.DeleteClientCommandRequest)) *MockRootCoord_DeleteClientCommand_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.DeleteClientCommandRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_DeleteClientCommand_Call) Return(_a0 *milvuspb.DeleteClientCommandResponse, _a1 error) *MockRootCoord_DeleteClientCommand_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_DeleteClientCommand_Call) RunAndReturn(run func(context.Context, *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error)) *MockRootCoord_DeleteClientCommand_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // DeleteCredential provides a mock function with given fields: _a0, _a1
 func (_m *MockRootCoord) DeleteCredential(_a0 context.Context, _a1 *milvuspb.DeleteCredentialRequest) (*commonpb.Status, error) {
 	ret := _m.Called(_a0, _a1)
@@ -1393,6 +1806,65 @@ func (_c *MockRootCoord_DropCollection_Call) RunAndReturn(run func(context.Conte
 	return _c
 }
 
+// DropCollectionFunction provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) DropCollectionFunction(_a0 context.Context, _a1 *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DropCollectionFunction")
+	}
+
+	var r0 *commonpb.Status
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.DropCollectionFunctionRequest) *commonpb.Status); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*commonpb.Status)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.DropCollectionFunctionRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_DropCollectionFunction_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DropCollectionFunction'
+type MockRootCoord_DropCollectionFunction_Call struct {
+	*mock.Call
+}
+
+// DropCollectionFunction is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.DropCollectionFunctionRequest
+func (_e *MockRootCoord_Expecter) DropCollectionFunction(_a0 interface{}, _a1 interface{}) *MockRootCoord_DropCollectionFunction_Call {
+	return &MockRootCoord_DropCollectionFunction_Call{Call: _e.mock.On("DropCollectionFunction", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_DropCollectionFunction_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.DropCollectionFunctionRequest)) *MockRootCoord_DropCollectionFunction_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.DropCollectionFunctionRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_DropCollectionFunction_Call) Return(_a0 *commonpb.Status, _a1 error) *MockRootCoord_DropCollectionFunction_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_DropCollectionFunction_Call) RunAndReturn(run func(context.Context, *milvuspb.DropCollectionFunctionRequest) (*commonpb.Status, error)) *MockRootCoord_DropCollectionFunction_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // DropDatabase provides a mock function with given fields: _a0, _a1
 func (_m *MockRootCoord) DropDatabase(_a0 context.Context, _a1 *milvuspb.DropDatabaseRequest) (*commonpb.Status, error) {
 	ret := _m.Called(_a0, _a1)
@@ -1625,6 +2097,65 @@ func (_c *MockRootCoord_DropRole_Call) Return(_a0 *commonpb.Status, _a1 error) *
 }
 
 func (_c *MockRootCoord_DropRole_Call) RunAndReturn(run func(context.Context, *milvuspb.DropRoleRequest) (*commonpb.Status, error)) *MockRootCoord_DropRole_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// GetClientTelemetry provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) GetClientTelemetry(_a0 context.Context, _a1 *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetClientTelemetry")
+	}
+
+	var r0 *milvuspb.GetClientTelemetryResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.GetClientTelemetryRequest) *milvuspb.GetClientTelemetryResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*milvuspb.GetClientTelemetryResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.GetClientTelemetryRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_GetClientTelemetry_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetClientTelemetry'
+type MockRootCoord_GetClientTelemetry_Call struct {
+	*mock.Call
+}
+
+// GetClientTelemetry is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.GetClientTelemetryRequest
+func (_e *MockRootCoord_Expecter) GetClientTelemetry(_a0 interface{}, _a1 interface{}) *MockRootCoord_GetClientTelemetry_Call {
+	return &MockRootCoord_GetClientTelemetry_Call{Call: _e.mock.On("GetClientTelemetry", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_GetClientTelemetry_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.GetClientTelemetryRequest)) *MockRootCoord_GetClientTelemetry_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.GetClientTelemetryRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_GetClientTelemetry_Call) Return(_a0 *milvuspb.GetClientTelemetryResponse, _a1 error) *MockRootCoord_GetClientTelemetry_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_GetClientTelemetry_Call) RunAndReturn(run func(context.Context, *milvuspb.GetClientTelemetryRequest) (*milvuspb.GetClientTelemetryResponse, error)) *MockRootCoord_GetClientTelemetry_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -2441,6 +2972,65 @@ func (_c *MockRootCoord_ListDatabases_Call) RunAndReturn(run func(context.Contex
 	return _c
 }
 
+// ListFileResources provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) ListFileResources(_a0 context.Context, _a1 *milvuspb.ListFileResourcesRequest) (*milvuspb.ListFileResourcesResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ListFileResources")
+	}
+
+	var r0 *milvuspb.ListFileResourcesResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.ListFileResourcesRequest) (*milvuspb.ListFileResourcesResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.ListFileResourcesRequest) *milvuspb.ListFileResourcesResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*milvuspb.ListFileResourcesResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.ListFileResourcesRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_ListFileResources_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ListFileResources'
+type MockRootCoord_ListFileResources_Call struct {
+	*mock.Call
+}
+
+// ListFileResources is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.ListFileResourcesRequest
+func (_e *MockRootCoord_Expecter) ListFileResources(_a0 interface{}, _a1 interface{}) *MockRootCoord_ListFileResources_Call {
+	return &MockRootCoord_ListFileResources_Call{Call: _e.mock.On("ListFileResources", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_ListFileResources_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.ListFileResourcesRequest)) *MockRootCoord_ListFileResources_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.ListFileResourcesRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_ListFileResources_Call) Return(_a0 *milvuspb.ListFileResourcesResponse, _a1 error) *MockRootCoord_ListFileResources_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_ListFileResources_Call) RunAndReturn(run func(context.Context, *milvuspb.ListFileResourcesRequest) (*milvuspb.ListFileResourcesResponse, error)) *MockRootCoord_ListFileResources_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // ListPolicy provides a mock function with given fields: _a0, _a1
 func (_m *MockRootCoord) ListPolicy(_a0 context.Context, _a1 *internalpb.ListPolicyRequest) (*internalpb.ListPolicyResponse, error) {
 	ret := _m.Called(_a0, _a1)
@@ -2736,6 +3326,65 @@ func (_c *MockRootCoord_OperateUserRole_Call) RunAndReturn(run func(context.Cont
 	return _c
 }
 
+// PushClientCommand provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) PushClientCommand(_a0 context.Context, _a1 *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for PushClientCommand")
+	}
+
+	var r0 *milvuspb.PushClientCommandResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.PushClientCommandRequest) *milvuspb.PushClientCommandResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*milvuspb.PushClientCommandResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.PushClientCommandRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_PushClientCommand_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'PushClientCommand'
+type MockRootCoord_PushClientCommand_Call struct {
+	*mock.Call
+}
+
+// PushClientCommand is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.PushClientCommandRequest
+func (_e *MockRootCoord_Expecter) PushClientCommand(_a0 interface{}, _a1 interface{}) *MockRootCoord_PushClientCommand_Call {
+	return &MockRootCoord_PushClientCommand_Call{Call: _e.mock.On("PushClientCommand", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_PushClientCommand_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.PushClientCommandRequest)) *MockRootCoord_PushClientCommand_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.PushClientCommandRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_PushClientCommand_Call) Return(_a0 *milvuspb.PushClientCommandResponse, _a1 error) *MockRootCoord_PushClientCommand_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_PushClientCommand_Call) RunAndReturn(run func(context.Context, *milvuspb.PushClientCommandRequest) (*milvuspb.PushClientCommandResponse, error)) *MockRootCoord_PushClientCommand_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // Register provides a mock function with no fields
 func (_m *MockRootCoord) Register() error {
 	ret := _m.Called()
@@ -2777,6 +3426,65 @@ func (_c *MockRootCoord_Register_Call) Return(_a0 error) *MockRootCoord_Register
 }
 
 func (_c *MockRootCoord_Register_Call) RunAndReturn(run func() error) *MockRootCoord_Register_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// RemoveFileResource provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) RemoveFileResource(_a0 context.Context, _a1 *milvuspb.RemoveFileResourceRequest) (*commonpb.Status, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for RemoveFileResource")
+	}
+
+	var r0 *commonpb.Status
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.RemoveFileResourceRequest) (*commonpb.Status, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.RemoveFileResourceRequest) *commonpb.Status); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*commonpb.Status)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.RemoveFileResourceRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_RemoveFileResource_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'RemoveFileResource'
+type MockRootCoord_RemoveFileResource_Call struct {
+	*mock.Call
+}
+
+// RemoveFileResource is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.RemoveFileResourceRequest
+func (_e *MockRootCoord_Expecter) RemoveFileResource(_a0 interface{}, _a1 interface{}) *MockRootCoord_RemoveFileResource_Call {
+	return &MockRootCoord_RemoveFileResource_Call{Call: _e.mock.On("RemoveFileResource", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_RemoveFileResource_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.RemoveFileResourceRequest)) *MockRootCoord_RemoveFileResource_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.RemoveFileResourceRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_RemoveFileResource_Call) Return(_a0 *commonpb.Status, _a1 error) *MockRootCoord_RemoveFileResource_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_RemoveFileResource_Call) RunAndReturn(run func(context.Context, *milvuspb.RemoveFileResourceRequest) (*commonpb.Status, error)) *MockRootCoord_RemoveFileResource_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -3694,6 +4402,65 @@ func (_c *MockRootCoord_Stop_Call) Return(_a0 error) *MockRootCoord_Stop_Call {
 }
 
 func (_c *MockRootCoord_Stop_Call) RunAndReturn(run func() error) *MockRootCoord_Stop_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// TruncateCollection provides a mock function with given fields: _a0, _a1
+func (_m *MockRootCoord) TruncateCollection(_a0 context.Context, _a1 *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error) {
+	ret := _m.Called(_a0, _a1)
+
+	if len(ret) == 0 {
+		panic("no return value specified for TruncateCollection")
+	}
+
+	var r0 *milvuspb.TruncateCollectionResponse
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *milvuspb.TruncateCollectionRequest) *milvuspb.TruncateCollectionResponse); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*milvuspb.TruncateCollectionResponse)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *milvuspb.TruncateCollectionRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRootCoord_TruncateCollection_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'TruncateCollection'
+type MockRootCoord_TruncateCollection_Call struct {
+	*mock.Call
+}
+
+// TruncateCollection is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *milvuspb.TruncateCollectionRequest
+func (_e *MockRootCoord_Expecter) TruncateCollection(_a0 interface{}, _a1 interface{}) *MockRootCoord_TruncateCollection_Call {
+	return &MockRootCoord_TruncateCollection_Call{Call: _e.mock.On("TruncateCollection", _a0, _a1)}
+}
+
+func (_c *MockRootCoord_TruncateCollection_Call) Run(run func(_a0 context.Context, _a1 *milvuspb.TruncateCollectionRequest)) *MockRootCoord_TruncateCollection_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*milvuspb.TruncateCollectionRequest))
+	})
+	return _c
+}
+
+func (_c *MockRootCoord_TruncateCollection_Call) Return(_a0 *milvuspb.TruncateCollectionResponse, _a1 error) *MockRootCoord_TruncateCollection_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRootCoord_TruncateCollection_Call) RunAndReturn(run func(context.Context, *milvuspb.TruncateCollectionRequest) (*milvuspb.TruncateCollectionResponse, error)) *MockRootCoord_TruncateCollection_Call {
 	_c.Call.Return(run)
 	return _c
 }

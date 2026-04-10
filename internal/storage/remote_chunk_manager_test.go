@@ -18,12 +18,22 @@ package storage
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"path"
+	"syscall"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/cockroachdb/errors"
+	"github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/api/googleapi"
 
 	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -518,6 +528,139 @@ func TestMinioChunkManager(t *testing.T) {
 		assert.Error(t, err)
 		assert.True(t, errors.Is(err, merr.ErrIoKeyNotFound))
 	})
+
+	t.Run("test Copy", func(t *testing.T) {
+		testCopyRoot := path.Join(testMinIOKVRoot, "test_copy")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		testCM, err := newMinioChunkManager(ctx, testBucket, testCopyRoot)
+		require.NoError(t, err)
+		defer testCM.RemoveWithPrefix(ctx, testCopyRoot)
+
+		// Test successful copy
+		t.Run("copy file successfully", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src", "file1")
+			dstKey := path.Join(testCopyRoot, "dst", "file1")
+			value := []byte("test data for copy")
+
+			// Write source file
+			err := testCM.Write(ctx, srcKey, value)
+			require.NoError(t, err)
+
+			// Copy file
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination file exists and has correct content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, value, dstData)
+
+			// Verify source file still exists
+			srcData, err := testCM.Read(ctx, srcKey)
+			assert.NoError(t, err)
+			assert.Equal(t, value, srcData)
+		})
+
+		// Test copy with non-existent source
+		t.Run("copy non-existent source file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "not_exist", "file")
+			dstKey := path.Join(testCopyRoot, "dst", "file")
+
+			err := testCM.Copy(ctx, srcKey, dstKey)
+			assert.Error(t, err)
+		})
+
+		// Test copy overwrite existing file
+		t.Run("copy and overwrite existing file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src3", "file3")
+			dstKey := path.Join(testCopyRoot, "dst3", "file3")
+			srcValue := []byte("new content")
+			oldValue := []byte("old content")
+
+			// Create destination with old content
+			err := testCM.Write(ctx, dstKey, oldValue)
+			require.NoError(t, err)
+
+			// Create source with new content
+			err = testCM.Write(ctx, srcKey, srcValue)
+			require.NoError(t, err)
+
+			// Copy (should overwrite)
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination has new content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, srcValue, dstData)
+		})
+
+		// Test copy large file
+		t.Run("copy large file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src4", "large_file")
+			dstKey := path.Join(testCopyRoot, "dst4", "large_file")
+
+			// Create 5MB file
+			largeData := make([]byte, 5*1024*1024)
+			for i := range largeData {
+				largeData[i] = byte(i % 256)
+			}
+
+			err := testCM.Write(ctx, srcKey, largeData)
+			require.NoError(t, err)
+
+			// Copy large file
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, largeData, dstData)
+		})
+
+		// Test copy empty file
+		t.Run("copy empty file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src5", "empty_file")
+			dstKey := path.Join(testCopyRoot, "dst5", "empty_file")
+			emptyData := []byte{}
+
+			// Write empty file
+			err := testCM.Write(ctx, srcKey, emptyData)
+			require.NoError(t, err)
+
+			// Copy empty file
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination exists and has size 0
+			size, err := testCM.Size(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, int64(0), size)
+		})
+
+		// Test copy with nested path
+		t.Run("copy file with nested path", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src6", "file6")
+			dstKey := path.Join(testCopyRoot, "dst6", "nested", "deep", "path", "file6")
+			value := []byte("test data for nested path copy")
+
+			// Write source file
+			err := testCM.Write(ctx, srcKey, value)
+			require.NoError(t, err)
+
+			// Copy to nested path
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination file exists and has correct content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, value, dstData)
+		})
+	})
 }
 
 func TestAzureChunkManager(t *testing.T) {
@@ -971,5 +1114,400 @@ func TestAzureChunkManager(t *testing.T) {
 		_, err = testCM.ReadAt(ctx, key, 100, 1)
 		assert.Error(t, err)
 		assert.True(t, errors.Is(err, merr.ErrIoKeyNotFound))
+	})
+
+	t.Run("test Copy", func(t *testing.T) {
+		testCopyRoot := path.Join(testMinIOKVRoot, "test_copy_azure")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		testCM, err := newAzureChunkManager(ctx, testBucket, testCopyRoot)
+		require.NoError(t, err)
+		defer testCM.RemoveWithPrefix(ctx, testCopyRoot)
+
+		// Test successful copy
+		t.Run("copy file successfully", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src", "file1")
+			dstKey := path.Join(testCopyRoot, "dst", "file1")
+			value := []byte("test data for azure copy")
+
+			// Write source file
+			err := testCM.Write(ctx, srcKey, value)
+			require.NoError(t, err)
+
+			// Copy file
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination file exists and has correct content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, value, dstData)
+
+			// Verify source file still exists
+			srcData, err := testCM.Read(ctx, srcKey)
+			assert.NoError(t, err)
+			assert.Equal(t, value, srcData)
+		})
+
+		// Test copy with non-existent source
+		t.Run("copy non-existent source file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "not_exist", "file")
+			dstKey := path.Join(testCopyRoot, "dst", "file")
+
+			err := testCM.Copy(ctx, srcKey, dstKey)
+			assert.Error(t, err)
+		})
+
+		// Test copy overwrite existing file
+		t.Run("copy and overwrite existing file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src3", "file3")
+			dstKey := path.Join(testCopyRoot, "dst3", "file3")
+			srcValue := []byte("new azure content")
+			oldValue := []byte("old azure content")
+
+			// Create destination with old content
+			err := testCM.Write(ctx, dstKey, oldValue)
+			require.NoError(t, err)
+
+			// Create source with new content
+			err = testCM.Write(ctx, srcKey, srcValue)
+			require.NoError(t, err)
+
+			// Copy (should overwrite)
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination has new content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, srcValue, dstData)
+		})
+
+		// Test copy large file
+		t.Run("copy large file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src4", "large_file")
+			dstKey := path.Join(testCopyRoot, "dst4", "large_file")
+
+			// Create 5MB file
+			largeData := make([]byte, 5*1024*1024)
+			for i := range largeData {
+				largeData[i] = byte(i % 256)
+			}
+
+			err := testCM.Write(ctx, srcKey, largeData)
+			require.NoError(t, err)
+
+			// Copy large file
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, largeData, dstData)
+		})
+
+		// Test copy empty file
+		t.Run("copy empty file", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src5", "empty_file")
+			dstKey := path.Join(testCopyRoot, "dst5", "empty_file")
+			emptyData := []byte{}
+
+			// Write empty file
+			err := testCM.Write(ctx, srcKey, emptyData)
+			require.NoError(t, err)
+
+			// Copy empty file
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination exists and has size 0
+			size, err := testCM.Size(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, int64(0), size)
+		})
+
+		// Test copy with nested path
+		t.Run("copy file with nested path", func(t *testing.T) {
+			srcKey := path.Join(testCopyRoot, "src6", "file6")
+			dstKey := path.Join(testCopyRoot, "dst6", "nested", "deep", "path", "file6")
+			value := []byte("test data for nested path copy")
+
+			// Write source file
+			err := testCM.Write(ctx, srcKey, value)
+			require.NoError(t, err)
+
+			// Copy to nested path
+			err = testCM.Copy(ctx, srcKey, dstKey)
+			assert.NoError(t, err)
+
+			// Verify destination file exists and has correct content
+			dstData, err := testCM.Read(ctx, dstKey)
+			assert.NoError(t, err)
+			assert.Equal(t, value, dstData)
+		})
+	})
+}
+
+func TestToMilvusIoError(t *testing.T) {
+	fileName := "test_file"
+
+	t.Run("nil error", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("io.ErrUnexpectedEOF", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, io.ErrUnexpectedEOF)
+		assert.ErrorIs(t, err, merr.ErrIoUnexpectEOF)
+	})
+
+	t.Run("syscall.ECONNRESET", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, syscall.ECONNRESET)
+		assert.ErrorIs(t, err, merr.ErrIoTooManyRequests)
+	})
+
+	t.Run("generic error", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, errors.New("some error"))
+		assert.ErrorIs(t, err, merr.ErrIoFailed)
+	})
+
+	t.Run("minio NoSuchKey", func(t *testing.T) {
+		minioErr := minio.ErrorResponse{Code: "NoSuchKey"}
+		err := ToMilvusIoError(fileName, minioErr)
+		assert.ErrorIs(t, err, merr.ErrIoKeyNotFound)
+	})
+
+	t.Run("minio SlowDown", func(t *testing.T) {
+		minioErr := minio.ErrorResponse{Code: "SlowDown"}
+		err := ToMilvusIoError(fileName, minioErr)
+		assert.ErrorIs(t, err, merr.ErrIoTooManyRequests)
+	})
+
+	t.Run("minio TooManyRequestsException", func(t *testing.T) {
+		minioErr := minio.ErrorResponse{Code: "TooManyRequestsException"}
+		err := ToMilvusIoError(fileName, minioErr)
+		assert.ErrorIs(t, err, merr.ErrIoTooManyRequests)
+	})
+
+	t.Run("minio other error", func(t *testing.T) {
+		minioErr := minio.ErrorResponse{Code: "AccessDenied"}
+		err := ToMilvusIoError(fileName, minioErr)
+		assert.ErrorIs(t, err, merr.ErrIoPermissionDenied)
+	})
+
+	t.Run("azure BlobNotFound", func(t *testing.T) {
+		azureErr := &azcore.ResponseError{ErrorCode: string(bloberror.BlobNotFound)}
+		err := ToMilvusIoError(fileName, azureErr)
+		assert.ErrorIs(t, err, merr.ErrIoKeyNotFound)
+	})
+
+	t.Run("azure ServerBusy", func(t *testing.T) {
+		azureErr := &azcore.ResponseError{ErrorCode: string(bloberror.ServerBusy)}
+		err := ToMilvusIoError(fileName, azureErr)
+		assert.ErrorIs(t, err, merr.ErrIoTooManyRequests)
+	})
+
+	t.Run("azure other error", func(t *testing.T) {
+		azureErr := &azcore.ResponseError{ErrorCode: "SomeOtherError"}
+		err := ToMilvusIoError(fileName, azureErr)
+		assert.ErrorIs(t, err, merr.ErrIoFailed)
+	})
+
+	t.Run("googleapi NotFound", func(t *testing.T) {
+		googleErr := &googleapi.Error{Code: http.StatusNotFound}
+		err := ToMilvusIoError(fileName, googleErr)
+		assert.ErrorIs(t, err, merr.ErrIoKeyNotFound)
+	})
+
+	t.Run("googleapi TooManyRequests", func(t *testing.T) {
+		googleErr := &googleapi.Error{Code: http.StatusTooManyRequests}
+		err := ToMilvusIoError(fileName, googleErr)
+		assert.ErrorIs(t, err, merr.ErrIoTooManyRequests)
+	})
+
+	t.Run("googleapi permission denied", func(t *testing.T) {
+		googleErr := &googleapi.Error{Code: http.StatusForbidden}
+		err := ToMilvusIoError(fileName, googleErr)
+		assert.ErrorIs(t, err, merr.ErrIoPermissionDenied)
+	})
+
+	// Test cases for passing merr.ErrIo* errors directly
+	// These should be returned as-is without re-wrapping
+	t.Run("direct merr.ErrIoKeyNotFound", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, merr.ErrIoKeyNotFound)
+		assert.ErrorIs(t, err, merr.ErrIoKeyNotFound)
+		// assert.Same() removed: merr errors are struct values, not pointers
+		// ErrorIs() is sufficient to verify no unwanted wrapping occurred
+	})
+
+	t.Run("direct merr.ErrIoPermissionDenied", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, merr.ErrIoPermissionDenied)
+		assert.ErrorIs(t, err, merr.ErrIoPermissionDenied)
+	})
+
+	t.Run("direct merr.ErrIoBucketNotFound", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, merr.ErrIoBucketNotFound)
+		assert.ErrorIs(t, err, merr.ErrIoBucketNotFound)
+	})
+
+	t.Run("direct merr.ErrIoInvalidArgument", func(t *testing.T) {
+		err := ToMilvusIoError(fileName, merr.ErrIoInvalidArgument)
+		assert.ErrorIs(t, err, merr.ErrIoInvalidArgument)
+	})
+
+	t.Run("wrapped merr.ErrIoKeyNotFound", func(t *testing.T) {
+		wrappedErr := fmt.Errorf("failed to read: %w", merr.ErrIoKeyNotFound)
+		err := ToMilvusIoError(fileName, wrappedErr)
+		assert.ErrorIs(t, err, merr.ErrIoKeyNotFound)
+		// Verify the error is returned without additional wrapping
+		assert.Equal(t, wrappedErr, err, "should return wrapped error as-is")
+	})
+}
+
+func tlsVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	default:
+		return "unknown"
+	}
+}
+
+// TestRemoteChunkManagerTLSVersion tests TLS version configuration via NewRemoteChunkManager.
+// Works for any cloud provider. Auth: ACCESS_KEY+SECRET_KEY, or USE_IAM=true.
+//
+// ACCESS_KEY+SECRET_KEY require:
+//   - ADDRESS, BUCKET_NAME, CLOUD_PROVIDER, ACCESS_KEY, SECRET_KEY.
+//
+// USE_IAM require:
+//   - ADDRESS, BUCKET_NAME, CLOUD_PROVIDER, USE_IAM=true.
+//
+// CLOUD_PROVIDER: aws, gcp (S3 compatibility mode), gcpnative, or azure.
+func TestRemoteChunkManagerTLSVersion(t *testing.T) {
+	address := os.Getenv("ADDRESS")
+	accessKey := os.Getenv("ACCESS_KEY")
+	secretKey := os.Getenv("SECRET_KEY")
+	bucketName := os.Getenv("BUCKET_NAME")
+	cloudProvider := os.Getenv("CLOUD_PROVIDER")
+	useIAM := os.Getenv("USE_IAM") == "true"
+
+	if bucketName == "" || cloudProvider == "" {
+		t.Skip("Skipping: set BUCKET_NAME, CLOUD_PROVIDER env vars to run this test")
+	}
+	hasAKSK := accessKey != "" && secretKey != ""
+	if !hasAKSK && !useIAM {
+		t.Skip("Skipping: set ACCESS_KEY+SECRET_KEY or USE_IAM=true to run this test")
+	}
+
+	// Determine the TLS host for probing
+	tlsHost := address
+	if cloudProvider == "azure" {
+		tlsHost = accessKey + ".blob." + address
+	}
+	if cloudProvider == "gcpnative" && tlsHost == "" {
+		tlsHost = "storage.googleapis.com"
+	}
+
+	newConfig := func(tlsMinVersion string) *objectstorage.Config {
+		return &objectstorage.Config{
+			Address:           address,
+			AccessKeyID:       accessKey,
+			SecretAccessKeyID: secretKey,
+			BucketName:        bucketName,
+			UseSSL:            true,
+			SslTLSMinVersion:  tlsMinVersion,
+			CloudProvider:     cloudProvider,
+			UseIAM:            useIAM,
+			CreateBucket:      true,
+		}
+	}
+
+	ctx := context.Background()
+
+	t.Run("check_server_tls_support", func(t *testing.T) {
+		if tlsHost == "" {
+			t.Skip("Skipping: ADDRESS not set, cannot probe TLS")
+		}
+		for _, ver := range []struct {
+			name string
+			ver  uint16
+		}{
+			{"TLS 1.2", tls.VersionTLS12},
+			{"TLS 1.3", tls.VersionTLS13},
+		} {
+			conn, err := tls.Dial("tcp", tlsHost+":443", &tls.Config{
+				MinVersion: ver.ver,
+				MaxVersion: ver.ver,
+			})
+			if err != nil {
+				t.Logf("%s -> %s: NOT supported (%v)", tlsHost, ver.name, err)
+			} else {
+				state := conn.ConnectionState()
+				t.Logf("%s -> %s: supported (negotiated: %s)", tlsHost, ver.name, tlsVersionName(state.Version))
+				conn.Close()
+			}
+		}
+	})
+
+	t.Run("tls12", func(t *testing.T) {
+		cm, err := NewRemoteChunkManager(ctx, newConfig("1.2"))
+		require.NoError(t, err, "NewRemoteChunkManager with TLS 1.2 should succeed")
+		require.NotNil(t, cm)
+
+		// Write and read back to verify the connection works end-to-end
+		key := path.Join("tls-test", "tls12-test-key")
+		value := []byte("tls12-test-value")
+		err = cm.Write(ctx, key, value)
+		require.NoError(t, err, "Write should succeed over TLS 1.2")
+
+		got, err := cm.Read(ctx, key)
+		require.NoError(t, err, "Read should succeed over TLS 1.2")
+		assert.Equal(t, value, got)
+
+		_ = cm.Remove(ctx, key)
+		t.Logf("NewRemoteChunkManager(SslTLSMinVersion=1.2, CloudProvider=%s): Write/Read OK", cloudProvider)
+	})
+
+	t.Run("tls13", func(t *testing.T) {
+		if tlsHost != "" {
+			conn, err := tls.Dial("tcp", tlsHost+":443", &tls.Config{
+				MinVersion: tls.VersionTLS13,
+			})
+			if err != nil {
+				t.Skipf("Skipping: %s does not support TLS 1.3 (%v)", tlsHost, err)
+			}
+			conn.Close()
+		}
+
+		cm, err := NewRemoteChunkManager(ctx, newConfig("1.3"))
+		require.NoError(t, err, "NewRemoteChunkManager with TLS 1.3 should succeed")
+		require.NotNil(t, cm)
+
+		key := path.Join("tls-test", "tls13-test-key")
+		value := []byte("tls13-test-value")
+		err = cm.Write(ctx, key, value)
+		require.NoError(t, err, "Write should succeed over TLS 1.3")
+
+		got, err := cm.Read(ctx, key)
+		require.NoError(t, err, "Read should succeed over TLS 1.3")
+		assert.Equal(t, value, got)
+
+		_ = cm.Remove(ctx, key)
+		t.Logf("NewRemoteChunkManager(SslTLSMinVersion=1.3, CloudProvider=%s): Write/Read OK", cloudProvider)
+	})
+
+	t.Run("no_tls_version_set", func(t *testing.T) {
+		cm, err := NewRemoteChunkManager(ctx, newConfig(""))
+		require.NoError(t, err, "NewRemoteChunkManager without TLS version should succeed")
+		require.NotNil(t, cm)
+		t.Logf("NewRemoteChunkManager(SslTLSMinVersion=<empty>, CloudProvider=%s): OK (default)", cloudProvider)
 	})
 }

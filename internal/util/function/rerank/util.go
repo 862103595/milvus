@@ -24,6 +24,8 @@ import (
 	"sort"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -57,6 +59,9 @@ type rerankInputs struct {
 
 	// There is only fieldId in schemapb.SearchResultData, but no fieldName
 	inputFieldIds []int64
+
+	// idxComputers for computing correct field indices for nullable vectors
+	idxComputers []*typeutil.FieldDataIdxComputer
 }
 
 func organizeFieldIdData(multipSearchResultData []*schemapb.SearchResultData, inputFieldIds []int64) ([]map[int64]*schemapb.FieldData, error) {
@@ -119,14 +124,21 @@ func newRerankInputs(multipSearchResultData []*schemapb.SearchResultData, inputF
 			start += size
 		}
 	}
+	idxComputers := make([]*typeutil.FieldDataIdxComputer, len(multipSearchResultData))
+	for i, srd := range multipSearchResultData {
+		if srd != nil {
+			idxComputers[i] = typeutil.NewFieldDataIdxComputer(srd.GetFieldsData())
+		}
+	}
+
 	if isGrouping {
 		idGroup, err := genIdGroupingMap(multipSearchResultData)
 		if err != nil {
 			return nil, err
 		}
-		return &rerankInputs{cols, idGroup, nq, multipSearchResultData, inputFieldIds}, nil
+		return &rerankInputs{cols, idGroup, nq, multipSearchResultData, inputFieldIds, idxComputers}, nil
 	}
-	return &rerankInputs{cols, nil, nq, multipSearchResultData, inputFieldIds}, nil
+	return &rerankInputs{cols, nil, nq, multipSearchResultData, inputFieldIds, idxComputers}, nil
 }
 
 func (inputs *rerankInputs) numOfQueries() int64 {
@@ -139,9 +151,6 @@ type rerankOutputs struct {
 
 func newRerankOutputs(inputs *rerankInputs, searchParams *SearchParams) *rerankOutputs {
 	topk := searchParams.limit
-	if searchParams.isGrouping() {
-		topk = topk * searchParams.groupSize
-	}
 	ret := &schemapb.SearchResultData{
 		NumQueries: searchParams.nq,
 		TopK:       topk,
@@ -168,7 +177,13 @@ func appendResult[T PKType](inputs *rerankInputs, outputs *rerankOutputs, idScor
 	if len(inputs.fieldData) > 0 && len(outputs.searchResultData.FieldsData) > 0 {
 		for idx := range ids {
 			loc := idScores.locations[idx]
-			typeutil.AppendFieldData(outputs.searchResultData.FieldsData, inputs.fieldData[loc.batchIdx].GetFieldsData(), int64(loc.offset))
+			fieldsData := inputs.fieldData[loc.batchIdx].GetFieldsData()
+			rowIdx := int64(loc.offset)
+			var fieldIdxs []int64
+			if inputs.idxComputers[loc.batchIdx] != nil {
+				fieldIdxs = inputs.idxComputers[loc.batchIdx].Compute(rowIdx)
+			}
+			typeutil.AppendFieldData(outputs.searchResultData.FieldsData, fieldsData, rowIdx, fieldIdxs...)
 		}
 	}
 	switch any(ids).(type) {
@@ -335,12 +350,17 @@ func newGroupingIDScores[T PKType](idScores map[T]float32, idLocations map[T]IDL
 	}
 
 	ret := IDScores[T]{
-		make([]T, 0, searchParams.limit),
-		make([]float32, 0, searchParams.limit),
+		make([]T, 0, searchParams.limit*searchParams.groupSize),
+		make([]float32, 0, searchParams.limit*searchParams.groupSize),
 		0,
-		make([]IDLoc, 0, searchParams.limit),
+		make([]IDLoc, 0, searchParams.limit*searchParams.groupSize),
 	}
-	for index := int(searchParams.offset); index < len(groupList); index++ {
+	// Explicitly calculate end index to ensure we output exactly limit groups
+	endIndex := int(searchParams.offset + searchParams.limit)
+	if endIndex > len(groupList) {
+		endIndex = len(groupList)
+	}
+	for index := int(searchParams.offset); index < endIndex; index++ {
 		group := groupList[index]
 		for i, score := range group.scoreList {
 			// idList and scoreList must have same length
@@ -354,6 +374,17 @@ func newGroupingIDScores[T PKType](idScores map[T]float32, idLocations map[T]IDL
 		}
 	}
 	ret.size = int64(len(ret.ids))
+	if log.GetLevel() <= zap.DebugLevel {
+		log.Debug("newGroupingIDScores",
+			zap.Int("inputIDs", len(idScores)),
+			zap.Int("totalGroups", len(buckets)),
+			zap.Int("groupsAfterTrunc", endIndex-int(searchParams.offset)),
+			zap.Int64("limit", searchParams.limit),
+			zap.Int64("offset", searchParams.offset),
+			zap.Int64("groupSize", searchParams.groupSize),
+			zap.Int64("outputIDs", ret.size),
+		)
+	}
 	return &ret, nil
 }
 

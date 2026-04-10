@@ -16,9 +16,14 @@
 
 #pragma once
 
+#include <cstdint>
+#include <sstream>
 #include <string>
 
+#include "common/EasyAssert.h"
 #include "common/Types.h"
+#include "fmt/core.h"
+#include "pb/schema.pb.h"
 
 namespace milvus::storage {
 
@@ -104,6 +109,9 @@ struct StorageConfig {
     int64_t requestTimeoutMs = 3000;
     bool gcp_native_without_auth = false;
     std::string gcp_credential_json = "";
+    uint32_t max_connections = 100;
+    std::string tls_min_version = "";
+    bool use_crc32c_checksum = false;
 
     std::string
     ToString() const {
@@ -117,8 +125,11 @@ struct StorageConfig {
            << ", useIAM=" << std::boolalpha << useIAM
            << ", useVirtualHost=" << std::boolalpha << useVirtualHost
            << ", requestTimeoutMs=" << requestTimeoutMs
+           << ", maxConnections=" << max_connections
            << ", gcp_native_without_auth=" << std::boolalpha
-           << gcp_native_without_auth << "]";
+           << gcp_native_without_auth << ", tls_min_version=" << tls_min_version
+           << ", use_crc32c_checksum=" << std::boolalpha << use_crc32c_checksum
+           << "]";
 
         return ss.str();
     }
@@ -134,6 +145,7 @@ struct MmapConfig {
     bool scalar_field_enable_mmap;
     bool vector_index_enable_mmap;
     bool vector_field_enable_mmap;
+    bool mmap_populate;
     bool
     GetEnableGrowingMmap() const {
         return growing_enable_mmap;
@@ -173,6 +185,10 @@ struct MmapConfig {
     void
     SetVectorFieldEnableMmap(bool flag) {
         this->vector_field_enable_mmap = flag;
+    }
+    [[nodiscard]] bool
+    GetMmapPopulate() const {
+        return mmap_populate;
     }
 
     std::string

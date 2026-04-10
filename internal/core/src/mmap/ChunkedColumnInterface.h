@@ -17,6 +17,7 @@
 
 #include "cachinglayer/CacheSlot.h"
 #include "common/Chunk.h"
+#include "common/OffsetMapping.h"
 #include "common/bson_view.h"
 namespace milvus {
 
@@ -26,9 +27,22 @@ class ChunkedColumnInterface {
  public:
     virtual ~ChunkedColumnInterface() = default;
 
+    // Check if this column is part of a multi-field column group.
+    // Used to guard DropFieldData from breaking shared storage.
+    virtual bool
+    IsInMultiFieldColumnGroup() const {
+        return false;
+    }
+
     // Default implementation does nothing.
     virtual void
     ManualEvictCache() const {
+    }
+
+    // Cancel any pending async warmup for this column's cache slot.
+    // Default implementation does nothing.
+    virtual void
+    CancelWarmup() {
     }
 
     // Get raw data pointer of a specific chunk
@@ -131,6 +145,41 @@ class ChunkedColumnInterface {
     virtual const std::vector<int64_t>&
     GetNumRowsUntilChunk() const = 0;
 
+    // Get vector of valid (non-null) row counts before each chunk
+    // For nullable columns, this tracks cumulative physical offsets
+    // For non-nullable columns, this equals GetNumRowsUntilChunk()
+    virtual const std::vector<int64_t>&
+    GetNumValidRowsUntilChunk() const = 0;
+
+    const FixedVector<bool>&
+    GetValidData() const {
+        return valid_data_;
+    }
+
+    const std::vector<int64_t>&
+    GetValidCountPerChunk() const {
+        return valid_count_per_chunk_;
+    }
+
+    const OffsetMapping&
+    GetOffsetMapping() const {
+        return offset_mapping_;
+    }
+
+    virtual void
+    BuildValidRowIds(milvus::OpContext* op_ctx) {
+        ThrowInfo(ErrorCode::Unsupported,
+                  "BuildValidRowIds not supported for this column type");
+    }
+
+    // Build offset mapping from valid_data
+    void
+    BuildOffsetMapping() {
+        if (!valid_data_.empty()) {
+            offset_mapping_.Build(valid_data_.data(), valid_data_.size());
+        }
+    }
+
     virtual void
     BulkValueAt(milvus::OpContext* op_ctx,
                 std::function<void(const char*, size_t)> fn,
@@ -141,7 +190,8 @@ class ChunkedColumnInterface {
     BulkPrimitiveValueAt(milvus::OpContext* op_ctx,
                          void* dst,
                          const int64_t* offsets,
-                         int64_t count) = 0;
+                         int64_t count,
+                         bool small_int_raw_type = false) = 0;
 
     virtual void
     BulkVectorValueAt(milvus::OpContext* op_ctx,
@@ -187,7 +237,7 @@ class ChunkedColumnInterface {
 
     virtual void
     BulkArrayAt(milvus::OpContext* op_ctx,
-                std::function<void(ScalarFieldProto&&, size_t)> fn,
+                std::function<void(const ArrayView&, size_t)> fn,
                 const int64_t* offsets,
                 int64_t count) const {
         ThrowInfo(ErrorCode::Unsupported,
@@ -237,6 +287,11 @@ class ChunkedColumnInterface {
     }
 
  protected:
+    FixedVector<bool> valid_data_;
+    std::vector<int64_t> valid_count_per_chunk_;
+    std::vector<int64_t> num_valid_rows_until_chunk_;
+    OffsetMapping offset_mapping_;
+
     std::pair<std::vector<milvus::cachinglayer::cid_t>, std::vector<int64_t>>
     ToChunkIdAndOffset(const int64_t* offsets, int64_t count) const {
         AssertInfo(offsets != nullptr, "Offsets cannot be nullptr");
@@ -264,6 +319,35 @@ class ChunkedColumnInterface {
         for (int64_t i = 0; i < count; i++) {
             auto [chunk_id, offset_in_chunk] = GetChunkIDByOffset(offsets[i]);
             cids.push_back(chunk_id);
+            offsets_in_chunk.push_back(offset_in_chunk);
+        }
+        return std::make_pair(std::move(cids), std::move(offsets_in_chunk));
+    }
+
+    std::pair<std::vector<milvus::cachinglayer::cid_t>, std::vector<int64_t>>
+    ToChunkIdAndOffsetByPhysical(const int64_t* physical_offsets,
+                                 int64_t count) const {
+        AssertInfo(physical_offsets != nullptr,
+                   "Physical offsets cannot be nullptr");
+        const auto& num_valid_rows_until_chunk = GetNumValidRowsUntilChunk();
+        std::vector<milvus::cachinglayer::cid_t> cids;
+        cids.reserve(count);
+        std::vector<int64_t> offsets_in_chunk;
+        offsets_in_chunk.reserve(count);
+
+        for (int64_t i = 0; i < count; i++) {
+            auto offset = physical_offsets[i];
+            auto iter = std::upper_bound(num_valid_rows_until_chunk.begin(),
+                                         num_valid_rows_until_chunk.end(),
+                                         offset);
+            AssertInfo(iter != num_valid_rows_until_chunk.begin(),
+                       "Physical offset {} is invalid",
+                       offset);
+            size_t chunk_idx =
+                std::distance(num_valid_rows_until_chunk.begin(), iter) - 1;
+            int64_t offset_in_chunk =
+                offset - num_valid_rows_until_chunk[chunk_idx];
+            cids.push_back(chunk_idx);
             offsets_in_chunk.push_back(offset_in_chunk);
         }
         return std::make_pair(std::move(cids), std::move(offsets_in_chunk));

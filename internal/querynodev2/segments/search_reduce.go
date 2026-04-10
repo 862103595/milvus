@@ -36,32 +36,61 @@ func (scr *SearchCommonReduce) ReduceSearchResultData(ctx context.Context, searc
 			Topks:      make([]int64, 0),
 		}, nil
 	}
+	nq := info.GetNq()
+	topk := info.GetTopK()
 	ret := &schemapb.SearchResultData{
-		NumQueries: info.GetNq(),
-		TopK:       info.GetTopK(),
+		NumQueries: nq,
+		TopK:       topk,
 		FieldsData: make([]*schemapb.FieldData, len(searchResultData[0].FieldsData)),
-		Scores:     make([]float32, 0),
+		Scores:     make([]float32, 0, nq*topk),
 		Ids:        &schemapb.IDs{},
-		Topks:      make([]int64, 0),
+		Topks:      make([]int64, 0, nq),
+	}
+
+	// Check element-level consistency: all results must have ElementIndices or none
+	hasElementIndices := searchResultData[0].ElementIndices != nil
+	for i, data := range searchResultData {
+		if (data.ElementIndices != nil) != hasElementIndices {
+			return nil, fmt.Errorf("inconsistent element-level flag in search results: result[0] has ElementIndices=%v, but result[%d] has ElementIndices=%v",
+				hasElementIndices, i, data.ElementIndices != nil)
+		}
+	}
+	if hasElementIndices {
+		ret.ElementIndices = &schemapb.LongArray{
+			Data: make([]int64, 0),
+		}
 	}
 
 	resultOffsets := make([][]int64, len(searchResultData))
+	totalOffsetElements := 0
+	for i := range searchResultData {
+		totalOffsetElements += len(searchResultData[i].Topks)
+	}
+	offsetBacking := make([]int64, totalOffsetElements)
 	for i := 0; i < len(searchResultData); i++ {
-		resultOffsets[i] = make([]int64, len(searchResultData[i].Topks))
-		for j := int64(1); j < info.GetNq(); j++ {
+		n := len(searchResultData[i].Topks)
+		resultOffsets[i] = offsetBacking[:n:n]
+		offsetBacking = offsetBacking[n:]
+		for j := int64(1); j < nq; j++ {
 			resultOffsets[i][j] = resultOffsets[i][j-1] + searchResultData[i].Topks[j-1]
 		}
 		ret.AllSearchCount += searchResultData[i].GetAllSearchCount()
 	}
 
+	idxComputers := make([]*typeutil.FieldDataIdxComputer, len(searchResultData))
+	for i, srd := range searchResultData {
+		idxComputers[i] = typeutil.NewFieldDataIdxComputer(srd.FieldsData)
+	}
+
+	numResults := len(searchResultData)
 	var skipDupCnt int64
 	var retSize int64
 	maxOutputSize := paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()
-	for i := int64(0); i < info.GetNq(); i++ {
-		offsets := make([]int64, len(searchResultData))
+	for i := int64(0); i < nq; i++ {
+		offsets := make([]int64, numResults)
 		idSet := make(map[interface{}]struct{})
 		var j int64
-		for j = 0; j < info.GetTopK(); {
+		for j = 0; j < topk; {
 			sel := SelectSearchResultData(searchResultData, resultOffsets, offsets, i)
 			if sel == -1 {
 				break
@@ -73,9 +102,14 @@ func (scr *SearchCommonReduce) ReduceSearchResultData(ctx context.Context, searc
 
 			// remove duplicates
 			if _, ok := idSet[id]; !ok {
-				retSize += typeutil.AppendFieldData(ret.FieldsData, searchResultData[sel].FieldsData, idx)
+				fieldsData := searchResultData[sel].FieldsData
+				fieldIdxs := idxComputers[sel].Compute(idx)
+				retSize += typeutil.AppendFieldData(ret.FieldsData, fieldsData, idx, fieldIdxs...)
 				typeutil.AppendPKs(ret.Ids, id)
 				ret.Scores = append(ret.Scores, score)
+				if searchResultData[sel].ElementIndices != nil && ret.ElementIndices != nil {
+					ret.ElementIndices.Data = append(ret.ElementIndices.Data, searchResultData[sel].ElementIndices.Data[idx])
+				}
 				idSet[id] = struct{}{}
 				j++
 			} else {
@@ -118,20 +152,43 @@ func (sbr *SearchGroupByReduce) ReduceSearchResultData(ctx context.Context, sear
 			Topks:      make([]int64, 0),
 		}, nil
 	}
+	nq := info.GetNq()
+	topk := info.GetTopK()
 	ret := &schemapb.SearchResultData{
-		NumQueries: info.GetNq(),
-		TopK:       info.GetTopK(),
+		NumQueries: nq,
+		TopK:       topk,
 		FieldsData: make([]*schemapb.FieldData, len(searchResultData[0].FieldsData)),
-		Scores:     make([]float32, 0),
+		Scores:     make([]float32, 0, nq*topk),
 		Ids:        &schemapb.IDs{},
-		Topks:      make([]int64, 0),
+		Topks:      make([]int64, 0, nq),
+	}
+
+	// Check element-level consistency: all results must have ElementIndices or none
+	hasElementIndices := searchResultData[0].ElementIndices != nil
+	for i, data := range searchResultData {
+		if (data.ElementIndices != nil) != hasElementIndices {
+			return nil, fmt.Errorf("inconsistent element-level flag in search results: result[0] has ElementIndices=%v, but result[%d] has ElementIndices=%v",
+				hasElementIndices, i, data.ElementIndices != nil)
+		}
+	}
+	if hasElementIndices {
+		ret.ElementIndices = &schemapb.LongArray{
+			Data: make([]int64, 0),
+		}
 	}
 
 	resultOffsets := make([][]int64, len(searchResultData))
+	totalOffsetElements := 0
+	for i := range searchResultData {
+		totalOffsetElements += len(searchResultData[i].Topks)
+	}
+	offsetBacking := make([]int64, totalOffsetElements)
 	groupByValIterator := make([]func(int) any, len(searchResultData))
 	for i := range searchResultData {
-		resultOffsets[i] = make([]int64, len(searchResultData[i].Topks))
-		for j := int64(1); j < info.GetNq(); j++ {
+		n := len(searchResultData[i].Topks)
+		resultOffsets[i] = offsetBacking[:n:n]
+		offsetBacking = offsetBacking[n:]
+		for j := int64(1); j < nq; j++ {
 			resultOffsets[i][j] = resultOffsets[i][j-1] + searchResultData[i].Topks[j-1]
 		}
 		ret.AllSearchCount += searchResultData[i].GetAllSearchCount()
@@ -140,6 +197,11 @@ func (sbr *SearchGroupByReduce) ReduceSearchResultData(ctx context.Context, sear
 	gpFieldBuilder, err := typeutil.NewFieldDataBuilder(searchResultData[0].GetGroupByFieldValue().GetType(), true, int(info.GetTopK()))
 	if err != nil {
 		return ret, merr.WrapErrServiceInternal("failed to construct group by field data builder, this is abnormal as segcore should always set up a group by field, no matter data status, check code on qn", err.Error())
+	}
+
+	idxComputers := make([]*typeutil.FieldDataIdxComputer, len(searchResultData))
+	for i, srd := range searchResultData {
+		idxComputers[i] = typeutil.NewFieldDataIdxComputer(srd.FieldsData)
 	}
 
 	var filteredCount int64
@@ -177,9 +239,14 @@ func (sbr *SearchGroupByReduce) ReduceSearchResultData(ctx context.Context, sear
 					// exceed the limit for each group, filter this entity
 					filteredCount++
 				} else {
-					retSize += typeutil.AppendFieldData(ret.FieldsData, searchResultData[sel].FieldsData, idx)
+					fieldsData := searchResultData[sel].FieldsData
+					fieldIdxs := idxComputers[sel].Compute(idx)
+					retSize += typeutil.AppendFieldData(ret.FieldsData, fieldsData, idx, fieldIdxs...)
 					typeutil.AppendPKs(ret.Ids, id)
 					ret.Scores = append(ret.Scores, score)
+					if searchResultData[sel].ElementIndices != nil && ret.ElementIndices != nil {
+						ret.ElementIndices.Data = append(ret.ElementIndices.Data, searchResultData[sel].ElementIndices.Data[idx])
+					}
 					gpFieldBuilder.Add(groupByVal)
 					groupByValueMap[groupByVal] += 1
 					idSet[id] = struct{}{}

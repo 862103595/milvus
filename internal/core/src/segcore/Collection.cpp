@@ -10,12 +10,14 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <google/protobuf/text_format.h>
-
 #include <memory>
 
-#include "pb/schema.pb.h"
-#include "segcore/Collection.h"
+#include "common/EasyAssert.h"
+#include "glog/logging.h"
 #include "log/Log.h"
+#include "pb/schema.pb.h"
+#include "pb/segcore.pb.h"
+#include "segcore/Collection.h"
 
 namespace milvus::segcore {
 
@@ -60,8 +62,9 @@ Collection::parseIndexMeta(const void* index_proto, const int64_t length) {
         return;
     }
 
-    index_meta_ = std::make_shared<CollectionIndexMeta>(indexMeta);
-    LOG_INFO("index meta info: {}", index_meta_->ToString());
+    auto new_index_meta = std::make_shared<CollectionIndexMeta>(indexMeta);
+    LOG_INFO("index meta info: {}", new_index_meta->ToString());
+    set_index_meta(new_index_meta);
 }
 
 void
@@ -70,7 +73,7 @@ Collection::parse_schema(const void* schema_proto_blob,
                          const uint64_t version) {
     Assert(schema_proto_blob != nullptr);
 
-    if (version <= schema_->get_schema_version()) {
+    if (version <= get_schema_version()) {
         return;
     }
 
@@ -79,14 +82,9 @@ Collection::parse_schema(const void* schema_proto_blob,
 
     AssertInfo(suc, "parse schema proto failed");
 
-    auto old_schema = schema_;
-
-    schema_ = Schema::ParseFrom(collection_schema);
-    schema_->set_schema_version(version);
-
-    if (old_schema) {
-        schema_->UpdateLoadFields(old_schema->load_fields());
-    }
+    auto new_schema = Schema::ParseFrom(collection_schema);
+    new_schema->set_schema_version(version);
+    set_schema(new_schema);
 }
 
 }  // namespace milvus::segcore

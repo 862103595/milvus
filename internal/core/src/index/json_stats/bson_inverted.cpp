@@ -14,51 +14,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <iostream>
+#include <chrono>
 #include <string>
+#include <type_traits>
 #include <vector>
-#include <unordered_map>
-#include <tuple>
-#include <boost/filesystem.hpp>
 
-#include "common/ScopedTimer.h"
-#include "monitor/Monitor.h"
+#include "boost/filesystem/directory.hpp"
+#include "boost/filesystem/path.hpp"
+#include "boost/iterator/iterator_facade.hpp"
+#include "common/EasyAssert.h"
+#include "glog/logging.h"
+#include "index/Utils.h"
 #include "index/json_stats/bson_inverted.h"
+#include "log/Log.h"
+#include "storage/DiskFileManagerImpl.h"
+#include "storage/LocalChunkManager.h"
 #include "storage/LocalChunkManagerSingleton.h"
+#include "storage/Types.h"
+
 namespace milvus::index {
 
 BsonInvertedIndex::BsonInvertedIndex(const std::string& path,
                                      int64_t field_id,
-                                     bool is_load,
                                      const storage::FileManagerContext& ctx,
                                      int64_t tantivy_index_version)
-    : is_load_(is_load),
+    : is_load_(false),
       field_id_(field_id),
       tantivy_index_version_(tantivy_index_version) {
     disk_file_manager_ =
         std::make_shared<milvus::storage::DiskFileManagerImpl>(ctx);
-    if (is_load_) {
-        auto prefix = disk_file_manager_->GetLocalJsonStatsSharedIndexPrefix();
-        path_ = prefix;
-        LOG_INFO("bson inverted index load path:{}", path_);
-    } else {
-        path_ = path;
-        LOG_INFO("bson inverted index build path:{}", path_);
-    }
+    path_ = path;
+    LOG_INFO("bson inverted index build path:{}", path_);
+}
+
+BsonInvertedIndex::BsonInvertedIndex(
+    std::shared_ptr<milvus::storage::DiskFileManagerImpl> disk_file_manager)
+    : is_load_(true) {
+    disk_file_manager_ = disk_file_manager;
+    field_id_ = disk_file_manager->GetFieldDataMeta().field_id;
+    path_ = disk_file_manager_->GetLocalJsonStatsSharedIndexPrefix();
+    LOG_INFO("bson inverted index load path:{}", path_);
 }
 
 BsonInvertedIndex::~BsonInvertedIndex() {
     if (wrapper_) {
         wrapper_->free();
     }
-    if (!is_load_) {
-        auto local_chunk_manager =
-            milvus::storage::LocalChunkManagerSingleton::GetInstance()
-                .GetChunkManager();
-        auto prefix = path_;
-        LOG_INFO("bson inverted index remove path:{}", path_);
-        local_chunk_manager->RemoveDir(prefix);
-    }
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+    auto prefix = path_;
+    LOG_INFO("bson inverted index remove path:{}", path_);
+    local_chunk_manager->RemoveDir(prefix);
 }
 
 void
@@ -91,6 +98,9 @@ BsonInvertedIndex::BuildIndex() {
     std::vector<const char*> keys;
     std::vector<const int64_t*> json_offsets;
     std::vector<uintptr_t> json_offsets_lens;
+    keys.reserve(inverted_index_map_.size());
+    json_offsets.reserve(inverted_index_map_.size());
+    json_offsets_lens.reserve(inverted_index_map_.size());
     for (const auto& [key, offsets] : inverted_index_map_) {
         keys.push_back(key.c_str());
         json_offsets.push_back(offsets.data());
@@ -104,28 +114,28 @@ BsonInvertedIndex::BuildIndex() {
 
 void
 BsonInvertedIndex::LoadIndex(const std::vector<std::string>& index_files,
-                             milvus::proto::common::LoadPriority priority) {
+                             milvus::proto::common::LoadPriority priority,
+                             bool load_in_mmap) {
     if (is_load_) {
-        // convert shared_key_index/... to remote_prefix/shared_key_index/...
-        std::vector<std::string> remote_files;
-        for (auto& file : index_files) {
-            auto remote_prefix =
-                disk_file_manager_->GetRemoteJsonStatsLogPrefix();
-            boost::filesystem::path full_path =
-                boost::filesystem::path(remote_prefix) / file;
-            remote_files.emplace_back(full_path.string());
-        }
-        // cache shared_key_index/... to disk
-        disk_file_manager_->CacheJsonStatsSharedIndexToDisk(remote_files,
+        // index_files are absolute remote paths (basePath already prepended by caller)
+        disk_file_manager_->CacheJsonStatsSharedIndexToDisk(index_files,
                                                             priority);
         AssertInfo(tantivy_index_exist(path_.c_str()),
                    "index dir not exist: {}",
                    path_);
         wrapper_ = std::make_shared<TantivyIndexWrapper>(
-            path_.c_str(), false, milvus::index::SetBitsetUnused);
-        LOG_INFO("load json shared key index done for field id:{} with dir:{}",
-                 field_id_,
-                 path_);
+            path_.c_str(), load_in_mmap, milvus::index::SetBitsetUnused);
+        if (!load_in_mmap) {
+            // the index is loaded in ram, so we can remove files in advance
+            disk_file_manager_->RemoveJsonStatsSharedIndexFiles();
+        }
+        load_in_mmap_ = load_in_mmap;
+        LOG_INFO(
+            "load json shared key index done for field id:{} with dir:{}, "
+            "load_in_mmap:{}",
+            field_id_,
+            path_,
+            load_in_mmap);
     }
 }
 

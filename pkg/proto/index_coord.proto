@@ -60,6 +60,7 @@ message FieldIndex {
     IndexInfo index_info = 1;
     bool deleted = 2;
     uint64 create_time = 3;
+    int32 min_schema_version = 4;
 }
 
 message SegmentIndex {
@@ -79,7 +80,7 @@ message SegmentIndex {
     uint64 serialize_size = 14; // the total size of index file at oos. (may be compress)
     bool write_handoff = 15;
     int32 current_index_version = 16;
-    int64 index_store_version = 17;
+    int64 index_store_version = 17 [deprecated = true];
     uint64 finished_time = 18;
     uint64 mem_size = 19; // the total size of index file at local (disk or memory) before loading by knowhere. (not compress)
     int32 current_scalar_index_version = 20;
@@ -137,6 +138,11 @@ message CreateIndexRequest {
     bool is_auto_index = 7;
     repeated common.KeyValuePair user_index_params = 8;
     bool user_autoindex_metric_type_specified = 9;
+
+    // For snapshot restore: preserve index ID from snapshot
+    // When true, DataCoord will not allocate a new index ID, using the provided index_id directly
+    bool preserve_index_id = 10;
+    int64 index_id = 11;
 }
 
 message AlterIndexRequest {
@@ -165,6 +171,7 @@ message IndexFilePathInfo {
     int64 num_rows = 10;
     int32 current_index_version = 11;
     uint64 mem_size = 12;
+    int32 current_scalar_index_version = 13;
 }
 
 message SegmentInfo {
@@ -226,6 +233,9 @@ message StorageConfig {
     int64 request_timeout_ms = 13;
     string sslCACert = 14;
     string GcpCredentialJSON = 15;
+    uint32 max_connections = 16;
+    string ssl_tls_min_version = 17;
+    bool use_crc32c_checksum = 18;
 }
 
 // Synchronously modify OptionalFieldInfo in index_cgo_msg.proto file
@@ -322,6 +332,24 @@ message StatsTask {
     int64 target_segmentID = 10;
     index.StatsSubJob subJobType = 11;
     bool canRecycle = 12;
+    repeated internal.FileResourceInfo file_resources = 13;
+}
+
+message UpdateExternalCollectionTask {
+    int64 collectionID = 1;
+    int64 taskID = 2;
+    int64 version = 3;
+    int64 nodeID = 4;
+    JobState state = 5;
+    string fail_reason = 6;
+    string external_source = 7;
+    string external_spec = 8;
+    // Fields for job tracking
+    int64 job_id = 9;            // Unique job identifier for API tracking
+    int64 start_time = 10;       // Job start timestamp (Unix ms)
+    int64 end_time = 11;         // Job end timestamp (Unix ms, 0 if not completed)
+    int64 progress = 12;         // Progress percentage (0-100)
+    string collection_name = 13; // Collection name for API response
 }
 
 enum StatsSubJob {

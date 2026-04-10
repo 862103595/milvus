@@ -147,7 +147,7 @@ message BroadcastRequest {
 
 // BroadcastResponse is the response of the Broadcast RPC.
 message BroadcastResponse {
-    map<string,ProduceMessageResponseResult> results = 1; 
+    map<string,ProduceMessageResponseResult> results = 1;
     uint64 broadcast_id = 2;
 }
 
@@ -196,6 +196,7 @@ service StreamingCoordAssignmentService {
 
 message UpdateReplicateConfigurationRequest {
     common.ReplicateConfiguration configuration = 1;
+    bool force_promote                          = 2;
 }
 
 // UpdateReplicateConfigurationResponse is the response of UpdateReplicateConfiguration service
@@ -254,10 +255,12 @@ message AssignmentDiscoverResponse {
 // FullStreamingNodeAssignmentWithVersion is the full assignment info of a log
 // node with version.
 message FullStreamingNodeAssignmentWithVersion {
-    VersionPair version                                   = 1;
+    VersionPair version                                   = 1 [deprecated = true];
     repeated StreamingNodeAssignment assignments          = 2;
     CChannelAssignment cchannel                           = 3; // Where the control channel located.
     common.ReplicateConfiguration replicate_configuration = 4;
+    StreamingVersion streaming_version = 5;
+    VersionPair version_by_revision = 6;
 }
 
 // CChannelAssignment is the assignment info of a control channel.
@@ -335,6 +338,9 @@ enum StreamingCode {
     STREAMING_CODE_UNRECOVERABLE          = 11; // unrecoverable error
     STREAMING_CODE_RESOURCE_ACQUIRED      = 12; // resource is acquired by other operation
     STREAMING_CODE_REPLICATE_VIOLATION    = 13; // replicate violation
+    STREAMING_CODE_WALNAME_MISMATCH       = 14; // walName mismatch
+    STREAMING_CODE_SCHEMA_VERSION_MISMATCH = 15; // wrong schema version
+    STREAMING_CODE_RATE_LIMIT_REJECTED    = 16; // rate limit rejected
     STREAMING_CODE_UNKNOWN                   = 999;  // unknown error
 }
 
@@ -417,6 +423,7 @@ message ProduceResponse {
         CreateProducerResponse create  = 1;
         ProduceMessageResponse produce = 2;
         CloseProducerResponse close    = 3;
+        ProduceRateLimitResponse rate_limit = 4;
     }
 }
 
@@ -436,6 +443,19 @@ message ProduceMessageResponse {
         ProduceMessageResponseResult result = 2;
         StreamingError error                = 3;
     }
+}
+
+enum WALRateLimitState {
+    WAL_RATE_LIMIT_STATE_UNKNOWN = 0;  // should never used.
+    WAL_RATE_LIMIT_STATE_NORMAL = 1;   // recover to normal produce rate.
+    WAL_RATE_LIMIT_STATE_SLOWDOWN = 2; // slowdown the produce rate.
+    WAL_RATE_LIMIT_STATE_REJECT = 3;   // reject the produce request.
+}
+
+// ProduceRateLimitResponse is the response to ask the client to slowdown/reject/recover the produce rate.
+message ProduceRateLimitResponse {
+    WALRateLimitState state = 1; // the state of the rate limit.
+    int64 rate = 2; // the rate to slowdown current produce rate, bytes/s.
 }
 
 // ProduceMessageResponseResult is the result of the produce message streaming
@@ -483,6 +503,7 @@ message CreateVChannelConsumerRequest {
     string vchannel = 1;
     DeliverPolicy deliver_policy           = 2;  // deliver policy.
     repeated DeliverFilter deliver_filters = 3;  // deliver filter.
+    bool ignore_pause_consumption          = 4;
 }
 
 // ConsumeMessageRequest is the request of the Consume RPC.
@@ -698,7 +719,7 @@ message WALCheckpoint {
     common.MessageID message_id = 1; // From here to recover all uncommited info.
     // e.g., primary key index, segment assignment info, vchannel info...
     // because current data path flush is slow, and managed by the coordinator, current current is not apply to it.
-    // 
+    //
     // because the data path flush is slow, so we add a new checkpoint here to promise fast recover the wal state from log.
     uint64 time_tick = 2; // The timetick of checkpoint, keep consistecy with message_id.
     // It's a hint for easier debugging.
@@ -706,13 +727,28 @@ message WALCheckpoint {
     // The wal name of the checkpoint.
     common.ReplicateConfiguration replicate_config = 4; // if the wal join a replicated clusters, the replicate config is not null,
     common.ReplicateCheckpoint replicate_checkpoint = 5; // if the wal is replicated from remote cluster, the checkpoint is not null,
-    // It's used to recover the replication state for remote cluster.
+    // Used for Alter WAL operations to track WAL modification states
+    AlterWALState alter_wal_state = 6;
+}
+
+enum AlterWALStage{
+    NONE = 0;
+    FLUSHING = 1;
+    ADVANCE_CHECKPOINT = 2;
+}
+
+message AlterWALState {
+    common.WALName  target_wal_name = 1;
+    uint64 time_tick = 2;
+    map<string, string> configs = 3;
+    AlterWALStage stage = 4;
 }
 
 // ReplicateConfigurationMeta is the replicate configuration of the wal.
 message ReplicateConfigurationMeta {
     common.ReplicateConfiguration replicate_configuration = 1;
     AckedResult acked_result = 2; // a acked helper to help managing the consuming of PutReplicateConfigMessageV2 message at coordinator.
+    bool force_promoted = 3;        // marks if this was force-promoted
 }
 
 message ReplicatePChannelMeta {
@@ -720,4 +756,5 @@ message ReplicatePChannelMeta {
     string target_channel_name          = 2;
     common.MilvusCluster target_cluster = 3;
     common.ReplicateCheckpoint initialized_checkpoint = 4;
+    bool skip_get_replicate_checkpoint  = 5;
 }

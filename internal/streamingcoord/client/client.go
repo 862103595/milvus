@@ -8,12 +8,13 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/streamingcoord/client/assignment"
 	"github.com/milvus-io/milvus/internal/streamingcoord/client/broadcast"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/balancer/picker"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/service/discoverer"
 	streamingserviceinterceptor "github.com/milvus-io/milvus/internal/util/streamingutil/service/interceptor"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/resolver"
@@ -34,11 +35,15 @@ type AssignmentService interface {
 	// AssignmentDiscover is used to watches the assignment discovery.
 	types.AssignmentDiscoverWatcher
 
+	// GetLatestStreamingVersion returns the latest version of the streaming service.
+	GetLatestStreamingVersion(ctx context.Context) (*streamingpb.StreamingVersion, error)
+
 	// UpdateReplicateConfiguration updates the replicate configuration to the milvus cluster.
-	UpdateReplicateConfiguration(ctx context.Context, config *commonpb.ReplicateConfiguration) error
+	UpdateReplicateConfiguration(ctx context.Context, req *milvuspb.UpdateReplicateConfigurationRequest) error
 
 	// GetReplicateConfiguration returns the replicate configuration of the milvus cluster.
-	GetReplicateConfiguration(ctx context.Context) (*replicateutil.ConfigHelper, error)
+	// Pass assignment.WithFreshRead() to force reading the latest state from the coord.
+	GetReplicateConfiguration(ctx context.Context, opts ...assignment.GetReplicateConfigurationOpt) (*replicateutil.ConfigHelper, error)
 
 	// GetLatestAssignments returns the latest assignment discovery result.
 	GetLatestAssignments(ctx context.Context) (*types.VersionedStreamingNodeAssignments, error)
@@ -78,7 +83,7 @@ type Client interface {
 func NewClient(etcdCli *clientv3.Client) Client {
 	// StreamingCoord is deployed on DataCoord node.
 	role := sessionutil.GetSessionPrefixByRole(typeutil.MixCoordRole)
-	rb := resolver.NewSessionExclusiveBuilder(etcdCli, role, ">=2.6.0-dev")
+	rb := resolver.NewSessionBuilder(etcdCli, discoverer.OptSDPrefix(role), discoverer.OptSDExclusive(), discoverer.OptSDVersionRange(">=2.6.0-dev"))
 	dialTimeout := paramtable.Get().StreamingCoordGrpcClientCfg.DialTimeout.GetAsDuration(time.Millisecond)
 	dialOptions := getDialOptions(rb)
 	conn := lazygrpc.NewConn(func(ctx context.Context) (*grpc.ClientConn, error) {

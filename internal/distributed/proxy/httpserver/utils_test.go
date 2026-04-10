@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -648,6 +649,25 @@ func TestAnyToColumns(t *testing.T) {
 		assert.Equal(t, true, strings.HasPrefix(err.Error(), "no need to pass pk field"))
 	})
 
+	t.Run("insert,autoid==true,allow_insert_auto_id=true", func(t *testing.T) {
+		body := []byte("{\"data\": {\"id\": 0, \"book_id\": 1, \"book_intro\": [0.1, 0.2], \"word_count\": 2, \"classified\": false, \"databaseID\": null}}")
+		req := InsertReq{}
+		coll := generateCollectionSchema(schemapb.DataType_Int64, true, true)
+		coll.Properties = append(coll.Properties, &commonpb.KeyValuePair{
+			Key:   common.AllowInsertAutoIDKey,
+			Value: "true",
+		})
+		var err error
+		err, req.Data, _ = checkAndSetData(body, coll, false)
+		assert.Equal(t, nil, err)
+		assert.Equal(t, int64(0), req.Data[0]["id"])
+		assert.Equal(t, int64(1), req.Data[0]["book_id"])
+		assert.Equal(t, int64(2), req.Data[0]["word_count"])
+		t.Log(req.Data)
+		_, err = anyToColumns(req.Data, nil, coll, true, false)
+		assert.NoError(t, err)
+	})
+
 	t.Run("pass more field", func(t *testing.T) {
 		body := []byte("{\"data\": {\"id\": 0, \"book_id\": 1, \"book_intro\": [0.1, 0.2], \"word_count\": 2, \"classified\": false, \"databaseID\": null}}")
 		coll := generateCollectionSchema(schemapb.DataType_Int64, true, false)
@@ -828,6 +848,158 @@ func TestAnyToColumns(t *testing.T) {
 		assert.True(t, fieldNames["a"])
 		// Field 'b' should not be present since it wasn't provided in any row
 		assert.False(t, fieldNames["b"])
+	})
+
+	t.Run("function output field not provided in any row", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name: "test_collection",
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "id",
+					DataType:     schemapb.DataType_Int64,
+					IsPrimaryKey: true,
+				},
+				{
+					FieldID:  101,
+					Name:     "vec",
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "2"},
+					},
+				},
+				{
+					FieldID:          102,
+					Name:             "fn_out",
+					DataType:         schemapb.DataType_Int64,
+					IsFunctionOutput: true,
+				},
+			},
+		}
+		rows := []map[string]interface{}{
+			{"id": int64(1), "vec": []float32{0.1, 0.2}},
+			{"id": int64(2), "vec": []float32{0.3, 0.4}},
+		}
+		fieldsData, err := anyToColumns(rows, nil, schema, true, false)
+		assert.NoError(t, err)
+		fieldNames := make(map[string]bool)
+		for _, fd := range fieldsData {
+			fieldNames[fd.FieldName] = true
+		}
+		assert.True(t, fieldNames["id"])
+		assert.True(t, fieldNames["vec"])
+		assert.False(t, fieldNames["fn_out"])
+	})
+
+	t.Run("function output field provided in all rows", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name: "test_collection",
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "id",
+					DataType:     schemapb.DataType_Int64,
+					IsPrimaryKey: true,
+				},
+				{
+					FieldID:  101,
+					Name:     "vec",
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "2"},
+					},
+				},
+				{
+					FieldID:          102,
+					Name:             "fn_out",
+					DataType:         schemapb.DataType_Int64,
+					IsFunctionOutput: true,
+				},
+			},
+		}
+		rows := []map[string]interface{}{
+			{"id": int64(1), "vec": []float32{0.1, 0.2}, "fn_out": int64(10)},
+			{"id": int64(2), "vec": []float32{0.3, 0.4}, "fn_out": int64(20)},
+		}
+		fieldsData, err := anyToColumns(rows, nil, schema, true, false)
+		assert.NoError(t, err)
+		fieldNames := make(map[string]bool)
+		for _, fd := range fieldsData {
+			fieldNames[fd.FieldName] = true
+		}
+		assert.True(t, fieldNames["fn_out"])
+	})
+
+	t.Run("function output field provided in row 0 but missing in later row", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name: "test_collection",
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "id",
+					DataType:     schemapb.DataType_Int64,
+					IsPrimaryKey: true,
+				},
+				{
+					FieldID:  101,
+					Name:     "vec",
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "2"},
+					},
+				},
+				{
+					FieldID:          102,
+					Name:             "fn_out",
+					DataType:         schemapb.DataType_Int64,
+					IsFunctionOutput: true,
+				},
+			},
+		}
+		rows := []map[string]interface{}{
+			{"id": int64(1), "vec": []float32{0.1, 0.2}, "fn_out": int64(10)},
+			{"id": int64(2), "vec": []float32{0.3, 0.4}}, // fn_out missing
+		}
+		_, err := anyToColumns(rows, nil, schema, true, false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "does not has field fn_out")
+	})
+
+	t.Run("function output field missing in row 0 but provided in later row", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name: "test_collection",
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "id",
+					DataType:     schemapb.DataType_Int64,
+					IsPrimaryKey: true,
+				},
+				{
+					FieldID:  101,
+					Name:     "vec",
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "2"},
+					},
+				},
+				{
+					FieldID:          102,
+					Name:             "fn_out",
+					DataType:         schemapb.DataType_Int64,
+					IsFunctionOutput: true,
+				},
+			},
+		}
+		rows := []map[string]interface{}{
+			{"id": int64(1), "vec": []float32{0.1, 0.2}},                      // fn_out missing
+			{"id": int64(2), "vec": []float32{0.3, 0.4}, "fn_out": int64(20)}, // fn_out provided
+		}
+		// row 0 doesn't have fn_out but row 1 does, column is allocated,
+		// so row 0 hits the "does not has field" error
+		_, err := anyToColumns(rows, nil, schema, true, false)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "does not has field fn_out")
 	})
 }
 
@@ -2733,4 +2905,182 @@ func TestGenFunctionScore(t *testing.T) {
 		_, err := genFunctionScore(context.Background(), &fScore)
 		assert.NoError(t, err)
 	}
+}
+
+func TestParseUsernamePassword(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("token with credential separator", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/", nil)
+		c.Request.Header.Set("Authorization", "Bearer testuser:testpass")
+
+		username, password, ok := ParseUsernamePassword(c)
+		assert.True(t, ok)
+		assert.Equal(t, "testuser", username)
+		assert.Equal(t, "testpass", password)
+	})
+
+	t.Run("token without credential separator", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/", nil)
+		c.Request.Header.Set("Authorization", "Bearer tokenonly")
+
+		username, password, ok := ParseUsernamePassword(c)
+		assert.False(t, ok)
+		assert.Equal(t, "", username)
+		assert.Equal(t, "", password)
+	})
+
+	t.Run("empty authorization header", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/", nil)
+
+		username, password, ok := ParseUsernamePassword(c)
+		assert.False(t, ok)
+		assert.Equal(t, "", username)
+		assert.Equal(t, "", password)
+	})
+}
+
+func TestConvertIDsToSchemapbIDs(t *testing.T) {
+	int64PkField := &schemapb.FieldSchema{
+		FieldID:      common.StartOfUserFieldID,
+		Name:         "id",
+		IsPrimaryKey: true,
+		DataType:     schemapb.DataType_Int64,
+	}
+
+	varcharPkField := &schemapb.FieldSchema{
+		FieldID:      common.StartOfUserFieldID,
+		Name:         "id",
+		IsPrimaryKey: true,
+		DataType:     schemapb.DataType_VarChar,
+	}
+
+	t.Run("empty ids array", func(t *testing.T) {
+		_, err := convertIDsToSchemapbIDs([]interface{}{}, int64PkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "ids array cannot be empty")
+	})
+
+	t.Run("int64 pk with float64 values (whole numbers)", func(t *testing.T) {
+		// JSON numbers are decoded as float64
+		ids := []interface{}{float64(1), float64(2), float64(3)}
+		result, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		intIds := result.GetIntId()
+		assert.NotNil(t, intIds)
+		assert.Equal(t, []int64{1, 2, 3}, intIds.Data)
+	})
+
+	t.Run("int64 pk with float64 values having fractional part", func(t *testing.T) {
+		ids := []interface{}{float64(1.5)}
+		_, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "has fractional part")
+	})
+
+	t.Run("int64 pk with float64 values - second element has fractional part", func(t *testing.T) {
+		ids := []interface{}{float64(1), float64(2.9)}
+		_, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "index 1")
+		assert.Contains(t, err.Error(), "has fractional part")
+	})
+
+	t.Run("int64 pk with int64 values", func(t *testing.T) {
+		ids := []interface{}{int64(100), int64(200)}
+		result, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		intIds := result.GetIntId()
+		assert.NotNil(t, intIds)
+		assert.Equal(t, []int64{100, 200}, intIds.Data)
+	})
+
+	t.Run("int64 pk with int values", func(t *testing.T) {
+		ids := []interface{}{int(10), int(20)}
+		result, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		intIds := result.GetIntId()
+		assert.NotNil(t, intIds)
+		assert.Equal(t, []int64{10, 20}, intIds.Data)
+	})
+
+	t.Run("int64 pk with valid string values", func(t *testing.T) {
+		ids := []interface{}{"123", "456"}
+		result, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		intIds := result.GetIntId()
+		assert.NotNil(t, intIds)
+		assert.Equal(t, []int64{123, 456}, intIds.Data)
+	})
+
+	t.Run("int64 pk with invalid string values", func(t *testing.T) {
+		ids := []interface{}{"not_a_number"}
+		_, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid int64 id")
+	})
+
+	t.Run("int64 pk with invalid type", func(t *testing.T) {
+		ids := []interface{}{true}
+		_, err := convertIDsToSchemapbIDs(ids, int64PkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid id type")
+	})
+
+	t.Run("varchar pk with string values", func(t *testing.T) {
+		ids := []interface{}{"abc", "def", "ghi"}
+		result, err := convertIDsToSchemapbIDs(ids, varcharPkField)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		strIds := result.GetStrId()
+		assert.NotNil(t, strIds)
+		assert.Equal(t, []string{"abc", "def", "ghi"}, strIds.Data)
+	})
+
+	t.Run("varchar pk with empty string", func(t *testing.T) {
+		ids := []interface{}{""}
+		_, err := convertIDsToSchemapbIDs(ids, varcharPkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "empty string id")
+	})
+
+	t.Run("varchar pk with number values", func(t *testing.T) {
+		ids := []interface{}{float64(123), int64(456), int(789)}
+		result, err := convertIDsToSchemapbIDs(ids, varcharPkField)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		strIds := result.GetStrId()
+		assert.NotNil(t, strIds)
+		assert.Equal(t, []string{"123", "456", "789"}, strIds.Data)
+	})
+
+	t.Run("varchar pk with invalid type", func(t *testing.T) {
+		ids := []interface{}{[]int{1, 2, 3}}
+		_, err := convertIDsToSchemapbIDs(ids, varcharPkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid id type")
+	})
+
+	t.Run("unsupported pk type", func(t *testing.T) {
+		boolPkField := &schemapb.FieldSchema{
+			FieldID:      common.StartOfUserFieldID,
+			Name:         "id",
+			IsPrimaryKey: true,
+			DataType:     schemapb.DataType_Bool,
+		}
+		ids := []interface{}{float64(1)}
+		_, err := convertIDsToSchemapbIDs(ids, boolPkField)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported primary key type")
+	})
 }

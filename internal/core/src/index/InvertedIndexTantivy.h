@@ -11,17 +11,38 @@
 
 #pragma once
 
-#include <cstddef>
-#include <vector>
 #include <folly/SharedMutex.h>
+#include <stdint.h>
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "nlohmann/json_fwd.hpp"
+
+#include "common/EasyAssert.h"
+#include "common/FieldData.h"
+#include "common/FieldDataInterface.h"
 #include "common/RegexQuery.h"
-#include "index/Index.h"
-#include "storage/FileManager.h"
+#include "common/Utils.h"
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "common/protobuf_utils.h"
+#include "fmt/core.h"
+#include "index/IndexStats.h"
+#include "index/Meta.h"
+#include "index/ScalarIndex.h"
+#include "pb/plan.pb.h"
+#include "pb/schema.pb.h"
+#include "rust-array.h"
 #include "storage/DiskFileManagerImpl.h"
+#include "storage/FileManager.h"
 #include "storage/MemFileManagerImpl.h"
 #include "tantivy-binding.h"
 #include "tantivy-wrapper.h"
-#include "index/StringIndex.h"
 
 namespace milvus::index {
 
@@ -79,7 +100,8 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
     explicit InvertedIndexTantivy(uint32_t tantivy_index_version,
                                   const storage::FileManagerContext& ctx,
                                   bool inverted_index_single_segment = false,
-                                  bool user_specified_doc_id = true);
+                                  bool user_specified_doc_id = true,
+                                  bool is_nested_index = false);
 
     ~InvertedIndexTantivy();
 
@@ -166,12 +188,12 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
     NotIn(size_t n, const T* values) override;
 
     const TargetBitmap
-    Range(T value, OpType op) override;
+    Range(const T& value, OpType op) override;
 
     const TargetBitmap
-    Range(T lower_bound_value,
+    Range(const T& lower_bound_value,
           bool lb_inclusive,
-          T upper_bound_value,
+          const T& upper_bound_value,
           bool ub_inclusive) override;
 
     const bool
@@ -190,9 +212,23 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
         return Count();
     }
 
-    int64_t
-    ByteSize() const {
-        return wrapper_->index_size_bytes();
+    void
+    ComputeByteSize() override {
+        ScalarIndex<T>::ComputeByteSize();
+        int64_t total = this->cached_byte_size_;
+
+        // Tantivy index size
+        total += wrapper_->index_size_bytes();
+
+        // null_offset_: vector<size_t>
+        total += null_offset_.capacity() * sizeof(size_t);
+
+        this->cached_byte_size_ = total;
+    }
+
+    bool
+    IsNestedIndex() const override {
+        return is_nested_index_;
     }
 
     virtual const TargetBitmap
@@ -208,19 +244,15 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
                 return PrefixMatch(pattern);
             }
             case proto::plan::OpType::PostfixMatch: {
-                PatternMatchTranslator translator;
-                auto regex_pattern = translator(fmt::format("%{}", pattern));
-                return RegexQuery(regex_pattern);
+                return PatternQuery(
+                    fmt::format("%{}", EscapeLikePattern(pattern)));
             }
             case proto::plan::OpType::InnerMatch: {
-                PatternMatchTranslator translator;
-                auto regex_pattern = translator(fmt::format("%{}%", pattern));
-                return RegexQuery(regex_pattern);
+                return PatternQuery(
+                    fmt::format("%{}%", EscapeLikePattern(pattern)));
             }
             case proto::plan::OpType::Match: {
-                PatternMatchTranslator translator;
-                auto regex_pattern = translator(pattern);
-                return RegexQuery(regex_pattern);
+                return PatternQuery(pattern);
             }
             default:
                 ThrowInfo(
@@ -232,22 +264,22 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
 
     bool
     SupportPatternMatch() const override {
-        return SupportRegexQuery();
-    }
-
-    bool
-    SupportRegexQuery() const override {
         return std::is_same_v<T, std::string>;
     }
 
     bool
-    TryUseRegexQuery() const override {
-        // for inverted index, not use regex query to implement match
+    SupportPatternQuery() const override {
+        return std::is_same_v<T, std::string>;
+    }
+
+    bool
+    TryUsePatternQuery() const override {
+        // for inverted index, not use pattern query to implement match
         return false;
     }
 
     const TargetBitmap
-    RegexQuery(const std::string& regex_pattern) override;
+    PatternQuery(const std::string& pattern) override;
 
     void
     BuildWithFieldData(const std::vector<FieldDataPtr>& datas) override;
@@ -257,12 +289,23 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
         is_growing_ = is_growing;
     }
 
+    void
+    WriteEntries(storage::IndexEntryWriter* writer) override;
+
+    void
+    LoadEntries(storage::IndexEntryReader& reader,
+                const Config& config) override;
+
  protected:
     void
     finish();
 
     void
     build_index_for_array(
+        const std::vector<std::shared_ptr<FieldDataBase>>& field_datas);
+
+    void
+    build_index_for_array_nested(
         const std::vector<std::shared_ptr<FieldDataBase>>& field_datas);
 
     virtual void
@@ -284,6 +327,11 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
     virtual void
     RetainTantivyIndexFiles(std::vector<std::string>& index_files);
 
+    // Builds the TANTIVY_META JSON object. Override in subclasses to add
+    // additional fields (e.g., has_non_exist in JsonInvertedIndex).
+    virtual nlohmann::json
+    BuildTantivyMeta(const std::vector<std::string>& file_names, bool has_null);
+
  protected:
     std::shared_ptr<TantivyIndexWrapper> wrapper_;
     TantivyDataType d_type_;
@@ -297,7 +345,6 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
      * 3, load phase, we need the index on the disk instead of memory, we use DiskFileManager.CacheIndexToDisk;
      * Btw, this approach can be applied to DiskANN also.
      */
-    MemFileManagerPtr mem_file_manager_;
     DiskFileManagerPtr disk_file_manager_;
 
     folly::SharedMutexWritePriority mutex_{};
@@ -328,5 +375,9 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
     // for now, only TextMatchIndex  can be built for growing segment,
     // and can read and insert concurrently.
     bool is_growing_{false};
+
+    // `is_nested_index_` can only be true for array data type. When it's true,
+    // every element in the array is treated as a separate document in the index.
+    bool is_nested_index_{false};
 };
 }  // namespace milvus::index

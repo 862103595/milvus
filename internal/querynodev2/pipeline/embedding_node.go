@@ -33,6 +33,7 @@ import (
 	base "github.com/milvus-io/milvus/internal/util/pipeline"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v2/util/bm25"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -155,6 +156,10 @@ func (eNode *embeddingNode) bm25Embedding(runner function.FunctionRunner, msg *m
 		return err
 	}
 
+	if len(output) == 0 {
+		return errors.New("BM25 runner returned empty output")
+	}
+
 	sparseArray, ok := output[0].(*schemapb.SparseFloatArray)
 	if !ok {
 		return errors.New("BM25 runner return unknown type output")
@@ -164,7 +169,57 @@ func (eNode *embeddingNode) bm25Embedding(runner function.FunctionRunner, msg *m
 		stats[outputFieldID] = storage.NewBM25Stats()
 	}
 	stats[outputFieldID].AppendBytes(sparseArray.GetContents()...)
-	msg.FieldsData = append(msg.FieldsData, delegator.BuildSparseFieldData(outputField, sparseArray))
+	msg.FieldsData = append(msg.FieldsData, bm25.BuildSparseFieldData(outputField, sparseArray))
+	return nil
+}
+
+func (eNode *embeddingNode) minhashEmbedding(runner function.FunctionRunner, msg *msgstream.InsertMsg, stats map[int64]*storage.BM25Stats) error {
+	inputFields := runner.GetInputFields()
+	outputField := runner.GetOutputFields()[0]
+
+	datas, err := getEmbeddingFieldDatas(msg.FieldsData, lo.Map(inputFields, func(field *schemapb.FieldSchema, _ int) int64 { return field.GetFieldID() })...)
+	if err != nil {
+		return err
+	}
+
+	output, err := runner.BatchRun(datas...)
+	if err != nil {
+		return err
+	}
+
+	if len(output) == 0 {
+		return errors.New("MinHash runner returned empty output")
+	}
+
+	fieldData, ok := output[0].(*schemapb.FieldData)
+	if !ok {
+		return errors.New("MinHash embedding failed: MinHash runner output not FieldData")
+	}
+	vectorField := fieldData.GetVectors()
+	if vectorField == nil {
+		return errors.New("MinHash embedding failed: output is not a vector field")
+	}
+
+	binaryVector := vectorField.GetBinaryVector()
+	if binaryVector == nil {
+		return errors.New("MinHash embedding failed: output is not a binary vector")
+	}
+
+	outputFieldData := &schemapb.FieldData{
+		Type:      outputField.GetDataType(),
+		FieldName: outputField.GetName(),
+		Field: &schemapb.FieldData_Vectors{
+			Vectors: &schemapb.VectorField{
+				Dim: vectorField.GetDim(),
+				Data: &schemapb.VectorField_BinaryVector{
+					BinaryVector: binaryVector,
+				},
+			},
+		},
+		FieldId: outputField.GetFieldID(),
+	}
+
+	msg.FieldsData = append(msg.FieldsData, outputFieldData)
 	return nil
 }
 
@@ -174,6 +229,11 @@ func (eNode *embeddingNode) embedding(msg *msgstream.InsertMsg, stats map[int64]
 		switch functionSchema.GetType() {
 		case schemapb.FunctionType_BM25:
 			err := eNode.bm25Embedding(functionRunner, msg, stats)
+			if err != nil {
+				return err
+			}
+		case schemapb.FunctionType_MinHash:
+			err := eNode.minhashEmbedding(functionRunner, msg, stats)
 			if err != nil {
 				return err
 			}
@@ -207,8 +267,12 @@ func (eNode *embeddingNode) Operate(in Msg) Msg {
 }
 
 func (eNode *embeddingNode) Close() {
-	for _, functionRunner := range eNode.functionRunners {
-		functionRunner.Close()
+	if eNode.functionRunners != nil {
+		for _, functionRunner := range eNode.functionRunners {
+			if functionRunner != nil {
+				functionRunner.Close()
+			}
+		}
 	}
 }
 

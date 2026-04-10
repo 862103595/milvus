@@ -15,14 +15,15 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/agg"
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
 	"github.com/milvus-io/milvus/internal/proxy/accesslog"
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/exprutil"
 	"github.com/milvus-io/milvus/internal/util/reduce"
+	"github.com/milvus-io/milvus/internal/util/reduce/orderby"
 	"github.com/milvus-io/milvus/internal/util/segcore"
-	typeutil2 "github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
@@ -34,6 +35,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -65,6 +67,7 @@ type queryTask struct {
 	translatedOutputFields []string
 	userOutputFields       []string
 	userDynamicFields      []string
+	userAggregates         []agg.AggregateBase
 
 	resultBuf *typeutil.ConcurrentSet[*internalpb.RetrieveResults]
 
@@ -80,8 +83,8 @@ type queryTask struct {
 	totalRelatedDataSize int64
 	mustUsePartitionKey  bool
 	resolvedTimezoneStr  string
-
-	storageCost segcore.StorageCost
+	storageCost          segcore.StorageCost
+	aggregationFieldMap  *agg.AggregationFieldMap
 }
 
 type queryParams struct {
@@ -90,8 +93,155 @@ type queryParams struct {
 	reduceType        reduce.IReduceType
 	isIterator        bool
 	collectionID      int64
+	groupByFields     []string
+	orderByFields     []string // NEW: ORDER BY field specifications (e.g., "price:desc")
 	timezone          string
 	extractTimeFields []string
+}
+
+func isSupportedGroupByFieldType(dt schemapb.DataType) bool {
+	switch dt {
+	case schemapb.DataType_Int8,
+		schemapb.DataType_Int16,
+		schemapb.DataType_Int32,
+		schemapb.DataType_Int64,
+		schemapb.DataType_VarChar,
+		schemapb.DataType_Timestamptz:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateGroupByFieldSchema(field *schemapb.FieldSchema) error {
+	if field == nil {
+		return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("group by field schema is nil"))
+	}
+	if !isSupportedGroupByFieldType(field.GetDataType()) {
+		return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg(
+			"group by field %s has unsupported data type %s", field.GetName(), field.GetDataType().String(),
+		))
+	}
+	return nil
+}
+
+func translateGroupByFieldIds(groupByFieldNames []string, schema *schemapb.CollectionSchema) ([]UniqueID, error) {
+	if len(groupByFieldNames) == 0 {
+		return nil, nil
+	}
+
+	fieldNameToSchema := make(map[string]*schemapb.FieldSchema, len(schema.Fields))
+	for _, field := range schema.Fields {
+		fieldNameToSchema[field.Name] = field
+	}
+
+	groupByFieldIds := make([]UniqueID, 0, len(groupByFieldNames))
+	for _, groupByField := range groupByFieldNames {
+		groupByField = strings.TrimSpace(groupByField)
+		fieldSchema, found := fieldNameToSchema[groupByField]
+		if !found {
+			return nil, fmt.Errorf("field %s not exist", groupByField)
+		}
+		if err := validateGroupByFieldSchema(fieldSchema); err != nil {
+			return nil, err
+		}
+		groupByFieldIds = append(groupByFieldIds, fieldSchema.GetFieldID())
+	}
+	return groupByFieldIds, nil
+}
+
+// validateOrderByFieldsWithGroupBy validates that ORDER BY fields are compatible with GROUP BY.
+// When GROUP BY is used, ORDER BY can only reference columns in the GROUP BY clause.
+// ORDER BY on aggregate expressions (e.g., count(*)) is not yet supported and is
+// explicitly rejected. This restriction may be lifted in a future release.
+func validateOrderByFieldsWithGroupBy(
+	orderByFieldSpecs []string,
+	groupByFields []string,
+	aggregates []agg.AggregateBase,
+) error {
+	if len(orderByFieldSpecs) == 0 {
+		return nil
+	}
+
+	// If no GROUP BY and no aggregates, any field is valid for ORDER BY
+	hasGroupBy := len(groupByFields) > 0 || len(aggregates) > 0
+	if !hasGroupBy {
+		return nil
+	}
+
+	// Build set of valid ORDER BY targets (GROUP BY columns only)
+	validTargets := make(map[string]bool)
+
+	// Add GROUP BY fields as valid targets
+	for _, field := range groupByFields {
+		validTargets[strings.ToLower(strings.TrimSpace(field))] = true
+	}
+
+	// Validate each ORDER BY field
+	for _, spec := range orderByFieldSpecs {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+
+		// Extract field name (remove direction suffix like ":desc").
+		// Only colon-separated format is supported (e.g., "price:desc").
+		// Space-separated format (e.g., "price desc") is NOT supported.
+		parts := strings.Split(spec, ":")
+		fieldName := strings.ToLower(strings.TrimSpace(parts[0]))
+
+		// Reject aggregate expressions — not yet supported
+		if isAgg, _, _ := agg.MatchAggregationExpression(fieldName); isAgg {
+			return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg(
+				"ORDER BY on aggregate expression '%s' is not yet supported",
+				fieldName,
+			))
+		}
+
+		if !validTargets[fieldName] {
+			return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg(
+				"ORDER BY field '%s' is not valid: when using GROUP BY or aggregates, "+
+					"ORDER BY can only reference GROUP BY columns. "+
+					"Valid targets are: %v",
+				fieldName, getValidTargetList(groupByFields, aggregates),
+			))
+		}
+	}
+
+	return nil
+}
+
+// getValidTargetList returns a formatted list of valid ORDER BY targets for error messages.
+// The aggregates parameter is currently unused because ORDER BY on aggregate expressions
+// (e.g., count(*)) is not yet supported. When enabled in the future, aggregate original
+// names should be appended to the target list.
+func getValidTargetList(groupByFields []string, _ []agg.AggregateBase) []string {
+	targets := make([]string, 0, len(groupByFields))
+	targets = append(targets, groupByFields...)
+	return targets
+}
+
+// translateOrderByFields converts ORDER BY field specifications to planpb.OrderByField messages.
+// Delegates parsing to orderby.ParseOrderByFields to ensure consistent behavior
+// (direction validation, nullsFirst defaults) between C++ segcore and Go proxy pipeline.
+func translateOrderByFields(orderByFieldSpecs []string, schema *schemapb.CollectionSchema) ([]*planpb.OrderByField, error) {
+	parsed, err := orderby.ParseOrderByFields(orderByFieldSpecs, schema)
+	if err != nil {
+		return nil, merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg(err.Error()))
+	}
+	if len(parsed) == 0 {
+		return nil, nil
+	}
+
+	result := make([]*planpb.OrderByField, len(parsed))
+	for i, f := range parsed {
+		result[i] = &planpb.OrderByField{
+			FieldId:    f.FieldID,
+			Ascending:  f.Ascending,
+			NullsFirst: f.NullsFirst,
+		}
+	}
+	return result, nil
 }
 
 // translateToOutputFieldIDs translates output fields name to output fields id.
@@ -166,7 +316,7 @@ func filterSystemFields(outputFieldIDs []UniqueID) []UniqueID {
 }
 
 // parseQueryParams get limit and offset from queryParamsPair, both are optional.
-func parseQueryParams(queryParamsPair []*commonpb.KeyValuePair) (*queryParams, error) {
+func parseQueryParams(queryParamsPair []*commonpb.KeyValuePair, largeTopKEnabled bool) (*queryParams, error) {
 	var (
 		limit             int64
 		offset            int64
@@ -236,13 +386,13 @@ func parseQueryParams(queryParamsPair []*commonpb.KeyValuePair) (*queryParams, e
 			}
 		}
 		// validate max result window.
-		if err = validateMaxQueryResultWindow(offset, limit); err != nil {
+		if err = validateMaxQueryResultWindow(offset, limit, largeTopKEnabled); err != nil {
 			return nil, fmt.Errorf("invalid max query result window, %w", err)
 		}
 	}
 
 	timezone, _ = funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, queryParamsPair)
-	if (timezone != "") && !funcutil.IsTimezoneValid(timezone) {
+	if (timezone != "") && !timestamptz.IsTimezoneValid(timezone) {
 		return nil, merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", timezone)
 	}
 
@@ -253,12 +403,40 @@ func parseQueryParams(queryParamsPair []*commonpb.KeyValuePair) (*queryParams, e
 		})
 	}
 
+	// parse group by fields
+	groupByFieldsStr, err := funcutil.GetAttrByKeyFromRepeatedKV(QueryGroupByFieldsKey, queryParamsPair)
+	var groupByFields []string
+	if err == nil {
+		splitFields := strings.Split(groupByFieldsStr, ",")
+		for _, field := range splitFields {
+			trimmed := strings.TrimSpace(field)
+			if trimmed != "" {
+				groupByFields = append(groupByFields, trimmed)
+			}
+		}
+	}
+
+	// parse order by fields (e.g., "price:desc,rating:asc"). Only colon-separated format is supported.
+	orderByFieldsStr, err := funcutil.GetAttrByKeyFromRepeatedKV(OrderByFieldsKey, queryParamsPair)
+	var orderByFields []string
+	if err == nil {
+		splitFields := strings.Split(orderByFieldsStr, ",")
+		for _, field := range splitFields {
+			trimmed := strings.TrimSpace(field)
+			if trimmed != "" {
+				orderByFields = append(orderByFields, trimmed)
+			}
+		}
+	}
+
 	return &queryParams{
 		limit:             limit,
 		offset:            offset,
 		reduceType:        reduceType,
 		isIterator:        isIterator,
 		collectionID:      collectionID,
+		groupByFields:     groupByFields,
+		orderByFields:     orderByFields,
 		timezone:          timezone,
 		extractTimeFields: extractTimeFields,
 	}, nil
@@ -297,15 +475,6 @@ func (t *queryTask) createPlan(ctx context.Context) error {
 
 func (t *queryTask) createPlanArgs(ctx context.Context, visitorArgs *planparserv2.ParserVisitorArgs) error {
 	schema := t.schema
-
-	cntMatch := matchCountRule(t.request.GetOutputFields())
-	if cntMatch {
-		var err error
-		t.plan, err = createCntPlan(t.request.GetExpr(), schema.schemaHelper, t.request.GetExprTemplateValues())
-		t.userOutputFields = []string{"count(*)"}
-		return err
-	}
-
 	var err error
 	if t.plan == nil {
 		start := time.Now()
@@ -316,25 +485,79 @@ func (t *queryTask) createPlanArgs(ctx context.Context, visitorArgs *planparserv
 		}
 		metrics.ProxyParseExpressionLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), "query", metrics.SuccessLabel).Observe(float64(time.Since(start).Milliseconds()))
 	}
-
-	t.translatedOutputFields, t.userOutputFields, t.userDynamicFields, _, err = translateOutputFields(t.request.OutputFields, t.schema, false)
+	// parse output fields names
+	originalOuputFields := t.request.GetOutputFields()
+	t.translatedOutputFields, t.userOutputFields, t.userDynamicFields, t.userAggregates, _, err = translateOutputFields(t.request.GetOutputFields(), t.schema, false)
 	if err != nil {
 		return err
 	}
 
-	outputFieldIDs, err := translateToOutputFieldIDs(t.translatedOutputFields, schema.CollectionSchema)
+	// parse aggregates
+	t.plan.GetQuery().Aggregates = agg.AggregatesToPB(t.userAggregates)
+	t.RetrieveRequest.Aggregates = t.plan.GetQuery().GetAggregates()
+	// parse group by field ids
+	groupByFieldsIDs, err := translateGroupByFieldIds(t.queryParams.groupByFields, t.schema.CollectionSchema)
 	if err != nil {
 		return err
 	}
-	outputFieldIDs = append(outputFieldIDs, common.TimeStampField)
-	t.RetrieveRequest.OutputFieldsId = outputFieldIDs
-	t.plan.OutputFieldIds = outputFieldIDs
-	t.plan.DynamicFields = t.userDynamicFields
+	t.plan.GetQuery().GroupByFieldIds = groupByFieldsIDs
+	t.RetrieveRequest.GroupByFieldIds = groupByFieldsIDs
+
+	// Validate ORDER BY fields compatibility with GROUP BY
+	// When GROUP BY is used, ORDER BY can only reference groupBy columns or aggregate results
+	if err := validateOrderByFieldsWithGroupBy(
+		t.queryParams.orderByFields,
+		t.queryParams.groupByFields,
+		t.userAggregates,
+	); err != nil {
+		return err
+	}
+
+	// parse order by fields
+	orderByFields, err := translateOrderByFields(t.queryParams.orderByFields, t.schema.CollectionSchema)
+	if err != nil {
+		return err
+	}
+	t.plan.GetQuery().OrderByFields = orderByFields
+	// Also populate on RetrieveRequest so QN/Delegator can read directly
+	// without re-parsing serialized_expr_plan.
+	t.RetrieveRequest.OrderByFields = orderByFields
+
+	hasAgg := len(t.RetrieveRequest.GroupByFieldIds) > 0 || len(t.RetrieveRequest.Aggregates) > 0
+	// parse output field ids
+	if hasAgg {
+		emptyOutputFields := make([]UniqueID, 0)
+		t.RetrieveRequest.OutputFieldsId = emptyOutputFields
+		t.plan.OutputFieldIds = emptyOutputFields
+		aggFieldMap, err := agg.NewAggregationFieldMap(originalOuputFields, t.queryParams.groupByFields, t.userAggregates)
+		if err != nil {
+			return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg(err.Error()))
+		}
+		t.aggregationFieldMap = aggFieldMap
+	} else {
+		outputFieldIDs, err := translateToOutputFieldIDs(t.translatedOutputFields, schema.CollectionSchema)
+		if err != nil {
+			return err
+		}
+		outputFieldIDs = append(outputFieldIDs, common.TimeStampField)
+		t.RetrieveRequest.OutputFieldsId = outputFieldIDs
+		t.plan.OutputFieldIds = outputFieldIDs
+		t.plan.DynamicFields = t.userDynamicFields
+	}
+
 	log.Ctx(ctx).Debug("translate output fields to field ids",
 		zap.Int64s("OutputFieldsID", t.OutputFieldsId),
 		zap.String("requestType", "query"))
-
 	return nil
+}
+
+func (t *queryTask) hasCountStar() bool {
+	for _, agg := range t.userAggregates {
+		if agg.Name() == "count" && agg.FieldID() == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *queryTask) CanSkipAllocTimestamp() bool {
@@ -433,7 +656,7 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	if t.RetrieveRequest.IgnoreGrowing, err = isIgnoreGrowing(t.request.GetQueryParams()); err != nil {
 		return err
 	}
-	queryParams, err := parseQueryParams(t.request.GetQueryParams())
+	queryParams, err := parseQueryParams(t.request.GetQueryParams(), colInfo.queryMode == common.QueryModeLargeTopK)
 	if err != nil {
 		return err
 	}
@@ -447,6 +670,22 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	t.RetrieveRequest.ReduceType = int32(queryParams.reduceType)
 
 	t.queryParams = queryParams
+
+	// ORDER BY requires explicit limit to prevent segment-level OOM.
+	// SortBuffer loads all matching rows into memory for sorting;
+	// MaxOutputSize only guards proxy reduce, not segment sorting.
+	if len(queryParams.orderByFields) > 0 && queryParams.limit == typeutil.Unlimited {
+		return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("ORDER BY requires explicit limit"))
+	}
+
+	// ORDER BY with iterator is not yet supported. Current iterator relies on
+	// PK-ordered pagination (plain query pipeline), while ORDER BY uses a
+	// different pipeline that sorts by arbitrary fields. Future work will
+	// enable iterator with user-specified ORDER BY fields.
+	if len(queryParams.orderByFields) > 0 && queryParams.isIterator {
+		return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("ORDER BY with iterator is not supported"))
+	}
+
 	t.RetrieveRequest.Limit = queryParams.limit + queryParams.offset
 
 	if t.ids != nil {
@@ -471,9 +710,15 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	if err := t.createPlanArgs(ctx, &planparserv2.ParserVisitorArgs{Timezone: t.resolvedTimezoneStr}); err != nil {
 		return err
 	}
-	t.plan.Node.(*planpb.PlanNode_Query).Query.Limit = t.RetrieveRequest.Limit
+	t.plan.GetQuery().Limit = t.RetrieveRequest.Limit
 
-	if planparserv2.IsAlwaysTruePlan(t.plan) && t.RetrieveRequest.Limit == typeutil.Unlimited {
+	// Aggregation queries have bounded result sizes:
+	// - global aggregation (no GROUP BY) returns exactly one row
+	// - GROUP BY aggregation returns at most one row per distinct group value
+	// Both are safe without a limit, so exempt them from the limit requirement.
+	hasAgg := len(t.userAggregates) > 0
+
+	if planparserv2.IsAlwaysTruePlan(t.plan) && t.RetrieveRequest.Limit == typeutil.Unlimited && !hasAgg {
 		return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("empty expression should be used with limit"))
 	}
 
@@ -499,13 +744,13 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 		}
 	}
 
-	// count with pagination
-	if t.plan.GetQuery().GetIsCount() && t.queryParams.limit != typeutil.Unlimited {
+	// count(*) without GROUP BY is a single-value result, pagination is meaningless.
+	// But count(*) with GROUP BY + limit is valid (limits the number of groups returned).
+	if t.hasCountStar() && t.queryParams.limit != typeutil.Unlimited && len(t.GetGroupByFieldIds()) == 0 {
 		return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("count entities with pagination is not allowed"))
 	}
 	t.plan.Namespace = t.request.Namespace
 
-	t.RetrieveRequest.IsCount = t.plan.GetQuery().GetIsCount()
 	t.RetrieveRequest.SerializedExprPlan, err = proto.Marshal(t.plan)
 	if err != nil {
 		return err
@@ -553,6 +798,9 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	}
 
 	t.GuaranteeTimestamp = guaranteeTs
+	// Extract physical time for entity-level TTL (issue #47413)
+	physicalTimeMs, _ := tsoutil.ParseHybridTs(guaranteeTs)
+	t.EntityTtlPhysicalTime = uint64(physicalTimeMs * 1000)
 	// need modify mvccTs and guaranteeTs for iterator specially
 	if t.queryParams.isIterator && t.request.GetGuaranteeTimestamp() > 0 {
 		t.MvccTimestamp = t.request.GetGuaranteeTimestamp()
@@ -643,13 +891,46 @@ func (t *queryTask) PostExecute(ctx context.Context) error {
 	metrics.ProxyDecodeResultLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.QueryLabel).Observe(0.0)
 	tr.CtxRecord(ctx, "reduceResultStart")
 
-	reducer := createMilvusReducer(ctx, t.queryParams, t.RetrieveRequest, t.schema.CollectionSchema, t.plan, t.collectionName)
+	// Parse ORDER BY fields if present
+	var orderByFields []*orderby.OrderByField
+	if len(t.queryParams.orderByFields) > 0 {
+		orderByFields, err = orderby.ParseOrderByFields(t.queryParams.orderByFields, t.schema.CollectionSchema)
+		if err != nil {
+			log.Warn("fail to parse order by fields", zap.Error(err))
+			return err
+		}
+	}
 
-	t.result, err = reducer.Reduce(toReduceResults)
+	primaryFieldSchema, err := t.schema.GetPkField()
+	if err != nil {
+		log.Warn("failed to get primary field schema", zap.Error(err))
+		return err
+	}
+
+	pipeline, err := NewQueryPipeline(
+		t.schema.CollectionSchema,
+		t.queryParams.limit,
+		t.queryParams.offset,
+		t.queryParams.reduceType,
+		orderByFields,
+		t.RetrieveRequest.GetGroupByFieldIds(),
+		t.RetrieveRequest.GetAggregates(),
+		t.aggregationFieldMap,
+		filterSystemFields(t.RetrieveRequest.GetOutputFieldsId()),
+	)
+	if err != nil {
+		log.Warn("fail to create query pipeline", zap.Error(err))
+		return err
+	}
+	t.result, err = pipeline.Execute(ctx, toReduceResults)
 	if err != nil {
 		log.Warn("fail to reduce query result", zap.Error(err))
 		return err
 	}
+
+	// FieldName/Type/IsDynamic setting and timestamp column removal are now
+	// handled by complementFieldOperator in the pipeline (for non-aggregation queries).
+	// Only geometry WKB→WKT conversion still needs to happen here.
 	for i, fieldData := range t.result.FieldsData {
 		if fieldData.Type == schemapb.DataType_Geometry {
 			if err := validateGeometryFieldSearchResult(&t.result.FieldsData[i]); err != nil {
@@ -663,11 +944,7 @@ func (t *queryTask) PostExecute(ctx context.Context) error {
 		reconstructStructFieldDataForQuery(t.result, t.schema.CollectionSchema)
 	}
 
-	primaryFieldSchema, err := t.schema.GetPkField()
-	if err != nil {
-		log.Warn("failed to get primary field schema", zap.Error(err))
-		return err
-	}
+	t.result.CollectionName = t.collectionName
 	t.result.PrimaryFieldName = primaryFieldSchema.GetName()
 	metrics.ProxyReduceResultLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.QueryLabel).Observe(float64(tr.RecordSpan().Milliseconds()))
 
@@ -774,11 +1051,22 @@ func reduceRetrieveResults(ctx context.Context, retrieveResults []*internalpb.Re
 		loopEnd int
 	)
 
+	// Detect if this is an element-level query
+	isElementLevel := len(retrieveResults) > 0 && retrieveResults[0].GetElementLevel()
+
 	validRetrieveResults := []*internalpb.RetrieveResults{}
 	for _, r := range retrieveResults {
 		size := typeutil.GetSizeOfIDs(r.GetIds())
 		if r == nil || len(r.GetFieldsData()) == 0 || size == 0 {
 			continue
+		}
+		// Validate element-level consistency: if any result is element-level, all must be
+		if isElementLevel && !r.GetElementLevel() {
+			return nil, fmt.Errorf("inconsistent element-level flag: expected all results to be element-level")
+		}
+		// Validate element_indices length matches ids length for element-level
+		if isElementLevel && len(r.GetElementIndices()) != size {
+			return nil, fmt.Errorf("element_indices length (%d) does not match ids length (%d)", len(r.GetElementIndices()), size)
 		}
 		validRetrieveResults = append(validRetrieveResults, r)
 		loopEnd += size
@@ -789,22 +1077,44 @@ func reduceRetrieveResults(ctx context.Context, retrieveResults []*internalpb.Re
 	}
 
 	cursors := make([]int64, len(validRetrieveResults))
+	idxComputers := make([]*typeutil.FieldDataIdxComputer, len(validRetrieveResults))
+	for i, vr := range validRetrieveResults {
+		idxComputers[i] = typeutil.NewFieldDataIdxComputer(vr.GetFieldsData())
+	}
 
+	// Used in element-level query to limit the number of elements returned
+	var elementLimit int = -1
 	if queryParams != nil && queryParams.limit != typeutil.Unlimited {
 		// IReduceInOrderForBest will try to get as many results as possible
 		// so loopEnd in this case will be set to the sum of all results' size
 		// to get as many qualified results as possible
 		if reduce.ShouldUseInputLimit(queryParams.reduceType) {
-			loopEnd = int(queryParams.limit)
+			if !isElementLevel {
+				loopEnd = int(queryParams.limit)
+			}
+			elementLimit = int(queryParams.limit)
 		}
 	}
 
 	// handle offset
 	if queryParams != nil && queryParams.offset > 0 {
-		for i := int64(0); i < queryParams.offset; i++ {
+		var skipped int64
+		for skipped < queryParams.offset {
 			sel, drainOneResult := typeutil.SelectMinPK(validRetrieveResults, cursors)
 			if sel == -1 || (reduce.ShouldStopWhenDrained(queryParams.reduceType) && drainOneResult) {
 				return ret, nil
+			}
+			if isElementLevel {
+				elemIndices := validRetrieveResults[sel].GetElementIndices()[cursors[sel]]
+				indicesCount := int64(len(elemIndices.GetIndices()))
+				if skipped+indicesCount > queryParams.offset {
+					elemIndices.Indices = elemIndices.Indices[queryParams.offset-skipped:]
+					break
+				} else {
+					skipped += indicesCount
+				}
+			} else {
+				skipped++
 			}
 			cursors[sel]++
 		}
@@ -812,13 +1122,25 @@ func reduceRetrieveResults(ctx context.Context, retrieveResults []*internalpb.Re
 
 	ret.FieldsData = typeutil.PrepareResultFieldData(validRetrieveResults[0].GetFieldsData(), int64(loopEnd))
 	var retSize int64
+	var availableCount int // for element-level: element count; for doc-level: doc count
 	maxOutputSize := paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()
-	for j := 0; j < loopEnd; j++ {
+	for j := 0; j < loopEnd && (elementLimit == -1 || availableCount < elementLimit); j++ {
 		sel, drainOneResult := typeutil.SelectMinPK(validRetrieveResults, cursors)
 		if sel == -1 || (reduce.ShouldStopWhenDrained(queryParams.reduceType) && drainOneResult) {
 			break
 		}
-		retSize += typeutil.AppendFieldData(ret.FieldsData, validRetrieveResults[sel].GetFieldsData(), cursors[sel])
+
+		// Get element indices for element-level query
+		var elemCount int = 1 // default for doc-level
+		if isElementLevel {
+			elemIndices := validRetrieveResults[sel].GetElementIndices()[cursors[sel]]
+			elemCount = len(elemIndices.GetIndices())
+			ret.ElementIndices = append(ret.ElementIndices, convertInternalElementIndicesToMilvus(elemIndices))
+		}
+
+		fieldIdxs := idxComputers[sel].Compute(cursors[sel])
+		retSize += typeutil.AppendFieldData(ret.FieldsData, validRetrieveResults[sel].GetFieldsData(), cursors[sel], fieldIdxs...)
+		availableCount += elemCount
 
 		// limit retrieve result to avoid oom
 		if retSize > maxOutputSize {
@@ -831,19 +1153,19 @@ func reduceRetrieveResults(ctx context.Context, retrieveResults []*internalpb.Re
 	return ret, nil
 }
 
-func reduceRetrieveResultsAndFillIfEmpty(ctx context.Context, retrieveResults []*internalpb.RetrieveResults, queryParams *queryParams, outputFieldsID []int64, schema *schemapb.CollectionSchema) (*milvuspb.QueryResults, error) {
-	result, err := reduceRetrieveResults(ctx, retrieveResults, queryParams)
-	if err != nil {
-		return nil, err
+// convertInternalElementIndicesToMilvus converts internalpb.ElementIndices (int32) to milvuspb.ElementIndices (int64)
+func convertInternalElementIndicesToMilvus(src *internalpb.ElementIndices) *milvuspb.ElementIndices {
+	if src == nil {
+		return nil
 	}
-
-	// filter system fields.
-	filtered := filterSystemFields(outputFieldsID)
-	if err := typeutil2.FillRetrieveResultIfEmpty(typeutil2.NewMilvusResult(result), filtered, schema); err != nil {
-		return nil, fmt.Errorf("failed to fill retrieve results: %s", err.Error())
+	indices := src.GetIndices()
+	data := make([]int64, len(indices))
+	for i, v := range indices {
+		data[i] = int64(v)
 	}
-
-	return result, nil
+	return &milvuspb.ElementIndices{
+		Indices: &schemapb.LongArray{Data: data},
+	}
 }
 
 func (t *queryTask) TraceCtx() context.Context {

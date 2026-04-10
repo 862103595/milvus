@@ -15,18 +15,18 @@
 // limitations under the License.
 
 #include <algorithm>
-#include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
-#include "arrow/type.h"
-#include <boost/lexical_cast.hpp>
-#include <google/protobuf/text_format.h>
-#include <memory>
+#include <tuple>
 
 #include "Schema.h"
-#include "SystemProperty.h"
+#include "arrow/type.h"
 #include "arrow/util/key_value_metadata.h"
+#include "common/Consts.h"
+#include "common/FieldMeta.h"
 #include "milvus-storage/common/constants.h"
+#include "pb/common.pb.h"
 #include "protobuf_utils.h"
 
 namespace milvus {
@@ -61,6 +61,19 @@ Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
         if (child.name() == namespace_field_name) {
             schema->set_namespace_field_id(field_id);
         }
+
+        auto [has_setting, enabled] =
+            GetBoolFromRepeatedKVs(child.type_params(), MMAP_ENABLED_KEY);
+        if (has_setting) {
+            schema->mmap_fields_[field_id] = enabled;
+        }
+
+        // Parse warmup policy for the field (key: "warmup")
+        auto warmup_policy =
+            GetStringFromRepeatedKVs(child.type_params(), WARMUP_KEY);
+        if (warmup_policy.has_value()) {
+            schema->warmup_fields_[field_id] = warmup_policy.value();
+        }
     };
 
     for (const milvus::proto::schema::FieldSchema& child :
@@ -75,8 +88,46 @@ Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
         }
     }
 
+    std::tie(schema->has_mmap_setting_, schema->mmap_enabled_) =
+        GetBoolFromRepeatedKVs(schema_proto.properties(), MMAP_ENABLED_KEY);
+
+    std::optional<std::string> ttl_field_name;
+    for (const auto& property : schema_proto.properties()) {
+        if (property.key() == COLLECTION_TTL_FIELD_KEY) {
+            ttl_field_name = property.value();
+            break;
+        }
+    }
+    if (ttl_field_name.has_value()) {
+        bool found = false;
+        for (const milvus::proto::schema::FieldSchema& child :
+             schema_proto.fields()) {
+            if (child.name() == ttl_field_name.value()) {
+                schema->set_ttl_field_id(FieldId(child.fieldid()));
+                found = true;
+                break;
+            }
+        }
+        AssertInfo(found, "ttl field name not found in schema fields");
+    }
+    // Parse collection-level warmup policies
+    schema->warmup_vector_index_ = GetStringFromRepeatedKVs(
+        schema_proto.properties(), WARMUP_VECTOR_INDEX_KEY);
+    schema->warmup_scalar_index_ = GetStringFromRepeatedKVs(
+        schema_proto.properties(), WARMUP_SCALAR_INDEX_KEY);
+    schema->warmup_scalar_field_ = GetStringFromRepeatedKVs(
+        schema_proto.properties(), WARMUP_SCALAR_FIELD_KEY);
+    schema->warmup_vector_field_ = GetStringFromRepeatedKVs(
+        schema_proto.properties(), WARMUP_VECTOR_FIELD_KEY);
+
     AssertInfo(schema->get_primary_field_id().has_value(),
                "primary key should be specified");
+
+    // Parse external collection properties
+    if (!schema_proto.external_source().empty()) {
+        schema->set_external_source(schema_proto.external_source());
+        schema->set_external_spec(schema_proto.external_spec());
+    }
 
     return schema;
 }
@@ -87,8 +138,9 @@ const FieldMeta FieldMeta::RowIdMeta(
 const ArrowSchemaPtr
 Schema::ConvertToArrowSchema() const {
     arrow::FieldVector arrow_fields;
-    for (auto& field : fields_) {
-        auto meta = field.second;
+    arrow_fields.reserve(field_ids_.size());
+    for (const auto& field_id : field_ids_) {
+        const auto& meta = fields_.at(field_id);
         int dim = IsVectorDataType(meta.get_data_type()) &&
                           !IsSparseFloatVectorDataType(meta.get_data_type())
                       ? meta.get_dim()
@@ -109,6 +161,35 @@ Schema::ConvertToArrowSchema() const {
             meta.is_nullable(),
             arrow::key_value_metadata({milvus_storage::ARROW_FIELD_ID_KEY},
                                       {std::to_string(meta.get_id().get())}));
+        arrow_fields.push_back(arrow_field);
+    }
+    return arrow::schema(arrow_fields);
+}
+
+const ArrowSchemaPtr
+Schema::ConvertToLoonArrowSchema() const {
+    arrow::FieldVector arrow_fields;
+    arrow_fields.reserve(field_ids_.size());
+    for (const auto& field_id : field_ids_) {
+        const auto& meta = fields_.at(field_id);
+        int dim = IsVectorDataType(meta.get_data_type()) &&
+                          !IsSparseFloatVectorDataType(meta.get_data_type())
+                      ? meta.get_dim()
+                      : 1;
+
+        std::shared_ptr<arrow::DataType> arrow_data_type = nullptr;
+        auto data_type = meta.get_data_type();
+        if (data_type == DataType::VECTOR_ARRAY) {
+            arrow_data_type = GetArrowDataTypeForVectorArray(
+                meta.get_element_type(), meta.get_dim());
+        } else {
+            arrow_data_type = GetArrowDataType(data_type, dim);
+        }
+
+        auto arrow_field =
+            std::make_shared<arrow::Field>(std::to_string(field_id.get()),
+                                           arrow_data_type,
+                                           meta.is_nullable());
         arrow_fields.push_back(arrow_field);
     }
     return arrow::schema(arrow_fields);
@@ -140,6 +221,7 @@ Schema::ToProto() const {
 std::unique_ptr<std::vector<FieldMeta>>
 Schema::AbsentFields(Schema& old_schema) const {
     std::vector<FieldMeta> result;
+    result.reserve(fields_.size());
     for (const auto& [field_id, field_meta] : fields_) {
         auto it = old_schema.fields_.find(field_id);
         if (it == old_schema.fields_.end()) {
@@ -147,7 +229,101 @@ Schema::AbsentFields(Schema& old_schema) const {
         }
     }
 
-    return std::make_unique<std::vector<FieldMeta>>(result);
+    return std::make_unique<std::vector<FieldMeta>>(std::move(result));
+}
+
+const ArrowSchemaPtr
+Schema::BuildReaderArrowSchema() const {
+    if (!is_external_collection()) {
+        return ConvertToArrowSchema();
+    }
+    // External collections: build a filtered schema containing only
+    // external fields. System fields (RowID, Timestamp) and virtual PK
+    // don't exist in the parquet files.
+    arrow::FieldVector external_fields;
+    for (const auto& [field_id, meta] : fields_) {
+        if (!meta.is_external_field()) {
+            continue;
+        }
+        int dim = IsVectorDataType(meta.get_data_type()) &&
+                          !IsSparseFloatVectorDataType(meta.get_data_type())
+                      ? meta.get_dim()
+                      : 1;
+        auto arrow_data_type = GetArrowDataType(meta.get_data_type(), dim);
+        auto arrow_field = std::make_shared<arrow::Field>(
+            meta.get_external_field(),
+            arrow_data_type,
+            meta.is_nullable(),
+            arrow::key_value_metadata({milvus_storage::ARROW_FIELD_ID_KEY},
+                                      {std::to_string(meta.get_id().get())}));
+        external_fields.push_back(arrow_field);
+    }
+    return arrow::schema(external_fields);
+}
+
+FieldId
+Schema::ResolveColumnFieldId(const std::string& column_name) const {
+    if (is_external_collection()) {
+        for (const auto& [fid, meta] : fields_) {
+            if (meta.is_external_field() &&
+                meta.get_external_field() == column_name) {
+                return fid;
+            }
+        }
+        ThrowInfo(ErrorCode::DataFormatBroken,
+                  "external column '{}' not found in schema",
+                  column_name);
+    }
+    return FieldId(std::stoll(column_name));
+}
+
+std::pair<bool, bool>
+Schema::MmapEnabled(const FieldId& field_id) const {
+    auto it = mmap_fields_.find(field_id);
+    // fallback to  collection-level config
+    if (it == mmap_fields_.end()) {
+        return {has_mmap_setting_, mmap_enabled_};
+    }
+    return {true, it->second};
+}
+
+const FieldMeta&
+Schema::GetFirstArrayFieldInStruct(const std::string& struct_name) const {
+    auto cache_it = struct_array_field_cache_.find(struct_name);
+    if (cache_it != struct_array_field_cache_.end()) {
+        return fields_.at(cache_it->second);
+    }
+
+    ThrowInfo(ErrorCode::UnexpectedError,
+              "No array field found in struct: {}",
+              struct_name);
+}
+
+std::pair<bool, std::string>
+Schema::WarmupPolicy(const FieldId& field_id,
+                     bool is_vector,
+                     bool is_index) const {
+    // First check field-level warmup policy
+    auto it = warmup_fields_.find(field_id);
+    if (it != warmup_fields_.end()) {
+        return {true, it->second};
+    }
+
+    // Fallback to appropriate collection-level config based on field type
+    if (is_vector) {
+        if (is_index) {
+            return {warmup_vector_index_.has_value(),
+                    warmup_vector_index_.value_or("")};
+        }
+        return {warmup_vector_field_.has_value(),
+                warmup_vector_field_.value_or("")};
+    }
+    if (is_index) {
+        return {warmup_scalar_index_.has_value(),
+                warmup_scalar_index_.value_or("")};
+    }
+    return {warmup_scalar_field_.has_value(),
+            warmup_scalar_field_.value_or("")};
 }
 
 }  // namespace milvus

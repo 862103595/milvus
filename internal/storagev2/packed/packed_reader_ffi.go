@@ -31,14 +31,20 @@ import (
 
 	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/cdata"
+	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexcgopb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 )
 
-func NewFFIPackedReader(manifest string, schema *arrow.Schema, neededColumns []string, bufferSize int64, storageConfig *indexpb.StorageConfig, storagePluginContext *indexcgopb.StoragePluginContext) (*FFIPackedReader, error) {
-	cManifest := C.CString(manifest)
-	defer C.free(unsafe.Pointer(cManifest))
+func NewFFIPackedReader(manifestPath string, schema *arrow.Schema, neededColumns []string, bufferSize int64, storageConfig *indexpb.StorageConfig, storagePluginContext *indexcgopb.StoragePluginContext) (*FFIPackedReader, error) {
+	cLoonManifest, err := GetManifestHandle(manifestPath, storageConfig)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get manifest")
+	}
+	defer C.loon_manifest_destroy(cLoonManifest)
 
 	var cas cdata.CArrowSchema
 	cdata.ExportArrowSchema(schema, &cas)
@@ -69,7 +75,7 @@ func NewFFIPackedReader(manifest string, schema *arrow.Schema, neededColumns []s
 			storage_type:           C.CString(storageConfig.GetStorageType()),
 			cloud_provider:         C.CString(storageConfig.GetCloudProvider()),
 			iam_endpoint:           C.CString(storageConfig.GetIAMEndpoint()),
-			log_level:              C.CString("Warn"), // TODO use config after storage support lower case configuration
+			log_level:              C.CString("warn"),
 			useSSL:                 C.bool(storageConfig.GetUseSSL()),
 			sslCACert:              C.CString(storageConfig.GetSslCACert()),
 			useIAM:                 C.bool(storageConfig.GetUseIAM()),
@@ -78,6 +84,9 @@ func NewFFIPackedReader(manifest string, schema *arrow.Schema, neededColumns []s
 			requestTimeoutMs:       C.int64_t(storageConfig.GetRequestTimeoutMs()),
 			gcp_credential_json:    C.CString(storageConfig.GetGcpCredentialJSON()),
 			use_custom_part_upload: true,
+			max_connections:        C.uint32_t(storageConfig.GetMaxConnections()),
+			tls_min_version:        C.CString(tlsMinVersionForStorage(storageConfig.GetSslTlsMinVersion())),
+			use_crc32c_checksum:    C.bool(storageConfig.GetUseCrc32CChecksum()),
 		}
 		defer C.free(unsafe.Pointer(cStorageConfig.address))
 		defer C.free(unsafe.Pointer(cStorageConfig.bucket_name))
@@ -91,6 +100,7 @@ func NewFFIPackedReader(manifest string, schema *arrow.Schema, neededColumns []s
 		defer C.free(unsafe.Pointer(cStorageConfig.sslCACert))
 		defer C.free(unsafe.Pointer(cStorageConfig.region))
 		defer C.free(unsafe.Pointer(cStorageConfig.gcp_credential_json))
+		defer C.free(unsafe.Pointer(cStorageConfig.tls_min_version))
 
 		cNeededColumn := make([]*C.char, len(neededColumns))
 		for i, columnName := range neededColumns {
@@ -100,7 +110,7 @@ func NewFFIPackedReader(manifest string, schema *arrow.Schema, neededColumns []s
 		cNeededColumnArray := (**C.char)(unsafe.Pointer(&cNeededColumn[0]))
 		cNumColumns := C.int64_t(len(neededColumns))
 
-		status = C.NewPackedFFIReaderWithManifest(cManifest, cSchema, cNeededColumnArray, cNumColumns, &cPackedReader, cStorageConfig, pluginContextPtr)
+		status = C.NewPackedFFIReaderWithManifest(cLoonManifest, cSchema, cNeededColumnArray, cNumColumns, &cPackedReader, cStorageConfig, pluginContextPtr)
 	} else {
 		return nil, fmt.Errorf("storageConfig is required")
 	}
@@ -153,6 +163,10 @@ func (r *FFIPackedReader) ReadNext() (arrow.Record, error) {
 
 // Close closes the FFI reader
 func (r *FFIPackedReader) Close() error {
+	if r.cPackedReader == nil {
+		return nil
+	}
+
 	// no need to manual release current batch
 	// stream reader handles it
 
@@ -160,13 +174,9 @@ func (r *FFIPackedReader) Close() error {
 		r.recordReader = nil
 	}
 
-	if r.cPackedReader != 0 {
-		status := C.CloseFFIReader(r.cPackedReader)
-		r.cPackedReader = 0
-		return ConsumeCStatusIntoError(&status)
-	}
-
-	return nil
+	status := C.CloseFFIReader(r.cPackedReader)
+	r.cPackedReader = nil
+	return ConsumeCStatusIntoError(&status)
 }
 
 // Schema returns the schema of the reader
@@ -176,14 +186,44 @@ func (r *FFIPackedReader) Schema() *arrow.Schema {
 
 // Retain increases the reference count
 func (r *FFIPackedReader) Retain() {
-	// if r.recordReader != nil {
-	// r.recordReader.Retain()
-	// }
 }
 
 // Release decreases the reference count
 func (r *FFIPackedReader) Release() {
 	r.Close()
+}
+
+func GetManifestHandle(manifestPath string, storageConfig *indexpb.StorageConfig) (loonManifestHandle *C.LoonManifest, err error) {
+	var cManifestHandle *C.LoonManifest
+	basePath, version, err := UnmarshalManifestPath(manifestPath)
+	if err != nil {
+		return cManifestHandle, err
+	}
+	log.Info("GetManifest", zap.String("manifestPath", manifestPath), zap.String("basePath", basePath), zap.Int64("version", version))
+
+	cProperties, err := MakePropertiesFromStorageConfig(storageConfig, nil)
+	if err != nil {
+		return cManifestHandle, err
+	}
+	defer C.loon_properties_free(cProperties)
+	cBasePath := C.CString(basePath)
+	defer C.free(unsafe.Pointer(cBasePath))
+
+	var cTransactionHandle C.LoonTransactionHandle
+	result := C.loon_transaction_begin(cBasePath, cProperties, C.int64_t(version), C.int32_t(0) /* resolve_id */, C.uint32_t(1) /* retry_limit */, &cTransactionHandle)
+	err = HandleLoonFFIResult(result)
+	if err != nil {
+		return cManifestHandle, err
+	}
+	defer C.loon_transaction_destroy(cTransactionHandle)
+
+	result = C.loon_transaction_get_manifest(cTransactionHandle, &cManifestHandle)
+	err = HandleLoonFFIResult(result)
+	if err != nil {
+		return cManifestHandle, err
+	}
+
+	return cManifestHandle, nil
 }
 
 // Ensure FFIPackedReader implements array.RecordReader interface

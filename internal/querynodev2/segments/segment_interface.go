@@ -85,13 +85,19 @@ type Segment interface {
 	Delete(ctx context.Context, primaryKeys storage.PrimaryKeys, timestamps []typeutil.Timestamp) error
 	LoadDeltaData(ctx context.Context, deltaData *storage.DeltaData) error
 	LastDeltaTimestamp() uint64
-	FinishLoad() error
+	Load(ctx context.Context) error
 	Release(ctx context.Context, opts ...releaseOption)
+	Reopen(ctx context.Context, newLoadInfo *querypb.SegmentLoadInfo) error
 
-	// Bloom filter related
-	SetBloomFilter(bf *pkoracle.BloomFilterSet)
-	BloomFilterExist() bool
-	UpdateBloomFilter(pks []storage.PrimaryKey)
+	// PK candidate related (BloomFilterSet for regular segments, ExternalSegmentCandidate for external)
+	// Segment implements pkoracle.Candidate: MayPkExist, BatchPkExist, ID, Partition, Type,
+	// PkCandidateExist, UpdatePkCandidate, Stats, Charge, Refund — with protective guards (e.g. skipGrowingBF).
+	SetPKCandidate(candidate pkoracle.Candidate)
+	PkCandidateExist() bool
+	UpdatePkCandidate(pks []storage.PrimaryKey)
+	Stats() *storage.PkStatistics
+	Charge()
+	Refund()
 	MayPkExist(lc *storage.LocationsCache) bool
 	BatchPkExist(lc *storage.BatchLocationsCache) []bool
 
@@ -107,7 +113,6 @@ type Segment interface {
 	Search(ctx context.Context, searchReq *segcore.SearchRequest) (*segcore.SearchResult, error)
 	Retrieve(ctx context.Context, plan *segcore.RetrievePlan) (*segcorepb.RetrieveResults, error)
 	RetrieveByOffsets(ctx context.Context, plan *segcore.RetrievePlanWithOffsets) (*segcorepb.RetrieveResults, error)
-	IsLazyLoad() bool
 	ResetIndexesLazyLoad(lazyState bool)
 
 	// lazy load related

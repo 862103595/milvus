@@ -94,7 +94,7 @@ func (s *L0ImportSuite) SetupTest() {
 	s.NoError(err)
 
 	cm := mocks.NewChunkManager(s.T())
-	cm.EXPECT().Read(mock.Anything, mock.Anything).Return(blob.Value, nil)
+	cm.EXPECT().MultiRead(mock.Anything, mock.Anything).Return([][]byte{blob.Value}, nil)
 	cm.EXPECT().WalkWithPrefix(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
 		func(ctx context.Context, s string, b bool, walkFunc storage.ChunkObjectWalkFunc) error {
 			for _, file := range []string{"a/b/c/"} {
@@ -134,7 +134,7 @@ func (s *L0ImportSuite) TestL0Import() {
 	s.syncMgr.EXPECT().SyncDataWithChunkManager(mock.Anything, mock.Anything, mock.Anything).
 		RunAndReturn(func(ctx context.Context, task syncmgr.Task, cm storage.ChunkManager, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
 			alloc := allocator.NewMockAllocator(s.T())
-			alloc.EXPECT().Alloc(mock.Anything).Return(1, int64(s.delCnt)+1, nil)
+			alloc.EXPECT().AllocOne().Return(1, nil)
 			task.(*syncmgr.SyncTask).WithAllocator(alloc)
 
 			s.cm.(*mocks.ChunkManager).EXPECT().RootPath().Return("mock-rootpath")

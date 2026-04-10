@@ -790,6 +790,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             cf.gen_array_field(name=df.array_string_field, element_type=DataType.VARCHAR, max_length=100, nullable=nullable),
             cf.gen_array_field(name=df.array_bool_field, element_type=DataType.BOOL, nullable=nullable),
             cf.gen_geometry_field(name=df.geo_field),
+            cf.gen_timestamptz_field(name=df.timestamp_field, nullable=nullable),
             cf.gen_float_vec_field(name=df.float_vec_field, dim=float_vec_field_dim),
             cf.gen_binary_vec_field(name=df.binary_vec_field, dim=binary_vec_field_dim),
             cf.gen_bfloat16_vec_field(name=df.bf16_vec_field, dim=bf16_vec_field_dim),
@@ -1168,6 +1169,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             cf.gen_array_field(name=df.array_string_field, element_type=DataType.VARCHAR, max_length=100, nullable=nullable),
             cf.gen_array_field(name=df.array_bool_field, element_type=DataType.BOOL, nullable=nullable),
             cf.gen_geometry_field(name=df.geo_field),
+            cf.gen_timestamptz_field(name=df.timestamp_field, nullable=nullable),
             cf.gen_float_vec_field(name=df.float_vec_field, dim=float_vec_field_dim),
             cf.gen_binary_vec_field(name=df.binary_vec_field, dim=binary_vec_field_dim),
             cf.gen_bfloat16_vec_field(name=df.bf16_vec_field, dim=bf16_vec_field_dim),
@@ -1594,6 +1596,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             cf.gen_float_field(name=df.float_field, nullable=nullable),
             cf.gen_string_field(name=df.string_field, nullable=nullable),
             cf.gen_json_field(name=df.json_field, nullable=nullable),
+            cf.gen_timestamptz_field(name=df.timestamp_field, nullable=nullable),
             cf.gen_array_field(name=df.array_int_field, element_type=DataType.INT64, nullable=nullable),
             cf.gen_array_field(name=df.array_float_field, element_type=DataType.FLOAT, nullable=nullable),
             cf.gen_array_field(name=df.array_string_field, element_type=DataType.VARCHAR, max_length=100, nullable=nullable),
@@ -1636,6 +1639,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                     df.float_field: 1.0 if not (nullable and random.random() < 0.5) else None,
                     df.string_field: "string" if not (nullable and random.random() < 0.5) else None,
                     df.json_field: json_value[i%len(json_value)] if not (nullable and random.random() < 0.5) else None,
+                    df.timestamp_field: cf.gen_timestamptz_str() if not (nullable and random.random() < 0.5) else None,
                     df.array_int_field: [1, 2] if not (nullable and random.random() < 0.5) else None,
                     df.array_float_field: [1.0, 2.0] if not (nullable and random.random() < 0.5) else None,
                     df.array_string_field: ["string1", "string2"] if not (nullable and random.random() < 0.5) else None,
@@ -2042,6 +2046,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             cf.gen_float_field(name=df.float_field, nullable=nullable),
             cf.gen_string_field(name=df.string_field, nullable=nullable),
             cf.gen_json_field(name=df.json_field, nullable=nullable),
+            cf.gen_timestamptz_field(name=df.timestamp_field, nullable=nullable),
             cf.gen_array_field(name=df.array_int_field, element_type=DataType.INT64, nullable=nullable),
             cf.gen_array_field(name=df.array_float_field, element_type=DataType.FLOAT, nullable=nullable),
             cf.gen_array_field(name=df.array_string_field, element_type=DataType.VARCHAR, max_length=100, nullable=nullable),
@@ -2084,6 +2089,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                     df.float_field: 1.0 if not (nullable and random.random() < 0.5) else None,
                     df.string_field: "string" if not (nullable and random.random() < 0.5) else None,
                     df.json_field: json_value[i%len(json_value)] if not (nullable and random.random() < 0.5) else None,
+                    df.timestamp_field: cf.gen_timestamptz_str() if not (nullable and random.random() < 0.5) else None,
                     df.array_int_field: [1, 2] if not (nullable and random.random() < 0.5) else None,
                     df.array_float_field: [1.0, 2.0] if not (nullable and random.random() < 0.5) else None,
                     df.array_string_field: ["string1", "string2"] if not (nullable and random.random() < 0.5) else None,
@@ -2191,6 +2197,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
             cf.gen_float_field(name=df.float_field, nullable=nullable),
             cf.gen_string_field(name=df.string_field, nullable=nullable),
             cf.gen_json_field(name=df.json_field, nullable=nullable),
+            cf.gen_timestamptz_field(name=df.timestamp_field, nullable=nullable),
             cf.gen_array_field(name=df.array_int_field, element_type=DataType.INT64, nullable=nullable),
             cf.gen_array_field(name=df.array_float_field, element_type=DataType.FLOAT, nullable=nullable),
             cf.gen_array_field(name=df.array_string_field, element_type=DataType.VARCHAR, max_length=100, nullable=nullable),
@@ -2227,6 +2234,7 @@ class TestBulkInsert(TestcaseBaseBulkInsert):
                     df.float_field: 1.0 if not (nullable and random.random() < 0.5) else None,
                     df.string_field: "string" if not (nullable and random.random() < 0.5) else None,
                     df.json_field: json_value[i%len(json_value)] if not (nullable and random.random() < 0.5) else None,
+                    df.timestamp_field: cf.gen_timestamptz_str() if not (nullable and random.random() < 0.5) else None,
                     df.array_int_field: [1, 2] if not (nullable and random.random() < 0.5) else None,
                     df.array_float_field: [1.0, 2.0] if not (nullable and random.random() < 0.5) else None,
                     df.array_string_field: ["string1", "string2"] if not (nullable and random.random() < 0.5) else None,
@@ -2728,7 +2736,7 @@ class TestImportWithTextEmbeddingFunction(TestcaseBase):
     @pytest.mark.parametrize("file_format", ["json", "parquet", "numpy"])
     @pytest.mark.parametrize("add_field", [True, False])
     @pytest.mark.tags(CaseLabel.L1)
-    def test_import_without_embedding(self, tei_endpoint, minio_host, file_format, add_field):
+    def test_import_without_embedding(self, tei_endpoint, minio_host, minio_bucket, file_format, add_field):
         """
         target: test import data without embedding
         method: 1. create collection
@@ -2770,7 +2778,7 @@ class TestImportWithTextEmbeddingFunction(TestcaseBase):
             schema=schema,
             remote_path="bulk_data",
             connect_param=RemoteBulkWriter.ConnectParam(
-                bucket_name="milvus-bucket",
+                bucket_name=minio_bucket,
                 endpoint=f"{minio_host}:9000",
                 access_key="minioadmin",
                 secret_key="minioadmin",
@@ -2831,7 +2839,7 @@ class TestImportWithFunctionNegative(TestcaseBase):
 
     @pytest.mark.parametrize("file_format", ["json", "parquet"])
     @pytest.mark.tags(CaseLabel.L2)
-    def test_import_for_bm25_function_with_output_field(self, tei_endpoint, minio_host, file_format):
+    def test_import_for_bm25_function_with_output_field(self, tei_endpoint, minio_host, minio_bucket, file_format):
         """
         target: test import data for bm25 with output field
         method: 1. create collection
@@ -2872,7 +2880,7 @@ class TestImportWithFunctionNegative(TestcaseBase):
             schema=invalid_schema,
             remote_path="bulk_data",
             connect_param=RemoteBulkWriter.ConnectParam(
-                bucket_name="milvus-bucket",
+                bucket_name=minio_bucket,
                 endpoint=f"{minio_host}:9000",
                 access_key="minioadmin",
                 secret_key="minioadmin",
@@ -2906,7 +2914,7 @@ class TestImportWithFunctionNegative(TestcaseBase):
 
     @pytest.mark.parametrize("file_format", ["json", "parquet"])
     @pytest.mark.tags(CaseLabel.L1)
-    def test_import_for_text_embedding_function_with_output_field(self, tei_endpoint, minio_host, file_format):
+    def test_import_for_text_embedding_function_with_output_field(self, tei_endpoint, minio_host, minio_bucket, file_format):
         """
         target: test import data for text embedding function with output field
         method: 1. create collection
@@ -2949,7 +2957,7 @@ class TestImportWithFunctionNegative(TestcaseBase):
             schema=invalid_schema,
             remote_path="bulk_data",
             connect_param=RemoteBulkWriter.ConnectParam(
-                bucket_name="milvus-bucket",
+                bucket_name=minio_bucket,
                 endpoint=f"{minio_host}:9000",
                 access_key="minioadmin",
                 secret_key="minioadmin",

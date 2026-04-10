@@ -18,6 +18,7 @@ package httpserver
 
 import (
 	"github.com/milvus-io/milvus/internal/proxy"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 )
 
@@ -69,11 +70,15 @@ const (
 	RevokePrivilegeActionV2         = "revoke_privilege_v2"
 	AlterAction                     = "alter"
 	AlterPropertiesAction           = "alter_properties"
+	AddFunctionAction               = "add_function"
+	AlterFunctionAction             = "alter_function"
+	DropFunctionAction              = "drop_function"
 	AddAction                       = `add`
 	DropPropertiesAction            = "drop_properties"
 	CompactAction                   = "compact"
 	CompactionStateAction           = "get_compaction_state"
 	FlushAction                     = "flush"
+	TruncateAction                  = "truncate"
 	GetProgressAction               = "get_progress" // deprecated, keep it for compatibility, use `/v2/vectordb/jobs/import/describe` instead
 	AddPrivilegesToGroupAction      = "add_privileges_to_group"
 	RemovePrivilegesFromGroupAction = "remove_privileges_from_group"
@@ -189,6 +194,8 @@ const (
 	DefaultMetricType       = metric.COSINE
 	DefaultPrimaryFieldName = "id"
 	DefaultVectorFieldName  = "vector"
+
+	HTTPWarmupKey = common.WarmupKey
 
 	Dim = "dim"
 )

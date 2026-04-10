@@ -31,13 +31,14 @@ func TestGetJSONParams(t *testing.T) {
 	jsonStr, err := GenerateJSONParams()
 	assert.NoError(t, err)
 
+	storageVersion := storage.StorageV2
+	if paramtable.Get().CommonCfg.UseLoonFFI.GetAsBool() {
+		storageVersion = storage.StorageV3
+	}
+
 	var result Params
 	err = json.Unmarshal([]byte(jsonStr), &result)
 	assert.NoError(t, err)
-	storageVersion := storage.StorageV1
-	if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
-		storageVersion = storage.StorageV2
-	}
 	assert.Equal(t, Params{
 		StorageVersion:            storageVersion,
 		BinLogMaxSize:             paramtable.Get().DataNodeCfg.BinLogMaxSize.GetAsUint64(),
@@ -46,6 +47,7 @@ func TestGetJSONParams(t *testing.T) {
 		PreferSegmentSizeRatio:    paramtable.Get().DataCoordCfg.ClusteringCompactionPreferSegmentSizeRatio.GetAsFloat(),
 		BloomFilterApplyBatchSize: paramtable.Get().CommonCfg.BloomFilterApplyBatchSize.GetAsInt(),
 		StorageConfig:             CreateStorageConfig(),
+		UseLoonFFI:                paramtable.Get().CommonCfg.UseLoonFFI.GetAsBool(),
 	}, result)
 }
 
@@ -82,19 +84,6 @@ func TestGetParamsFromJSON_InvalidJSON(t *testing.T) {
 func TestGetParamsFromJSON_EmptyJSON(t *testing.T) {
 	// Test compatibility
 	emptyJSON := ``
-	result, err := ParseParamsFromJSON(emptyJSON)
-	assert.NoError(t, err)
-	storageVersion := storage.StorageV1
-	if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
-		storageVersion = storage.StorageV2
-	}
-	assert.Equal(t, Params{
-		StorageVersion:            storageVersion,
-		BinLogMaxSize:             paramtable.Get().DataNodeCfg.BinLogMaxSize.GetAsUint64(),
-		UseMergeSort:              paramtable.Get().DataNodeCfg.UseMergeSort.GetAsBool(),
-		MaxSegmentMergeSort:       paramtable.Get().DataNodeCfg.MaxSegmentMergeSort.GetAsInt(),
-		PreferSegmentSizeRatio:    paramtable.Get().DataCoordCfg.ClusteringCompactionPreferSegmentSizeRatio.GetAsFloat(),
-		BloomFilterApplyBatchSize: paramtable.Get().CommonCfg.BloomFilterApplyBatchSize.GetAsInt(),
-		StorageConfig:             CreateStorageConfig(),
-	}, result)
+	_, err := ParseParamsFromJSON(emptyJSON)
+	assert.Error(t, err)
 }

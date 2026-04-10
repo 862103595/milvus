@@ -41,12 +41,6 @@ func (r *recoveryStorageImpl) recoverFromStream(
 			r.Logger().Warn("recovery from wal stream failed", zap.Error(err))
 			return
 		}
-		r.Logger().Info("recovery from wal stream done",
-			zap.Int("vchannels", len(snapshot.VChannels)),
-			zap.Int("segments", len(snapshot.SegmentAssignments)),
-			zap.String("checkpoint", snapshot.Checkpoint.MessageID.String()),
-			zap.Uint64("timetick", snapshot.Checkpoint.TimeTick),
-		)
 	}()
 L:
 	for {
@@ -66,6 +60,20 @@ L:
 	}
 	snapshot = r.getSnapshot()
 	snapshot.TxnBuffer = rs.TxnBuffer()
+	logFields := []zap.Field{
+		zap.String("channel", recoveryStreamBuilder.Channel().String()),
+		zap.Int("vchannels", len(snapshot.VChannels)),
+		zap.Int("segments", len(snapshot.SegmentAssignments)),
+		zap.String("checkpoint", snapshot.Checkpoint.MessageID.String()),
+		zap.Uint64("checkpointTimeTick", snapshot.Checkpoint.TimeTick),
+	}
+	if snapshot.AlterWALInfo != nil {
+		logFields = append(logFields,
+			zap.Bool("foundAlterWALMsg", snapshot.AlterWALInfo.FoundAlterWALMsg),
+			zap.Stringer("targetWALName", snapshot.AlterWALInfo.TargetWALName),
+		)
+	}
+	r.Logger().Info("recovery from wal stream done", logFields...)
 	return snapshot, nil
 }
 
@@ -75,19 +83,51 @@ L:
 func (r *recoveryStorageImpl) getSnapshot() *RecoverySnapshot {
 	segments := make(map[int64]*streamingpb.SegmentAssignmentMeta, len(r.segments))
 	vchannels := make(map[string]*streamingpb.VChannelMeta, len(r.vchannels))
-	for segmentID, segment := range r.segments {
-		if segment.IsGrowing() {
-			segments[segmentID] = proto.Clone(segment.meta).(*streamingpb.SegmentAssignmentMeta)
-		}
-	}
+	// Collect active vchannels and build a set of active partition IDs (globally unique).
+	activePartitions := make(map[int64]struct{})
 	for channelName, vchannel := range r.vchannels {
 		if vchannel.IsActive() {
 			vchannels[channelName] = proto.Clone(vchannel.meta).(*streamingpb.VChannelMeta)
+			for _, p := range vchannel.meta.CollectionInfo.Partitions {
+				activePartitions[p.PartitionId] = struct{}{}
+			}
 		}
 	}
-	return &RecoverySnapshot{
+	for segmentID, segment := range r.segments {
+		if !segment.IsGrowing() {
+			continue
+		}
+		// Defensive filtering: skip GROWING segments whose parent vchannel does not exist
+		// or is not active, or whose partition has been dropped. This can happen due to
+		// non-atomic etcd persistence or Kafka offset compaction replaying CreateSegment
+		// for dropped collections/partitions.
+		if _, ok := vchannels[segment.meta.Vchannel]; !ok {
+			r.Logger().Warn("getSnapshot: skipping orphaned growing segment with non-active vchannel",
+				zap.Int64("segmentID", segmentID),
+				zap.String("vchannel", segment.meta.Vchannel),
+				zap.Int64("collectionID", segment.meta.CollectionId),
+			)
+			continue
+		}
+		if _, ok := activePartitions[segment.meta.PartitionId]; !ok {
+			r.Logger().Warn("getSnapshot: skipping orphaned growing segment with dropped partition",
+				zap.Int64("segmentID", segmentID),
+				zap.String("vchannel", segment.meta.Vchannel),
+				zap.Int64("collectionID", segment.meta.CollectionId),
+				zap.Int64("partitionID", segment.meta.PartitionId),
+			)
+			continue
+		}
+		segments[segmentID] = proto.Clone(segment.meta).(*streamingpb.SegmentAssignmentMeta)
+	}
+	snapshot := &RecoverySnapshot{
 		VChannels:          vchannels,
 		SegmentAssignments: segments,
 		Checkpoint:         r.checkpoint.Clone(),
 	}
+	if r.alterWALInfo != nil {
+		alterWALInfoCopy := *r.alterWALInfo
+		snapshot.AlterWALInfo = &alterWALInfoCopy
+	}
+	return snapshot
 }

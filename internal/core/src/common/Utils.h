@@ -20,14 +20,17 @@
 #include <cstring>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "common/Consts.h"
 #include "common/FieldMeta.h"
 #include "common/LoadInfo.h"
+#include "common/Schema.h"
 #include "common/Types.h"
 #include "common/EasyAssert.h"
 #include "knowhere/dataset.h"
@@ -85,12 +88,7 @@ PrefixMatch(const std::string_view str, const std::string_view prefix) {
     if (prefix.length() > str.length()) {
         return false;
     }
-    auto ret = strncmp(str.data(), prefix.data(), prefix.length());
-    if (ret != 0) {
-        return false;
-    }
-
-    return true;
+    return memcmp(str.data(), prefix.data(), prefix.length()) == 0;
 }
 
 inline DatasetPtr
@@ -123,20 +121,8 @@ PostfixMatch(const std::string_view str, const std::string_view postfix) {
         return false;
     }
 
-    int offset = str.length() - postfix.length();
-    auto ret = strncmp(str.data() + offset, postfix.data(), postfix.length());
-    if (ret != 0) {
-        return false;
-    }
-    //
-    //    int i = postfix.length() - 1;
-    //    int j = str.length() - 1;
-    //    for (; i >= 0; i--, j--) {
-    //        if (postfix[i] != str[j]) {
-    //            return false;
-    //        }
-    //    }
-    return true;
+    size_t offset = str.length() - postfix.length();
+    return memcmp(str.data() + offset, postfix.data(), postfix.length()) == 0;
 }
 
 inline bool
@@ -145,6 +131,21 @@ InnerMatch(const std::string_view str, const std::string_view pattern) {
         return false;
     }
     return str.find(pattern) != std::string::npos;
+}
+
+// Escape LIKE metacharacters (%, _, \) in a string so it can be safely
+// embedded in a LIKE pattern. Uses '\' as the escape character.
+inline std::string
+EscapeLikePattern(const std::string& literal) {
+    std::string escaped;
+    escaped.reserve(literal.size());
+    for (char c : literal) {
+        if (c == '%' || c == '_' || c == '\\') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    return escaped;
 }
 
 inline int64_t
@@ -172,7 +173,10 @@ PositivelyRelated(const knowhere::MetricType& metric_type) {
     return IsMetricType(metric_type, knowhere::metric::IP) ||
            IsMetricType(metric_type, knowhere::metric::COSINE) ||
            IsMetricType(metric_type, knowhere::metric::BM25) ||
-           IsMetricType(metric_type, knowhere::metric::MHJACCARD);
+           IsMetricType(metric_type, knowhere::metric::MHJACCARD) ||
+           IsMetricType(metric_type, knowhere::metric::MAX_SIM) ||
+           IsMetricType(metric_type, knowhere::metric::MAX_SIM_IP) ||
+           IsMetricType(metric_type, knowhere::metric::MAX_SIM_COSINE);
 }
 
 inline std::string
@@ -300,7 +304,9 @@ CopyAndWrapSparseRow(const void* data,
 template <typename Iterable>
 std::unique_ptr<knowhere::sparse::SparseRow<SparseValueType>[]>
 SparseBytesToRows(const Iterable& rows, const bool validate = false) {
-    AssertInfo(rows.size() > 0, "at least 1 sparse row should be provided");
+    if (rows.size() == 0) {
+        return nullptr;
+    }
     auto res = std::make_unique<knowhere::sparse::SparseRow<SparseValueType>[]>(
         rows.size());
     for (size_t i = 0; i < rows.size(); ++i) {
@@ -345,5 +351,228 @@ class Defer {
 };
 
 #define DeferLambda(fn) Defer Defer_##__COUNTER__(fn);
+
+template <typename T>
+FOLLY_ALWAYS_INLINE int
+comparePrimitiveAsc(const T& left, const T& right) {
+    if constexpr (std::is_floating_point<T>::value) {
+        bool leftNan = std::isnan(left);
+        bool rightNan = std::isnan(right);
+        if (leftNan) {
+            return rightNan ? 0 : 1;
+        }
+        if (rightNan) {
+            return -1;
+        }
+    }
+    return left < right ? -1 : left == right ? 0 : 1;
+}
+
+inline std::string
+lowerString(const std::string& str) {
+    std::string ret;
+    ret.resize(str.size());
+    std::transform(str.begin(), str.end(), ret.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    return ret;
+}
+
+template <typename T>
+T
+checkPlus(const T& a, const T& b, const char* typeName = "integer") {
+    static_assert(std::is_integral_v<T>, "checkPlus requires integral type");
+#if defined(__GNUC__) || defined(__clang__)
+    // Use compiler builtin for GCC/Clang
+    T result;
+    bool overflow = __builtin_add_overflow(a, b, &result);
+    if (UNLIKELY(overflow)) {
+        ThrowInfo(DataTypeInvalid, "{} overflow: {} + {}", typeName, a, b);
+    }
+    return result;
+#else
+    // Portable fallback for MSVC and other compilers
+    constexpr T max_val = std::numeric_limits<T>::max();
+    constexpr T min_val = std::numeric_limits<T>::min();
+
+    bool overflow = false;
+    if (b > 0) {
+        // Positive addition: check if a > max - b
+        if (a > max_val - b) {
+            overflow = true;
+        }
+    } else if (b < 0) {
+        // Negative addition: check if a < min - b
+        if (a < min_val - b) {
+            overflow = true;
+        }
+    }
+    // If b == 0, no overflow possible
+
+    if (UNLIKELY(overflow)) {
+        ThrowInfo(DataTypeInvalid, "{} overflow: {} + {}", typeName, a, b);
+    }
+    return a + b;
+#endif
+}
+
+template <typename T>
+T
+checkedMultiply(const T& a, const T& b, const char* typeName = "integer") {
+    static_assert(std::is_integral_v<T>,
+                  "checkedMultiply requires integral type");
+#if defined(__GNUC__) || defined(__clang__)
+    // Use compiler builtin for GCC/Clang
+    T result;
+    bool overflow = __builtin_mul_overflow(a, b, &result);
+    if (UNLIKELY(overflow)) {
+        ThrowInfo(DataTypeInvalid, "{} overflow: {} * {}", typeName, a, b);
+    }
+    return result;
+#else
+    // Portable fallback for MSVC and other compilers
+    constexpr T max_val = std::numeric_limits<T>::max();
+    constexpr T min_val = std::numeric_limits<T>::min();
+
+    // Handle zero case: no overflow if either operand is zero
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+
+    bool overflow = false;
+
+    if constexpr (std::is_signed_v<T>) {
+        // Signed type: handle MIN edge case and use absolute values
+        if (a == min_val) {
+            // Special case: if a is MIN, only safe multiplications are with
+            // 0 (already handled), 1, or -1
+            if (b != 1 && b != -1) {
+                overflow = true;
+            }
+        } else if (b == min_val) {
+            // Special case: if b is MIN, only safe multiplications are with
+            // 0 (already handled), 1, or -1
+            if (a != 1 && a != -1) {
+                overflow = true;
+            }
+        } else {
+            // Use division-based check: |a| > max_val / |b| implies overflow
+            // Compute absolute values carefully to avoid overflow
+            T abs_a = (a < 0) ? -a : a;
+            T abs_b = (b < 0) ? -b : b;
+
+            // Check: abs_a > max_val / abs_b
+            // This works because both operands are not MIN (handled above)
+            // and not zero (handled above)
+            if (abs_a > max_val / abs_b) {
+                overflow = true;
+            }
+        }
+    } else {
+        // Unsigned type: simpler case
+        // Check: a > max_val / b
+        if (a > max_val / b) {
+            overflow = true;
+        }
+    }
+
+    if (UNLIKELY(overflow)) {
+        ThrowInfo(DataTypeInvalid, "{} overflow: {} * {}", typeName, a, b);
+    }
+    return a * b;
+#endif
+}
+
+inline const char* const KSum = "sum";
+inline const char* const KMin = "min";
+inline const char* const KMax = "max";
+inline const char* const KCount = "count";
+inline const char* const KAvg = "avg";
+
+inline DataType
+GetAggResultType(std::string func_name, DataType input_type) {
+    if (func_name == KSum) {
+        switch (input_type) {
+            case DataType::INT8:
+            case DataType::INT16:
+            case DataType::INT32:
+            case DataType::INT64: {
+                return DataType::INT64;
+            }
+            case DataType::TIMESTAMPTZ: {
+                return DataType::TIMESTAMPTZ;
+            }
+            case DataType::FLOAT: {
+                return DataType::DOUBLE;
+            }
+            case DataType::DOUBLE: {
+                return DataType::DOUBLE;
+            }
+            default: {
+                ThrowInfo(DataTypeInvalid,
+                          "Unsupported data type for type:{}",
+                          input_type);
+            }
+        }
+    }
+    if (func_name == KAvg) {
+        switch (input_type) {
+            case DataType::INT8:
+            case DataType::INT16:
+            case DataType::INT32:
+            case DataType::INT64:
+            case DataType::FLOAT:
+            case DataType::DOUBLE: {
+                return DataType::DOUBLE;
+            }
+            default: {
+                ThrowInfo(DataTypeInvalid,
+                          "Unsupported data type for {} aggregation: {}",
+                          func_name,
+                          input_type);
+            }
+        }
+    }
+    if (func_name == KMin || func_name == KMax) {
+        // min/max keep the original scalar type.
+        switch (input_type) {
+            case DataType::INT8:
+            case DataType::INT16:
+            case DataType::INT32:
+            case DataType::INT64:
+            case DataType::FLOAT:
+            case DataType::DOUBLE:
+            case DataType::VARCHAR:
+            case DataType::STRING:
+            case DataType::TEXT:
+            case DataType::TIMESTAMPTZ: {
+                return input_type;
+            }
+            default: {
+                ThrowInfo(DataTypeInvalid,
+                          "Unsupported data type for {} aggregation: {}",
+                          func_name,
+                          input_type);
+            }
+        }
+    }
+    if (func_name == KCount) {
+        return DataType::INT64;
+    }
+    ThrowInfo(OpTypeInvalid, "Unsupported func type:{}", func_name);
+}
+
+inline int32_t
+Align(int32_t number, int32_t alignment) {
+    AssertInfo(alignment > 0 && (alignment & (alignment - 1)) == 0,
+               "Alignment must be a power of 2, got {}",
+               alignment);
+    return (number + alignment - 1) & ~(alignment - 1);
+}
+
+inline bool
+IsStructSubField(const std::string& fieldName) {
+    return fieldName.find('[') != std::string::npos;
+}
 
 }  // namespace milvus

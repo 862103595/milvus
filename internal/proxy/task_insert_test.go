@@ -405,11 +405,6 @@ func TestInsertTask_KeepUserPK_WhenAllowInsertAutoIDTrue(t *testing.T) {
 		mock.Anything,
 	).Return(&collectionInfo{schema: info}, nil)
 
-	cache.On("GetDatabaseInfo",
-		mock.Anything,
-		mock.Anything,
-	).Return(&databaseInfo{properties: []*commonpb.KeyValuePair{}}, nil)
-
 	globalMetaCache = cache
 
 	err = task.PreExecute(context.Background())
@@ -557,11 +552,6 @@ func TestInsertTask_Function(t *testing.T) {
 		mock.Anything,
 		mock.Anything,
 	).Return(&collectionInfo{schema: info}, nil)
-	cache.On("GetDatabaseInfo",
-		mock.Anything,
-		mock.Anything,
-	).Return(&databaseInfo{properties: []*commonpb.KeyValuePair{}}, nil)
-
 	globalMetaCache = cache
 	err = task.PreExecute(ctx)
 	assert.NoError(t, err)
@@ -588,8 +578,13 @@ func TestInsertTaskForSchemaMismatch(t *testing.T) {
 		mockCache.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
 		mockCache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&collectionInfo{
 			updateTimestamp: 100,
+			schema: newSchemaInfo(&schemapb.CollectionSchema{
+				Name: "fooooo",
+				Fields: []*schemapb.FieldSchema{
+					{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+				},
+			}),
 		}, nil)
-		mockCache.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{dbID: 0}, nil)
 		err := it.PreExecute(ctx)
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, merr.ErrCollectionSchemaMismatch)
@@ -598,8 +593,6 @@ func TestInsertTaskForSchemaMismatch(t *testing.T) {
 
 func TestInsertTask_Namespace(t *testing.T) {
 	paramtable.Init()
-	paramtable.Get().CommonCfg.EnableNamespace.SwapTempValue("true")
-	defer paramtable.Get().CommonCfg.EnableNamespace.SwapTempValue("false")
 	cache := NewMockCache(t)
 	globalMetaCache = cache
 	cache.On("GetDatabaseInfo",
@@ -612,8 +605,8 @@ func TestInsertTask_Namespace(t *testing.T) {
 	rc.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
 		Status: merr.Status(nil),
 		ID:     11198,
-		Count:  10,
-	}, nil)
+		Count:  100,
+	}, nil).Maybe()
 	idAllocator, err := allocator.NewIDAllocator(ctx, rc, 0)
 	idAllocator.Start()
 	defer idAllocator.Close()
@@ -627,9 +620,7 @@ func TestInsertTask_Namespace(t *testing.T) {
 				{Key: common.MaxLengthKey, Value: "100"},
 			}},
 		},
-		Properties: []*commonpb.KeyValuePair{
-			{Key: common.NamespaceEnabledKey, Value: "true"},
-		},
+		EnableNamespace: true,
 	}
 
 	schemaWithNamespaceDisabled := &schemapb.CollectionSchema{
@@ -642,10 +633,17 @@ func TestInsertTask_Namespace(t *testing.T) {
 	t.Run("test insert with namespace enabled", func(t *testing.T) {
 		cache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Unset()
 		cache.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Unset()
+		cache.EXPECT().GetPartitionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Unset()
 		cache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&collectionInfo{
 			schema: newSchemaInfo(schemaWithNamespaceEnabled),
 		}, nil).Maybe()
 		cache.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Return(newSchemaInfo(schemaWithNamespaceEnabled), nil).Maybe()
+		cache.EXPECT().GetPartitionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&partitionInfo{
+			name:                "p1",
+			partitionID:         10,
+			createdTimestamp:    10001,
+			createdUtcTimestamp: 10002,
+		}, nil).Maybe()
 		namespace := "test"
 		it := insertTask{
 			ctx: context.Background(),

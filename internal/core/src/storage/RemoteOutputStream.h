@@ -11,8 +11,11 @@
 
 #pragma once
 
+#include <stddef.h>
+#include <memory>
+
+#include "arrow/io/interfaces.h"
 #include "filemanager/OutputStream.h"
-#include "milvus-storage/filesystem/fs.h"
 
 namespace milvus::storage {
 
@@ -21,7 +24,7 @@ class RemoteOutputStream : public milvus::OutputStream {
     explicit RemoteOutputStream(
         std::shared_ptr<arrow::io::OutputStream>&& output_stream);
 
-    ~RemoteOutputStream() override = default;
+    ~RemoteOutputStream() override;
 
     size_t
     Tell() const override;
@@ -31,6 +34,9 @@ class RemoteOutputStream : public milvus::OutputStream {
 
     size_t
     Write(int fd, size_t size) override;
+
+    void
+    Close() override;
 
  private:
     std::shared_ptr<arrow::io::OutputStream> output_stream_;

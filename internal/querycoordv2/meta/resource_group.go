@@ -13,7 +13,6 @@ import (
 var (
 	DefaultResourceGroupName           = "__default_resource_group"
 	defaultResourceGroupCapacity int32 = 1000000
-	resourceGroupTransferBoost         = 10000
 )
 
 func NewResourceGroupConfig(request int32, limit int32) *rgpb.ResourceGroupConfig {
@@ -96,6 +95,11 @@ func (rg *ResourceGroup) GetConfig() *rgpb.ResourceGroupConfig {
 // GetConfigCloned return a cloned resource group config.
 func (rg *ResourceGroup) GetConfigCloned() *rgpb.ResourceGroupConfig {
 	return proto.Clone(rg.cfg).(*rgpb.ResourceGroupConfig)
+}
+
+// GetAllNodes return all physical nodes of resource group, bypassing node label filter.
+func (rg *ResourceGroup) GetAllNodes() []int64 {
+	return rg.nodes.Collect()
 }
 
 // GetNodes return nodes of resource group which match required node labels
@@ -197,13 +201,17 @@ func (rg *ResourceGroup) SelectNodeForRG(targetRG *ResourceGroup) int64 {
 
 // return node and priority.
 func (rg *ResourceGroup) AcceptNode(nodeID int64) bool {
-	if rg.GetName() == DefaultResourceGroupName {
-		return true
-	}
-
 	nodeInfo := rg.nodeMgr.Get(nodeID)
 	if nodeInfo == nil {
 		return false
+	}
+
+	if nodeInfo.ResourceGroupName() != "" && nodeInfo.ResourceGroupName() != rg.GetName() {
+		return false
+	}
+
+	if rg.GetName() == DefaultResourceGroupName {
+		return true
 	}
 
 	requiredNodeLabels := rg.GetConfig().GetNodeFilter().GetNodeLabels()

@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -43,7 +44,6 @@ type IndexTaskInfo struct {
 	MemSize                   uint64
 	FailReason                string
 	CurrentIndexVersion       int32
-	IndexStoreVersion         int64
 	CurrentScalarIndexVersion int32
 
 	// task statistics
@@ -59,7 +59,6 @@ func (i *IndexTaskInfo) Clone() *IndexTaskInfo {
 		MemSize:                   i.MemSize,
 		FailReason:                i.FailReason,
 		CurrentIndexVersion:       i.CurrentIndexVersion,
-		IndexStoreVersion:         i.IndexStoreVersion,
 		CurrentScalarIndexVersion: i.CurrentScalarIndexVersion,
 		statistic:                 typeutil.Clone(i.statistic),
 	}
@@ -74,7 +73,6 @@ func (i *IndexTaskInfo) ToIndexTaskInfo(buildID int64) *workerpb.IndexTaskInfo {
 		MemSize:                   i.MemSize,
 		FailReason:                i.FailReason,
 		CurrentIndexVersion:       i.CurrentIndexVersion,
-		IndexStoreVersion:         i.IndexStoreVersion,
 		CurrentScalarIndexVersion: i.CurrentScalarIndexVersion,
 	}
 }
@@ -355,6 +353,8 @@ type StatsTaskInfo struct {
 	TextStatsLogs    map[int64]*datapb.TextIndexStats
 	Bm25Logs         []*datapb.FieldBinlog
 	JSONKeyStatsLogs map[int64]*datapb.JsonKeyStats
+	FileResources    []*internalpb.FileResourceInfo
+	Manifest         string
 }
 
 func (s *StatsTaskInfo) Clone() *StatsTaskInfo {
@@ -372,6 +372,8 @@ func (s *StatsTaskInfo) Clone() *StatsTaskInfo {
 		TextStatsLogs:    s.CloneTextStatsLogs(),
 		Bm25Logs:         s.CloneBm25Logs(),
 		JSONKeyStatsLogs: s.CloneJSONKeyStatsLogs(),
+		FileResources:    s.CloneFileResources(),
+		Manifest:         s.Manifest,
 	}
 }
 
@@ -390,7 +392,16 @@ func (s *StatsTaskInfo) ToStatsResult(taskID int64) *workerpb.StatsResult {
 		Bm25Logs:         s.Bm25Logs,
 		NumRows:          s.NumRows,
 		JsonKeyStatsLogs: s.JSONKeyStatsLogs,
+		Manifest:         s.Manifest,
 	}
+}
+
+func (s *StatsTaskInfo) CloneFileResources() []*internalpb.FileResourceInfo {
+	clone := make([]*internalpb.FileResourceInfo, len(s.FileResources))
+	for i, resource := range s.FileResources {
+		clone[i] = typeutil.Clone(resource)
+	}
+	return clone
 }
 
 func (s *StatsTaskInfo) CloneInsertLogs() []*datapb.FieldBinlog {
@@ -479,6 +490,7 @@ func (m *TaskManager) StorePKSortStatsResult(
 	insertLogs []*datapb.FieldBinlog,
 	statsLogs []*datapb.FieldBinlog,
 	bm25Logs []*datapb.FieldBinlog,
+	manifest string,
 ) {
 	key := Key{ClusterID: ClusterID, TaskID: taskID}
 	m.stateLock.Lock()
@@ -492,6 +504,7 @@ func (m *TaskManager) StorePKSortStatsResult(
 		info.InsertLogs = insertLogs
 		info.StatsLogs = statsLogs
 		info.Bm25Logs = bm25Logs
+		info.Manifest = manifest
 		return
 	}
 }
@@ -504,6 +517,7 @@ func (m *TaskManager) StoreStatsTextIndexResult(
 	segID typeutil.UniqueID,
 	channel string,
 	texIndexLogs map[int64]*datapb.TextIndexStats,
+	manifest string,
 ) {
 	key := Key{ClusterID: ClusterID, TaskID: taskID}
 	m.stateLock.Lock()
@@ -514,6 +528,7 @@ func (m *TaskManager) StoreStatsTextIndexResult(
 		info.CollID = collID
 		info.PartID = partID
 		info.InsertChannel = channel
+		info.Manifest = manifest
 	}
 }
 
@@ -525,6 +540,7 @@ func (m *TaskManager) StoreJSONKeyStatsResult(
 	segID typeutil.UniqueID,
 	channel string,
 	jsonKeyIndexLogs map[int64]*datapb.JsonKeyStats,
+	manifest string,
 ) {
 	key := Key{ClusterID: clusterID, TaskID: taskID}
 	m.stateLock.Lock()
@@ -535,6 +551,7 @@ func (m *TaskManager) StoreJSONKeyStatsResult(
 		info.CollID = collID
 		info.PartID = partID
 		info.InsertChannel = channel
+		info.Manifest = manifest
 	}
 }
 

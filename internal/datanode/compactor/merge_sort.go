@@ -44,7 +44,9 @@ func mergeSortMultipleSegments(ctx context.Context,
 	logIDAlloc := allocator.NewLocalAllocator(plan.GetPreAllocatedLogIDs().GetBegin(), plan.GetPreAllocatedLogIDs().GetEnd())
 	compAlloc := NewCompactionAllocator(segIDAlloc, logIDAlloc)
 	writer, err := NewMultiSegmentWriter(ctx, binlogIO, compAlloc, plan.GetMaxSize(), plan.GetSchema(), compactionParams, maxRows, partitionID, collectionID, plan.GetChannel(), 4096,
-		storage.WithStorageConfig(compactionParams.StorageConfig))
+		storage.WithStorageConfig(compactionParams.StorageConfig),
+		storage.WithUseLoonFFI(compactionParams.UseLoonFFI),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -55,28 +57,39 @@ func mergeSortMultipleSegments(ctx context.Context,
 		return nil, err
 	}
 
+	ttlFieldID := getTTLFieldID(plan.GetSchema())
+	hasTTLField := ttlFieldID >= common.StartOfUserFieldID
+
 	segmentReaders := make([]storage.RecordReader, len(binlogs))
 	segmentFilters := make([]compaction.EntityFilter, len(binlogs))
 	for i, s := range binlogs {
-		reader, err := storage.NewBinlogRecordReader(ctx,
-			s.GetFieldBinlogs(),
-			plan.GetSchema(),
-			storage.WithCollectionID(collectionID),
-			storage.WithDownloader(binlogIO.Download),
-			storage.WithVersion(s.StorageVersion),
-			storage.WithStorageConfig(compactionParams.StorageConfig),
-		)
+		var reader storage.RecordReader
+		if s.GetManifest() != "" {
+			reader, err = storage.NewManifestRecordReader(ctx,
+				s.GetManifest(),
+				plan.GetSchema(),
+				storage.WithCollectionID(collectionID),
+				storage.WithDownloader(binlogIO.Download),
+				storage.WithVersion(s.StorageVersion),
+				storage.WithStorageConfig(compactionParams.StorageConfig),
+			)
+		} else {
+			reader, err = storage.NewBinlogRecordReader(ctx,
+				s.GetFieldBinlogs(),
+				plan.GetSchema(),
+				storage.WithCollectionID(collectionID),
+				storage.WithDownloader(binlogIO.Download),
+				storage.WithVersion(s.StorageVersion),
+				storage.WithStorageConfig(compactionParams.StorageConfig),
+			)
+		}
 		if err != nil {
 			return nil, err
 		}
 		segmentReaders[i] = reader
-		deltalogPaths := make([]string, 0)
-		for _, d := range s.GetDeltalogs() {
-			for _, l := range d.GetBinlogs() {
-				deltalogPaths = append(deltalogPaths, l.GetLogPath())
-			}
-		}
-		delta, err := compaction.ComposeDeleteFromDeltalogs(ctx, binlogIO, deltalogPaths)
+		delta, err := compaction.ComposeDeleteFromDeltalogs(ctx, pkField.DataType, s,
+			storage.WithDownloader(binlogIO.Download),
+			storage.WithStorageConfig(compactionParams.StorageConfig))
 		if err != nil {
 			return nil, err
 		}
@@ -95,13 +108,27 @@ func mergeSortMultipleSegments(ctx context.Context,
 		predicate = func(r storage.Record, ri, i int) bool {
 			pk := r.Column(pkField.FieldID).(*array.Int64).Value(i)
 			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
-			return !segmentFilters[ri].Filtered(pk, uint64(ts))
+			expireTs := int64(-1)
+			if hasTTLField {
+				col := r.Column(ttlFieldID).(*array.Int64)
+				if col.IsValid(i) {
+					expireTs = col.Value(i)
+				}
+			}
+			return !segmentFilters[ri].Filtered(pk, uint64(ts), expireTs)
 		}
 	case schemapb.DataType_VarChar:
 		predicate = func(r storage.Record, ri, i int) bool {
 			pk := r.Column(pkField.FieldID).(*array.String).Value(i)
 			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
-			return !segmentFilters[ri].Filtered(pk, uint64(ts))
+			expireTs := int64(-1)
+			if hasTTLField {
+				col := r.Column(ttlFieldID).(*array.Int64)
+				if col.IsValid(i) {
+					expireTs = col.Value(i)
+				}
+			}
+			return !segmentFilters[ri].Filtered(pk, uint64(ts), expireTs)
 		}
 	default:
 		log.Warn("compaction only support int64 and varchar pk field")
@@ -118,8 +145,10 @@ func mergeSortMultipleSegments(ctx context.Context,
 	}
 
 	res := writer.GetCompactionSegments()
+	isNamespaceSorted := plan.GetSchema().GetEnableNamespace()
 	for _, seg := range res {
-		seg.IsSorted = true
+		seg.IsSorted = !isNamespaceSorted
+		seg.IsSortedByNamespace = isNamespaceSorted
 	}
 
 	var (

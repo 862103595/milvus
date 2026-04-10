@@ -98,8 +98,8 @@ func (s *L0Segment) LastDeltaTimestamp() uint64 {
 	s.dataGuard.RLock()
 	defer s.dataGuard.RUnlock()
 
-	last, err := lo.Last(s.tss)
-	if err != nil {
+	last, ok := lo.Last(s.tss)
+	if !ok {
 		return 0
 	}
 	return last
@@ -178,8 +178,12 @@ func (s *L0Segment) DeleteRecords() ([]storage.PrimaryKey, []uint64) {
 	return s.pks, s.tss
 }
 
-func (s *L0Segment) FinishLoad() error {
+func (s *L0Segment) Load(ctx context.Context) error {
 	return nil
+}
+
+func (s *L0Segment) Reopen(ctx context.Context, newLoadInfo *querypb.SegmentLoadInfo) error {
+	return merr.WrapErrServiceInternal("unexpected reopen on l0 segment")
 }
 
 func (s *L0Segment) Release(ctx context.Context, opts ...releaseOption) {

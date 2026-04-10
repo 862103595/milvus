@@ -12,13 +12,15 @@
 #pragma once
 
 #include <boost/dynamic_bitset.hpp>
+#include <functional>
 #include <memory>
 
 #include "Plan.h"
 #include "PlanNode.h"
 #include "common/Schema.h"
+#include "expr/ITypeExpr.h"
 #include "pb/plan.pb.h"
-#include "plan/PlanNode.h"
+#include "rescores/Scorer.h"
 
 namespace milvus::query {
 
@@ -107,11 +109,20 @@ class ProtoParser {
         const proto::plan::TimestamptzArithCompareExpr& expr_pb);
 
     expr::TypedExprPtr
+    ParseElementFilterExprs(const proto::plan::ElementFilterExpr& expr_pb);
+
+    expr::TypedExprPtr
+    ParseMatchExprs(const proto::plan::MatchExpr& expr_pb);
+
+    expr::TypedExprPtr
     ParseValueExprs(const proto::plan::ValueExpr& expr_pb);
 
     void
     PlanOptionsFromProto(const proto::plan::PlanOption& plan_option_proto,
                          PlanOptions& plan_options);
+
+    SearchInfo
+    ParseSearchInfo(const proto::plan::VectorANNS& anns_proto);
 
  private:
     const SchemaPtr schema;

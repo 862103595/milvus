@@ -29,8 +29,10 @@ from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone as tzmod
 from datetime import timezone
+from dateutil import parser
+import pytz
 
-from pymilvus import CollectionSchema, DataType, FunctionType, Function, MilvusException, MilvusClient
+from pymilvus import CollectionSchema, FieldSchema, DataType, FunctionType, Function, MilvusException, MilvusClient
 
 from bm25s.tokenization import Tokenizer
 
@@ -276,8 +278,8 @@ def analyze_documents_with_analyzer_params(texts, analyzer_params):
         uri = "http://" + param_info.param_host + ":" + str(param_info.param_port)
 
     client = MilvusClient(
-        uri = uri,
-        token = param_info.param_token
+        uri=uri,
+        token=param_info.param_token
     )
     freq = Counter()
     res = client.run_analyzer(texts, analyzer_params, with_detail=True, with_hash=True)
@@ -630,7 +632,8 @@ def gen_digits_by_length(length=8):
     return "".join(random.choice(string.digits) for _ in range(length))
 
 
-def gen_scalar_field(field_type, name=None, description=ct.default_desc, is_primary=False, **kwargs):
+def gen_scalar_field(field_type, name=None, description=ct.default_desc, is_primary=False,
+                     nullable=False, skip_wrapper=False, **kwargs):
     """
     Generate a field schema based on the field type.
     
@@ -639,6 +642,9 @@ def gen_scalar_field(field_type, name=None, description=ct.default_desc, is_prim
         name: Field name (uses default if None)
         description: Field description
         is_primary: Whether this is a primary field
+        nullable: Whether this field is nullable
+        skip_wrapper: whether to call FieldSchemaWrapper, in gen_row_data case,
+                      it logs too much if calling the wrapper
         **kwargs: Additional parameters like max_length, max_capacity, etc.
     
     Returns:
@@ -656,15 +662,29 @@ def gen_scalar_field(field_type, name=None, description=ct.default_desc, is_prim
             kwargs['element_type'] = DataType.INT64
         if 'max_capacity' not in kwargs:
             kwargs['max_capacity'] = ct.default_max_capacity
-    
-    field, _ = ApiFieldSchemaWrapper().init_field_schema(
-        name=name, 
-        dtype=field_type, 
-        description=description,
-        is_primary=is_primary, 
-        **kwargs
-    )
-    return field
+    if is_primary is True:
+        nullable = False
+
+    if skip_wrapper is True:
+        field = FieldSchema(
+            name=name,
+            dtype=field_type,
+            description=description,
+            is_primary=is_primary,
+            nullable=nullable,
+            **kwargs
+        )
+        return field
+    else:
+        field, _ = ApiFieldSchemaWrapper().init_field_schema(
+            name=name,
+            dtype=field_type,
+            description=description,
+            is_primary=is_primary,
+            nullable=nullable,
+            **kwargs
+        )
+        return field
 
 
 # Convenience functions for backward compatibility
@@ -686,6 +706,9 @@ def gen_geometry_field(name=ct.default_geometry_field_name, description=ct.defau
 
 def gen_geometry_field(name="geo", description=ct.default_desc, is_primary=False, **kwargs):
     return gen_scalar_field(DataType.GEOMETRY, name=name, description=description, is_primary=is_primary, **kwargs)
+
+def gen_timestamptz_field(name=ct.default_timestamptz_field_name, description=ct.default_desc, is_primary=False, **kwargs):
+    return gen_scalar_field(DataType.TIMESTAMPTZ, name=name, description=description, is_primary=is_primary, **kwargs)
 
 
 def gen_array_field(name=ct.default_array_field_name, element_type=DataType.INT64, max_capacity=ct.default_max_capacity,
@@ -836,33 +859,48 @@ def gen_default_collection_schema(description=ct.default_desc, primary_field=ct.
 
 
 def gen_all_datatype_collection_schema(description=ct.default_desc, primary_field=ct.default_int64_field_name,
-                                       auto_id=False, dim=ct.default_dim, enable_dynamic_field=True, nullable=True,**kwargs):
+                                       auto_id=False, dim=ct.default_dim, enable_dynamic_field=True, nullable=True,
+                                       enable_struct_array_field=True, **kwargs):
     analyzer_params = {
         "tokenizer": "standard",
     }
-    fields = [
-        gen_int64_field(),
-        gen_float_field(nullable=nullable),
-        gen_string_field(nullable=nullable),
-        gen_string_field(name="document", max_length=2000, enable_analyzer=True, enable_match=True, nullable=nullable),
-        gen_string_field(name="text", max_length=2000, enable_analyzer=True, enable_match=True,
-                         analyzer_params=analyzer_params),
-        gen_json_field(nullable=nullable),
-        gen_geometry_field(nullable=nullable),
-        gen_array_field(name="array_int", element_type=DataType.INT64),
-        gen_array_field(name="array_float", element_type=DataType.FLOAT),
-        gen_array_field(name="array_varchar", element_type=DataType.VARCHAR, max_length=200),
-        gen_array_field(name="array_bool", element_type=DataType.BOOL),
-        gen_float_vec_field(dim=dim),
-        gen_int8_vec_field(name="image_emb", dim=dim),
-        gen_float_vec_field(name="text_sparse_emb", vector_data_type=DataType.SPARSE_FLOAT_VECTOR),
-        gen_float_vec_field(name="voice_emb", dim=dim),
-        # gen_timestamptz_field(name="timestamptz", nullable=nullable),
-    ]
 
-    schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
-                                                                    primary_field=primary_field, auto_id=auto_id,
-                                                                    enable_dynamic_field=enable_dynamic_field, **kwargs)
+    # Create schema using MilvusClient
+    schema = MilvusClient.create_schema(
+        auto_id=auto_id,
+        enable_dynamic_field=enable_dynamic_field,
+        description=description,
+        **kwargs
+    )
+
+    # Add all fields using schema.add_field()
+    schema.add_field(primary_field, DataType.INT64, is_primary=True)
+    schema.add_field(ct.default_float_field_name, DataType.FLOAT, nullable=nullable)
+    schema.add_field(ct.default_string_field_name, DataType.VARCHAR, max_length=ct.default_max_length, nullable=nullable)
+    schema.add_field("document", DataType.VARCHAR, max_length=2000, enable_analyzer=True, enable_match=True, nullable=nullable)
+    schema.add_field("text", DataType.VARCHAR, max_length=2000, enable_analyzer=True, enable_match=True,
+                    analyzer_params=analyzer_params, nullable=True)
+    schema.add_field(ct.default_json_field_name, DataType.JSON, nullable=nullable)
+    schema.add_field(ct.default_geometry_field_name, DataType.GEOMETRY, nullable=nullable)
+    schema.add_field(ct.default_timestamptz_field_name, DataType.TIMESTAMPTZ, nullable=nullable)
+    schema.add_field("array_int", DataType.ARRAY, element_type=DataType.INT64, max_capacity=ct.default_max_capacity)
+    schema.add_field("array_float", DataType.ARRAY, element_type=DataType.FLOAT, max_capacity=ct.default_max_capacity)
+    schema.add_field("array_varchar", DataType.ARRAY, element_type=DataType.VARCHAR, max_length=200, max_capacity=ct.default_max_capacity)
+    schema.add_field("array_bool", DataType.ARRAY, element_type=DataType.BOOL, max_capacity=ct.default_max_capacity)
+    schema.add_field(ct.default_float_vec_field_name, DataType.FLOAT_VECTOR, dim=dim, nullable=True)
+    schema.add_field("text_sparse_emb", DataType.SPARSE_FLOAT_VECTOR, nullable=False)  # function output field cannot be nullable
+    # schema.add_field("voice_emb", DataType.FLOAT_VECTOR, dim=dim)
+
+    # Add struct array field
+    if enable_struct_array_field:
+        struct_schema = MilvusClient.create_struct_field_schema()
+        struct_schema.add_field("name", DataType.VARCHAR, max_length=200)
+        struct_schema.add_field("age", DataType.INT64)
+        struct_schema.add_field("float_vector", DataType.FLOAT_VECTOR, dim=dim)
+        schema.add_field("array_struct", datatype=DataType.ARRAY, element_type=DataType.STRUCT,
+                        struct_schema=struct_schema, max_capacity=10)
+
+    # Add BM25 function
     bm25_function = Function(
         name=f"text",
         function_type=FunctionType.BM25,
@@ -871,6 +909,20 @@ def gen_all_datatype_collection_schema(description=ct.default_desc, primary_fiel
         params={},
     )
     schema.add_function(bm25_function)
+
+    # Add MinHash function (input: document field, output: minhash_emb binary vector)
+    minhash_num_hashes = 16
+    minhash_dim = minhash_num_hashes * 32  # 512
+    schema.add_field("minhash_emb", DataType.BINARY_VECTOR, dim=minhash_dim)
+    minhash_function = Function(
+        name="document_minhash",
+        function_type=FunctionType.MINHASH,
+        input_field_names=["document"],
+        output_field_names=["minhash_emb"],
+        params={"num_hashes": minhash_num_hashes, "shingle_size": 3},
+    )
+    schema.add_function(minhash_function)
+
     return schema
 
 
@@ -1779,25 +1831,56 @@ def get_column_data_by_schema(nb=ct.default_nb, schema=None, skip_vectors=False,
     return data
 
 
-def gen_row_data_by_schema(nb=ct.default_nb, schema=None, start=0, random_pk=False, skip_field_names=[], desired_field_names=[]):
+def convert_orm_schema_to_dict_schema(orm_schema):
+    """
+    Convert ORM CollectionSchema object to dict format (same as describe_collection output).
+
+    Args:
+        orm_schema: CollectionSchema object from pymilvus.orm
+
+    Returns:
+        dict: Schema in dict format compatible with MilvusClient describe_collection output
+    """
+    # Use the built-in to_dict() method which already provides the right structure
+    schema_dict = orm_schema.to_dict()
+
+    # to_dict() already includes:
+    # - auto_id
+    # - description
+    # - fields (with each field's to_dict())
+    # - enable_dynamic_field
+    # - functions (if present)
+    # - struct_fields (if present)
+
+    return schema_dict
+
+
+def gen_row_data_by_schema(nb=ct.default_nb, schema=None, start=0, random_pk=False, 
+                           skip_field_names=[], desired_field_names=[], desired_dynamic_field_names=[]):
     """
     Generates row data based on the given schema.
-    
+
     Args:
         nb (int): Number of rows to generate. Defaults to ct.default_nb.
-        schema (Schema): Collection schema or collection info. If None, uses default schema.
+        schema (Schema): Collection schema or collection info. Can be:
+                        - dict (from client.describe_collection())
+                        - CollectionSchema object (from ORM)
+                        - None (uses default schema)
         start (int): Starting value for primary key fields. Defaults to 0.
         random_pk (bool, optional): Whether to generate random primary key values (default: False)
         skip_field_names(list, optional): whether to skip some field to gen data manually (default: [])
+        desired_field_names(list, optional): only generate data for specified field names (default: [])
+        desired_dynamic_field_names(list, optional): generate additional data with random types for specified dynamic fields (default: [])
 
     Returns:
         list[dict]: List of dictionaries where each dictionary represents a row,
                     with field names as keys and generated data as values.
-    
+
     Notes:
         - Skips auto_id fields and function output fields.
         - For primary key fields, generates sequential values starting from 'start'.
         - For non-primary fields, generates random data based on field type.
+        - Supports struct array fields in both dict and ORM schema formats.
     """
     # if both skip_field_names and desired_field_names are specified, raise an exception
     if skip_field_names and desired_field_names:
@@ -1806,84 +1889,106 @@ def gen_row_data_by_schema(nb=ct.default_nb, schema=None, start=0, random_pk=Fal
     if schema is None:
         schema = gen_default_collection_schema()
 
-    # ignore auto id field and the fields in function output
+    # Convert ORM schema to dict schema for unified processing
+    if not isinstance(schema, dict):
+        schema = convert_orm_schema_to_dict_schema(schema)
+
+    # Now schema is always a dict after conversion, process it uniformly
+    enable_dynamic = schema.get('enable_dynamic_field', False)
+    # Get all fields from schema
+    all_fields = schema.get('fields', [])
+    fields = []
+    for field in all_fields:
+        # if desired_field_names is specified, only generate the fields in desired_field_names
+        if field.get('name', None) in desired_field_names:
+            fields.append(field)
+        # elif desired_field_names is not specified, generate all fields
+        elif not desired_field_names:
+            fields.append(field)
+
+    # Get struct_fields from schema
+    struct_fields = schema.get('struct_fields', [])
+    # log.debug(f"[gen_row_data_by_schema] struct_fields from schema: {len(struct_fields)} items")
+    if struct_fields:
+        pass
+        # log.debug(f"[gen_row_data_by_schema] First struct_field: {struct_fields[0]}")
+
+    # If struct_fields is not present, extract struct array fields from fields list
+    # This happens when using client.describe_collection()
+    if not struct_fields:
+        struct_fields = []
+        for field in fields:
+            if field.get('type') == DataType.ARRAY and field.get('element_type') == DataType.STRUCT:
+                # Convert field format to struct_field format
+                struct_field_dict = {
+                    'name': field.get('name'),
+                    'max_capacity': field.get('params', {}).get('max_capacity', 100),
+                    'fields': []
+                }
+                # Get struct fields from field - key can be 'struct_fields' or 'struct_schema'
+                struct_field_list = field.get('struct_fields') or field.get('struct_schema')
+                if struct_field_list:
+                    # If it's a dict with 'fields' key, get the fields
+                    if isinstance(struct_field_list, dict) and 'fields' in struct_field_list:
+                        struct_field_dict['fields'] = struct_field_list['fields']
+                    # If it's already a list, use it directly
+                    elif isinstance(struct_field_list, list):
+                        struct_field_dict['fields'] = struct_field_list
+                struct_fields.append(struct_field_dict)
+
+    # Get function output fields to skip
     func_output_fields = []
-    if isinstance(schema, dict):
-        # a dict of collection schema info is usually from client.describe_collection()
-        all_fields = schema.get('fields', [])
-        fields = []
-        for field in all_fields:
-            # if desired_field_names is specified, only generate the fields in desired_field_names
-            if field.get('name', None) in desired_field_names:
-                fields.append(field)
-            # elif desired_field_names is not specified, generate all fields
-            elif not desired_field_names:
-                fields.append(field)
+    functions = schema.get('functions', [])
+    for func in functions:
+        output_field_names = func.get('output_field_names', [])
+        func_output_fields.extend(output_field_names)
+    func_output_fields = list(set(func_output_fields))
 
-        functions = schema.get('functions', [])
-        for func in functions:
-            output_field_names = func.get('output_field_names', [])
-            func_output_fields.extend(output_field_names)
-        func_output_fields = list(set(func_output_fields))
+    # Filter fields that need data generation
+    fields_needs_data = []
+    for field in fields:
+        field_name = field.get('name', None)
+        if field.get('auto_id', False):
+            continue
+        if field_name in func_output_fields or field_name in skip_field_names:
+            continue
+        # Skip struct array fields as they are handled separately via struct_fields
+        if field.get('type') == DataType.ARRAY and field.get('element_type') == DataType.STRUCT:
+            continue
+        fields_needs_data.append(field)
 
-        fields_needs_data = []
-        for field in fields:
-            field_name = field.get('name', None)
-            if field.get('auto_id', False):
-                continue
-            if field_name in func_output_fields or field_name in skip_field_names:
-                continue
-            fields_needs_data.append(field)
-        data = []
-        for i in range(nb):
-            tmp = {}
-            for field in fields_needs_data:
-                tmp[field.get('name', None)] = gen_data_by_collection_field(field, random_pk=random_pk)
-                if field.get('is_primary', False) is True and field.get('type', None) == DataType.INT64:
-                    tmp[field.get('name', None)] = start
-                    start += 1
-                if field.get('is_primary', False) is True and field.get('type', None) == DataType.VARCHAR:
-                    tmp[field.get('name', None)] = str(start)
-                    start += 1
-            data.append(tmp)
-    else:
-        # a schema object is usually form orm schema object
-        all_fields = schema.fields
-        fields = []
-        for field in all_fields:
-            # if desired_field_names is specified, only generate the fields in desired_field_names
-            if field.name in desired_field_names:
-                fields.append(field)
-            # elif desired_field_names is not specified, generate all fields
-            elif not desired_field_names:
-                fields.append(field)
+    # Generate data for each row
+    data = []
+    for i in range(nb):
+        tmp = {}
+        # Generate data for regular fields
+        for field in fields_needs_data:
+            tmp[field.get('name', None)] = gen_data_by_collection_field(field, random_pk=random_pk)
+            # Handle primary key fields specially
+            if field.get('is_primary', False) is True and field.get('type', None) == DataType.INT64:
+                tmp[field.get('name', None)] = start
+                start += 1
+            if field.get('is_primary', False) is True and field.get('type', None) == DataType.VARCHAR:
+                tmp[field.get('name', None)] = str(start)
+                start += 1
 
-        if hasattr(schema, "functions"):
-            functions = schema.functions
-            for func in functions:
-                output_field_names = func.output_field_names
-                func_output_fields.extend(output_field_names)
-        func_output_fields = list(set(func_output_fields))
+        # Generate data for struct array fields
+        for struct_field in struct_fields:
+            field_name = struct_field.get('name', None)
+            struct_data = gen_struct_array_data(struct_field, start=start, random_pk=random_pk)
+            tmp[field_name] = struct_data
+        
+        # generate additional data for dynamic fields
+        if enable_dynamic:
+            for name in desired_dynamic_field_names:
+                data_types = [DataType.JSON, DataType.INT64, DataType.FLOAT, DataType.VARCHAR, DataType.BOOL, DataType.ARRAY]
+                data_type = data_types[random.randint(0, len(data_types) - 1)]
+                dynamic_field = gen_scalar_field(data_type, nullable=True, skip_wrapper=True)
+                tmp[name] = gen_data_by_collection_field(dynamic_field)
 
-        fields_needs_data = []
-        for field in fields:
-            if field.auto_id:
-                continue
-            if field.name in func_output_fields or field.name in skip_field_names:
-                continue
-            fields_needs_data.append(field)
-        data = []
-        for i in range(nb):
-            tmp = {}
-            for field in fields_needs_data:
-                tmp[field.name] = gen_data_by_collection_field(field, random_pk=random_pk)
-                if field.is_primary is True and field.dtype == DataType.INT64:
-                    tmp[field.name] = start
-                    start += 1
-                if field.is_primary is True and field.dtype == DataType.VARCHAR:
-                    tmp[field.name] = str(start)
-                    start += 1
-            data.append(tmp)
+        data.append(tmp)
+
+    # log.debug(f"[gen_row_data_by_schema] Generated {len(data)} rows, first row keys: {list(data[0].keys()) if data else []}")
     return data
 
 
@@ -2035,6 +2140,17 @@ def get_int8_vec_field_name_list(schema=None):
             vec_fields.append(field.name)
     return vec_fields
 
+def get_emb_list_field_name_list(schema=None):
+    vec_fields = []
+    if schema is None:
+        schema = gen_default_collection_schema()
+    struct_fields = schema.struct_fields
+    for struct_field in struct_fields:
+        for field in struct_field.fields:
+            if field.dtype in [DataType.FLOAT_VECTOR]:
+                vec_fields.append(f"{struct_field.name}[{field.name}]")
+    return vec_fields
+
 def get_bm25_vec_field_name_list(schema=None):
     if not hasattr(schema, "functions"):
         return []
@@ -2046,6 +2162,17 @@ def get_bm25_vec_field_name_list(schema=None):
     bm25_outputs = list(set(bm25_outputs))
 
     return bm25_outputs
+
+def get_minhash_vec_field_name_list(schema=None):
+    if not hasattr(schema, "functions"):
+        return []
+    functions = schema.functions
+    minhash_func = [func for func in functions if func.type == FunctionType.MINHASH]
+    minhash_outputs = []
+    for func in minhash_func:
+        minhash_outputs.extend(func.output_field_names)
+    minhash_outputs = list(set(minhash_outputs))
+    return minhash_outputs
 
 def get_dim_by_schema(schema=None):
     if schema is None:
@@ -2060,9 +2187,16 @@ def get_dim_by_schema(schema=None):
 def get_dense_anns_field_name_list(schema=None):
     if schema is None:
         schema = gen_default_collection_schema()
+    # Collect function output fields to exclude (e.g. BM25, MinHash outputs)
+    func_output_fields = set()
+    if hasattr(schema, "functions"):
+        for func in schema.functions:
+            func_output_fields.update(func.output_field_names)
     fields = schema.fields
     anns_fields = []
     for field in fields:
+        if field.name in func_output_fields:
+            continue
         if field.dtype in [DataType.FLOAT_VECTOR,DataType.FLOAT16_VECTOR,DataType.BFLOAT16_VECTOR, DataType.INT8_VECTOR, DataType.BINARY_VECTOR]:
             item = {
                 "name": field.name,
@@ -2072,6 +2206,40 @@ def get_dense_anns_field_name_list(schema=None):
             anns_fields.append(item)
     return anns_fields
 
+def get_struct_array_vector_field_list(schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+
+    struct_fields = schema.struct_fields
+    struct_vector_fields = []
+
+    for struct_field in struct_fields:
+            struct_field_name = struct_field.name
+            # Check each sub-field for vector types
+            for sub_field in struct_field.fields:
+                sub_field_name = sub_field.name if hasattr(sub_field, 'name') else sub_field.get('name')
+                sub_field_dtype = sub_field.dtype if hasattr(sub_field, 'dtype') else sub_field.get('type')
+
+                if sub_field_dtype in [DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR,
+                                      DataType.BFLOAT16_VECTOR, DataType.INT8_VECTOR,
+                                      DataType.BINARY_VECTOR]:
+                    # Get dimension
+                    if hasattr(sub_field, 'params'):
+                        dim = sub_field.params.get('dim')
+                    else:
+                        dim = sub_field.get('params', {}).get('dim')
+
+                    item = {
+                        "struct_field": struct_field_name,
+                        "vector_field": sub_field_name,
+                        "anns_field": f"{struct_field_name}[{sub_field_name}]",
+                        "dtype": sub_field_dtype,
+                        "dim": dim
+                    }
+                    struct_vector_fields.append(item)
+
+    return struct_vector_fields
+
 
 def gen_varchar_data(length: int, nb: int, text_mode=False):
     if text_mode:
@@ -2079,6 +2247,38 @@ def gen_varchar_data(length: int, nb: int, text_mode=False):
     else:
         return ["".join([chr(random.randint(97, 122)) for _ in range(length)]) for _ in range(nb)]
 
+
+def gen_struct_array_data(struct_field, start=0, random_pk=False):
+    """
+    Generates struct array data based on the struct field schema.
+
+    Args:
+        struct_field: Either a dict (from dict schema) or StructFieldSchema object (from ORM schema)
+        start: Starting value for primary key fields
+        random_pk: Whether to generate random primary key values
+
+    Returns:
+        List of struct data dictionaries
+    """
+    struct_array_data = []
+
+    # Handle both dict and object formats
+    if isinstance(struct_field, dict):
+        max_capacity = struct_field.get('max_capacity', 100)
+        fields = struct_field.get('fields', [])
+    else:
+        # StructFieldSchema object
+        max_capacity = getattr(struct_field, 'max_capacity', 100) or 100
+        fields = struct_field.fields
+
+    arr_len = random.randint(1, max_capacity)
+    for _ in range(arr_len):
+        struct_data = {}
+        for field in fields:
+            field_name = field.get('name') if isinstance(field, dict) else field.name
+            struct_data[field_name] = gen_data_by_collection_field(field, nb=None, start=start, random_pk=random_pk)
+        struct_array_data.append(struct_data)
+    return struct_array_data
 
 def gen_data_by_collection_field(field, nb=None, start=0, random_pk=False):
     """
@@ -2105,7 +2305,8 @@ def gen_data_by_collection_field(field, nb=None, start=0, random_pk=False):
         # for v2 client, it accepts a dict of field info
         nullable = field.get('nullable', False)
         data_type = field.get('type', None)
-        enable_analyzer = field.get('params').get("enable_analyzer", False)
+        params = field.get('params', {}) or {}
+        enable_analyzer = params.get("enable_analyzer", False)
         is_primary = field.get('is_primary', False)
     else:
         # for ORM client, it accepts a field object
@@ -2216,17 +2417,26 @@ def gen_data_by_collection_field(field, nb=None, start=0, random_pk=False):
         else:
             dim = ct.default_dim if data_type == DataType.SPARSE_FLOAT_VECTOR else field.params['dim']
         if nb is None:
-            return gen_vectors(1, dim, vector_data_type=data_type)[0]
+            return gen_vectors(1, dim, vector_data_type=data_type)[0] if random.random() < 0.8 or nullable is False else None
         if nullable is False:
             return gen_vectors(nb, dim, vector_data_type=data_type)
         else:
-            raise MilvusException(message=f"gen data failed, vector field does not support nullable")
+            # gen 20% none data for nullable vector field
+            vectors = gen_vectors(nb, dim, vector_data_type=data_type)
+            return [None if i % 2 == 0 and random.random() < 0.4 else vectors[i] for i in range(nb)]
     elif data_type == DataType.ARRAY:
         if isinstance(field, dict):
             max_capacity = field.get('params')['max_capacity']
+            element_type = field.get('element_type')
         else:
             max_capacity = field.params['max_capacity']
-        element_type = field.element_type
+            element_type = field.element_type
+
+        # Struct array fields are handled separately in gen_row_data_by_schema
+        # by processing struct_fields, so skip here
+        if element_type == DataType.STRUCT:
+            return None
+
         if element_type == DataType.INT8:
             if nb is None:
                 return [random.randint(-128, 127) for _ in range(max_capacity)] if random.random() < 0.8 or nullable is False else None
@@ -2330,7 +2540,10 @@ def gen_timestamptz_str():
             return base.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
         # otherwise use explicit offset
         offset_hours = random.randint(-12, 14)
-        offset_minutes = random.choice([0, 30])
+        if offset_hours == -12 or offset_hours == 14:
+            offset_minutes = 0
+        else:
+            offset_minutes = random.choice([0, 30])
         tz = timezone(timedelta(hours=offset_hours, minutes=offset_minutes))
         local_dt = base.astimezone(tz)
         tz_str = local_dt.strftime("%z")  # "+0800"
@@ -3333,20 +3546,17 @@ def modify_file(file_path_list, is_modify=False, input_content=""):
     for file_path in file_path_list:
         folder_path, file_name = os.path.split(file_path)
         if not os.path.isdir(folder_path):
-            log.debug("[modify_file] folder(%s) is not exist." % folder_path)
             os.makedirs(folder_path)
 
         if not os.path.isfile(file_path):
             log.error("[modify_file] file(%s) is not exist." % file_path)
         else:
             if is_modify is True:
-                log.debug("[modify_file] start modifying file(%s)..." % file_path)
                 with open(file_path, "r+") as f:
                     f.seek(0)
                     f.truncate()
                     f.write(input_content)
                     f.close()
-                log.info("[modify_file] file(%s) modification is complete." % file_path_list)
 
 
 def index_to_dict(index):
@@ -3693,14 +3903,17 @@ def extract_vector_field_name_list(collection_w):
     return vector_name_list
 
 
-def get_field_dtype_by_field_name(collection_w, field_name):
+def get_field_dtype_by_field_name(schema, field_name):
     """
     get the vector field data type by field name
     collection_w : the collection object to be extracted
     return: the field data type of the field name
     """
-    schema_dict = collection_w.schema.to_dict()
-    fields = schema_dict.get('fields')
+    # Convert ORM schema to dict schema for unified processing
+    if not isinstance(schema, dict):
+        schema = convert_orm_schema_to_dict_schema(schema)
+
+    fields = schema.get('fields')
     for field in fields:
         if field['name'] == field_name:
             return field['type']
@@ -4040,80 +4253,55 @@ def parse_fmod(x: int, y: int) -> int:
 
 def convert_timestamptz(rows, timestamptz_field_name, timezone="UTC"):
     """
-    Convert timestamptz string to desired timezone string
+    Convert timestamptz strings in ``rows`` into the specified IANA timezone.
 
-    Args:
-        rows: list of rows data with timestamptz string
-        timestamptz_field_name: name of the timestamptz field
-        timezone: timezone to convert to (default: UTC)
+    Behaviour matches PostgreSQL:
+    - Inputs that already include an offset (e.g. ``Z`` or ``+08:00``) are
+      converted to the target timezone.
+    - Naive inputs (no offset) are treated as already expressed in the target
+      timezone; we simply append the correct offset for that zone.
 
-    Returns:
-        list of rows data with timestamptz string converted to desired timezone string
+    Examples:
+        "2024-12-31 22:00:00"       -> "2024-12-31T22:00:00+08:00"
+        "2024-12-31 22:00:00Z"      -> "2025-01-01T06:00:00+08:00"
+        "2024-12-31T22:00:00"       -> "2024-12-31T22:00:00+08:00"
+        "2024-12-31T22:00:00+08:00" -> "2024-12-31T22:00:00+08:00"
+        "2024-12-31T22:00:00-08:00" -> "2025-01-01T14:00:00+08:00"
     """
-    iso_offset_re = re.compile(r"([+-])(\d{2}):(\d{2})$")
+
+    basic_re = re.compile(
+        r"^(?P<y>-?\d{1,4})-(?P<m>\d{2})-(?P<d>\d{2})[T ]"
+        r"(?P<h>\d{2}):(?P<mi>\d{2}):(?P<s>\d{2})(?P<offset>Z|[+-]\d{2}:\d{2})?$"
+    )
 
     def _days_in_month(year: int, month: int) -> int:
-        if month in (1, 3, 5, 7, 9, 10, 12):
+        if month in (1, 3, 5, 7, 8, 10, 12):
             return 31
-        if month in (4, 6, 8, 11):
+        if month in (4, 6, 9, 11):
             return 30
-        # February
         is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
         return 29 if is_leap else 28
 
-    def _parse_basic(ts: str) -> Tuple[int, int, int, int, int, int, Optional[Tuple[str, int, int]], bool]:
-        s = ts.strip()
-        s = s.replace(" ", "T", 1)
-        has_z = False
-        if s.endswith("Z") or s.endswith("z"):
-            has_z = True
-            s = s[:-1]
-        # split offset if present
-        m = iso_offset_re.search(s)
-        offset = None
-        if m:
-            sign, hh, mm = m.groups()
-            offset = (sign, int(hh), int(mm))
-            s = s[:m.start()]
-        # now s like YYYY-MM-DDTHH:MM:SS or with fractional seconds
-        if "T" not in s:
-            raise ValueError(f"Invalid timestamp string: {ts}")
-        date_part, time_part = s.split("T", 1)
-        y_str, mon_str, d_str = date_part.split("-")
-        # strip fractional seconds
-        if "." in time_part:
-            time_part = time_part.split(".", 1)[0]
-        hh_str, mi_str, se_str = time_part.split(":")
-        return int(y_str), int(mon_str), int(d_str), int(hh_str), int(mi_str), int(se_str), offset, has_z
-
-    def _apply_offset_to_utc(year: int, month: int, day: int, hour: int, minute: int, second: int, offset: Tuple[str, int, int]) -> Tuple[int, int, int, int, int, int]:
+    def _apply_offset_to_utc(
+        year: int, month: int, day: int, hour: int, minute: int, second: int, offset: Tuple[str, int, int]
+    ) -> Tuple[int, int, int, int, int, int]:
         sign, oh, om = offset
-        # local time -> UTC
         delta_minutes = oh * 60 + om
         if sign == '+':
-            # UTC = local - offset
             delta_minutes = -delta_minutes
         else:
-            # sign '-' means local is behind UTC; UTC = local + offset
             delta_minutes = +delta_minutes
-        # apply minutes
         total_minutes = hour * 60 + minute + delta_minutes
-        new_hour = hour
-        new_minute = minute
         carry_days = 0
-        # normalize down
         if total_minutes < 0:
-            carry_days = (total_minutes - 59) // (60 * 24)  # negative floor division
+            carry_days = (total_minutes - 59) // (60 * 24)
             total_minutes -= carry_days * 60 * 24
         else:
             carry_days = total_minutes // (60 * 24)
             total_minutes = total_minutes % (60 * 24)
         new_hour = total_minutes // 60
         new_minute = total_minutes % 60
-        # seconds unchanged here
-        # apply day carry
         day += carry_days
-        # normalize date
         while True:
             if day <= 0:
                 month -= 1
@@ -4133,15 +4321,6 @@ def convert_timestamptz(rows, timestamptz_field_name, timezone="UTC"):
                     break
         return year, month, day, new_hour, new_minute, second
 
-    def _format_with_offset_str(dt: datetime) -> str:
-        # format with colon in tz offset
-        if dt.tzinfo is not None and dt.utcoffset() == tzmod.utc.utcoffset(dt):
-            return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-        s = dt.strftime('%Y-%m-%dT%H:%M:%S%z')  # +0800
-        if len(s) >= 5:
-            return s[:-5] + s[-5:-2] + ':' + s[-2:]
-        return s
-
     def _format_fixed(y: int, m: int, d: int, hh: int, mi: int, ss: int, offset_minutes: int) -> str:
         if offset_minutes == 0:
             return f"{y:04d}-{m:02d}-{d:02d}T{hh:02d}:{mi:02d}:{ss:02d}Z"
@@ -4150,66 +4329,95 @@ def convert_timestamptz(rows, timestamptz_field_name, timezone="UTC"):
         oh, om = divmod(total, 60)
         return f"{y:04d}-{m:02d}-{d:02d}T{hh:02d}:{mi:02d}:{ss:02d}{sign}{oh:02d}:{om:02d}"
 
-    def convert_one(ts: str) -> str:
-        # Try python builtins first for typical range 1..9999
-        raw = ts.strip()
-        # normalize space separator and 'Z'
-        norm = raw.replace(' ', 'T', 1)
-        if norm.endswith('Z') or norm.endswith('z'):
-            norm = norm[:-1] + '+00:00'
-        try:
-            dt = None
-            if iso_offset_re.search(norm):
-                # aware input; convert to target zone
-                dt = datetime.fromisoformat(norm)
-                dt_target = dt.astimezone(ZoneInfo(timezone))
-                return _format_with_offset_str(dt_target)
-            else:
-                # naive; interpret as time in target timezone and output there
-                y, mo, d, hh, mi, ss, _, _ = _parse_basic(raw)
-                if y == 0:
-                    # Cannot use datetime; treat as local-like in target zone with fixed offset fallback
-                    # Asia/Shanghai common case: +08:00
-                    fixed_minutes = 480 if timezone == 'Asia/Shanghai' else 0
-                    return _format_fixed(y, mo, d, hh, mi, ss, fixed_minutes)
-                local = datetime(y, mo, d, hh, mi, ss, tzinfo=ZoneInfo(timezone))
-                return _format_with_offset_str(local)
-        except Exception:
-            # manual fallback (handles year 0 and overflow beyond 9999)
-            y, mo, d, hh, mi, ss, offset, has_z = _parse_basic(raw)
-            # compute UTC components first
-            if offset is None and has_z:
-                uy, um, ud, uh, umi, uss = y, mo, d, hh, mi, ss
-            elif offset is None:
-                # treat naive as in target timezone; need target offset if possible
-                try:
-                    if 1 <= y <= 9999:
-                        local = datetime(y, mo, d, hh, mi, ss, tzinfo=ZoneInfo(timezone))
-                        off_td = local.utcoffset() or tzmod.utc.utcoffset(local)
-                        total = int(off_td.total_seconds() // 60)
-                        # convert to UTC
-                        sign = '+' if total >= 0 else '-'
-                        total = abs(total)
-                        offset = (sign, total // 60, total % 60)
-                    else:
-                        offset = ('+', 8, 0) if timezone == 'Asia/Shanghai' else ('+', 0, 0)
-                except Exception:
-                    offset = ('+', 8, 0) if timezone == 'Asia/Shanghai' else ('+', 0, 0)
-                uy, um, ud, uh, umi, uss = _apply_offset_to_utc(y, mo, d, hh, mi, ss, offset)
-            else:
-                uy, um, ud, uh, umi, uss = _apply_offset_to_utc(y, mo, d, hh, mi, ss, offset)
+    def _format_dt(dt: datetime) -> str:
+        s = dt.isoformat(timespec="seconds")
+        return s[:-6] + "Z" if s.endswith("+00:00") else s
 
-            # convert UTC to target timezone if feasible
+    def _localize_naive(dt: datetime, tz_name: str) -> Optional[datetime]:
+        """Best-effort localization that handles DST gaps/ambiguities."""
+        # Prefer pytz because it surfaces NonExistent/Ambiguous errors we can resolve.
+        try:
+            tz = pytz.timezone(tz_name)
             try:
-                if 1 <= uy <= 9999:
-                    dt_utc = datetime(uy, um, ud, uh, umi, uss, tzinfo=tzmod.utc)
-                    dt_target = dt_utc.astimezone(ZoneInfo(timezone))
-                    return _format_with_offset_str(dt_target)
-            except Exception:
-                pass
-            # fallback to fixed offset formatting (Asia/Shanghai -> +08:00 else Z)
-            target_minutes = 480 if timezone == 'Asia/Shanghai' else 0
-            return _format_fixed(uy, um, ud, uh, umi, uss, target_minutes)
+                return tz.localize(dt, is_dst=None)
+            except pytz.NonExistentTimeError:
+                # For forward DST jump (gap), shift back by the jump to previous valid time.
+                before = tz.localize(dt - timedelta(hours=1), is_dst=None)
+                after = tz.localize(dt + timedelta(hours=1), is_dst=None)
+                gap = after.utcoffset() - before.utcoffset()
+                adjust = gap if gap.total_seconds() != 0 else timedelta(hours=1)
+                return tz.localize(dt - adjust, is_dst=None)
+            except pytz.AmbiguousTimeError:
+                # Choose DST side (fold=1) to align with PostgreSQL semantics.
+                return tz.localize(dt, is_dst=True)
+        except Exception:
+            pass
+
+        # Fallback with zoneinfo: detect offset jump around the time.
+        try:
+            tzinfo = ZoneInfo(tz_name)
+            before = (dt - timedelta(minutes=30)).replace(tzinfo=tzinfo)
+            after = (dt + timedelta(minutes=30)).replace(tzinfo=tzinfo)
+            off_before = before.utcoffset()
+            off_after = after.utcoffset()
+            if off_before and off_after and off_before != off_after:
+                gap = off_after - off_before
+                adjust = gap if gap.total_seconds() != 0 else timedelta(hours=1)
+                return (dt - adjust).replace(tzinfo=tzinfo)
+            return dt.replace(tzinfo=tzinfo)
+        except Exception:
+            return None
+
+    def _target_offset_minutes() -> int:
+        try:
+            probe = datetime(2004, 1, 1, 0, 0, 0, tzinfo=ZoneInfo(timezone))
+            off = probe.utcoffset()
+            if off is not None:
+                return int(off.total_seconds() // 60)
+        except Exception:
+            pass
+        return 480 if timezone == "Asia/Shanghai" else 0
+
+    def _manual_path(raw: str) -> str:
+        norm = raw.replace(" ", "T", 1)
+        m = basic_re.match(norm)
+        if not m:
+            raise ValueError(f"Invalid timestamp string: {raw}")
+        y, mo, d, hh, mi, ss = map(int, (m.group("y"), m.group("m"), m.group("d"), m.group("h"), m.group("mi"), m.group("s")))
+        offset_str = m.group("offset")
+        target_minutes = _target_offset_minutes()
+
+        if not offset_str:
+            return _format_fixed(y, mo, d, hh, mi, ss, target_minutes)
+
+        if offset_str == "Z":
+            uy, um, ud, uh, umi, uss = y, mo, d, hh, mi, ss
+        else:
+            sign, oh, om = offset_str[0], int(offset_str[1:3]), int(offset_str[4:6])
+            uy, um, ud, uh, umi, uss = _apply_offset_to_utc(y, mo, d, hh, mi, ss, (sign, oh, om))
+
+        if target_minutes == 0:
+            return _format_fixed(uy, um, ud, uh, umi, uss, 0)
+
+        reverse_sign = '-' if target_minutes >= 0 else '+'
+        ty, tm, td, th, tmi, ts = _apply_offset_to_utc(
+            uy, um, ud, uh, umi, uss, (reverse_sign, abs(target_minutes) // 60, abs(target_minutes) % 60)
+        )
+        return _format_fixed(ty, tm, td, th, tmi, ts, target_minutes)
+
+    def convert_one(ts: str) -> str:
+        raw = ts.strip()
+        try:
+            dt = parser.isoparse(raw.replace(" ", "T", 1))
+            target_tz = ZoneInfo(timezone)
+            if dt.tzinfo is None:
+                localized = _localize_naive(dt, timezone)
+                dt = localized if localized else dt.replace(tzinfo=target_tz)
+            else:
+                dt = dt.astimezone(target_tz)
+            return _format_dt(dt)
+        except Exception:
+            return _manual_path(raw)
 
     new_rows = []
     for row in rows:
@@ -4218,3 +4426,23 @@ def convert_timestamptz(rows, timestamptz_field_name, timezone="UTC"):
             row[timestamptz_field_name] = convert_one(row[timestamptz_field_name])
         new_rows.append(row)
     return new_rows
+
+
+def get_field_warmup(describe_res, field_name):
+    """Get warmup value from describe_collection result for a specific field"""
+    for field in describe_res["fields"]:
+        if field["name"] == field_name:
+            return field.get("params", {}).get("warmup", None)
+    return None
+
+
+def get_collection_warmup(describe_res, key):
+    """Get collection level warmup value from describe_collection result
+       key: "warmup.scalarField" / "warmup.scalarIndex" / "warmup.vectorField" / "warmup.vectorIndex"
+    """
+    return describe_res.get("properties", {}).get(key, None)
+
+
+def get_index_warmup(describe_index_res):
+    """Get index warmup value from describe_index result"""
+    return describe_index_res.get("warmup", None)

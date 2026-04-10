@@ -8,31 +8,28 @@ import (
 
 // init the message ack callbacks
 func init() {
+	resetMessageAckOnceCallbacks()
 	resetMessageAckCallbacks()
-	resetMessageCheckCallbacks()
-}
-
-var RegisterImportV1CheckCallback = registerMessageCheckCallback[*message.ImportMessageHeader, *msgpb.ImportMsg]
-
-// resetMessageCheckCallbacks resets the message check callbacks.
-func resetMessageCheckCallbacks() {
-	messageCheckCallbacks = map[message.MessageTypeWithVersion]*syncutil.Future[messageInnerCheckCallback]{
-		message.MessageTypeImportV1: syncutil.NewFuture[messageInnerCheckCallback](),
-	}
+	// CheckCallback mechanism has been removed as part of import refactoring
+	// All validation is now done before broadcasting in the respective coordinators
 }
 
 var (
-	RegisterImportV1AckCallback = registerMessageAckCallback[*message.ImportMessageHeader, *msgpb.ImportMsg]
+	RegisterImportV1AckCallback              = registerMessageAckCallback[*message.ImportMessageHeader, *msgpb.ImportMsg]
+	RegisterBatchUpdateManifestV2AckCallback = registerMessageAckCallback[*message.BatchUpdateManifestMessageHeader, *message.BatchUpdateManifestMessageBody]
 
 	// Cluster
 	RegisterAlterReplicateConfigV2AckCallback = registerMessageAckCallback[*message.AlterReplicateConfigMessageHeader, *message.AlterReplicateConfigMessageBody]
+	RegisterFlushAllV2AckCallback             = registerMessageAckCallback[*message.FlushAllMessageHeader, *message.FlushAllMessageBody]
+	RegisterAlterWALV2AckCallback             = registerMessageAckCallback[*message.AlterWALMessageHeader, *message.AlterWALMessageBody]
 
 	// Collection
-	RegisterAlterCollectionV2AckCallback  = registerMessageAckCallback[*message.AlterCollectionMessageHeader, *message.AlterCollectionMessageBody]
-	RegisterCreateCollectionV1AckCallback = registerMessageAckCallback[*message.CreateCollectionMessageHeader, *message.CreateCollectionRequest]
-	RegisterDropCollectionV1AckCallback   = registerMessageAckCallback[*message.DropCollectionMessageHeader, *message.DropCollectionRequest]
-	RegisterAlterLoadConfigV2AckCallback  = registerMessageAckCallback[*message.AlterLoadConfigMessageHeader, *message.AlterLoadConfigMessageBody]
-	RegisterDropLoadConfigV2AckCallback   = registerMessageAckCallback[*message.DropLoadConfigMessageHeader, *message.DropLoadConfigMessageBody]
+	RegisterAlterCollectionV2AckCallback    = registerMessageAckCallback[*message.AlterCollectionMessageHeader, *message.AlterCollectionMessageBody]
+	RegisterCreateCollectionV1AckCallback   = registerMessageAckCallback[*message.CreateCollectionMessageHeader, *message.CreateCollectionRequest]
+	RegisterDropCollectionV1AckCallback     = registerMessageAckCallback[*message.DropCollectionMessageHeader, *message.DropCollectionRequest]
+	RegisterTruncateCollectionV2AckCallback = registerMessageAckCallback[*message.TruncateCollectionMessageHeader, *message.TruncateCollectionMessageBody]
+	RegisterAlterLoadConfigV2AckCallback    = registerMessageAckCallback[*message.AlterLoadConfigMessageHeader, *message.AlterLoadConfigMessageBody]
+	RegisterDropLoadConfigV2AckCallback     = registerMessageAckCallback[*message.DropLoadConfigMessageHeader, *message.DropLoadConfigMessageBody]
 
 	// Partition
 	RegisterCreatePartitionV1AckCallback = registerMessageAckCallback[*message.CreatePartitionMessageHeader, *message.CreatePartitionRequest]
@@ -68,22 +65,34 @@ var (
 	// Resource Group
 	RegisterAlterResourceGroupV2AckCallback = registerMessageAckCallback[*message.AlterResourceGroupMessageHeader, *message.AlterResourceGroupMessageBody]
 	RegisterDropResourceGroupV2AckCallback  = registerMessageAckCallback[*message.DropResourceGroupMessageHeader, *message.DropResourceGroupMessageBody]
+
+	// Snapshot
+	RegisterCreateSnapshotV2AckCallback  = registerMessageAckCallback[*message.CreateSnapshotMessageHeader, *message.CreateSnapshotMessageBody]
+	RegisterDropSnapshotV2AckCallback    = registerMessageAckCallback[*message.DropSnapshotMessageHeader, *message.DropSnapshotMessageBody]
+	RegisterRestoreSnapshotV2AckCallback = registerMessageAckCallback[*message.RestoreSnapshotMessageHeader, *message.RestoreSnapshotMessageBody]
+
+	// External Collection
+	RegisterRefreshExternalCollectionV2AckCallback = registerMessageAckCallback[*message.RefreshExternalCollectionMessageHeader, *message.RefreshExternalCollectionMessageBody]
 )
 
 // resetMessageAckCallbacks resets the message ack callbacks.
 func resetMessageAckCallbacks() {
 	messageAckCallbacks = map[message.MessageTypeWithVersion]*syncutil.Future[messageInnerAckCallback]{
-		message.MessageTypeImportV1: syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeImportV1:              syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeBatchUpdateManifestV2: syncutil.NewFuture[messageInnerAckCallback](),
 
 		// Cluster
 		message.MessageTypeAlterReplicateConfigV2: syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeFlushAllV2:             syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeAlterWALV2:             syncutil.NewFuture[messageInnerAckCallback](),
 
 		// Collection
-		message.MessageTypeAlterCollectionV2:  syncutil.NewFuture[messageInnerAckCallback](),
-		message.MessageTypeCreateCollectionV1: syncutil.NewFuture[messageInnerAckCallback](),
-		message.MessageTypeDropCollectionV1:   syncutil.NewFuture[messageInnerAckCallback](),
-		message.MessageTypeAlterLoadConfigV2:  syncutil.NewFuture[messageInnerAckCallback](),
-		message.MessageTypeDropLoadConfigV2:   syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeAlterCollectionV2:    syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeCreateCollectionV1:   syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeDropCollectionV1:     syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeTruncateCollectionV2: syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeAlterLoadConfigV2:    syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeDropLoadConfigV2:     syncutil.NewFuture[messageInnerAckCallback](),
 
 		// Partition
 		message.MessageTypeCreatePartitionV1: syncutil.NewFuture[messageInnerAckCallback](),
@@ -119,5 +128,13 @@ func resetMessageAckCallbacks() {
 		// Resource Group
 		message.MessageTypeAlterResourceGroupV2: syncutil.NewFuture[messageInnerAckCallback](),
 		message.MessageTypeDropResourceGroupV2:  syncutil.NewFuture[messageInnerAckCallback](),
+
+		// Snapshot
+		message.MessageTypeCreateSnapshotV2:  syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeDropSnapshotV2:    syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeRestoreSnapshotV2: syncutil.NewFuture[messageInnerAckCallback](),
+
+		// External Collection
+		message.MessageTypeRefreshExternalCollectionV2: syncutil.NewFuture[messageInnerAckCallback](),
 	}
 }

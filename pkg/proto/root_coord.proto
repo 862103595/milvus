@@ -32,6 +32,15 @@ service RootCoord {
     rpc DropCollection(milvus.DropCollectionRequest) returns (common.Status) {}
 
     /**
+     * @brief This method is used to clear a collection.
+     *
+     * @param TruncateCollectionRequest, collection name is going to be cleared.
+     *
+     * @return Status
+     */
+    rpc TruncateCollection(milvus.TruncateCollectionRequest) returns (milvus.TruncateCollectionResponse) {}
+
+    /**
      * @brief This method is used to add collection field.
      *
      * @param AddCollectionFieldRequest, field schema is going to be added.
@@ -39,6 +48,17 @@ service RootCoord {
      * @return Status
      */
     rpc AddCollectionField(milvus.AddCollectionFieldRequest) returns (common.Status) {}
+
+
+     /**
+     * @brief This method is used to add/drop collection field/function.
+     *
+     * @param AlterCollectionSchemaRequest, field schema is going to be added.
+     *
+     * @return AlterCollectionSchemaResponse
+     */
+    rpc AlterCollectionSchema(milvus.AlterCollectionSchemaRequest) returns (milvus.AlterCollectionSchemaResponse){}
+
 
     /**
      * @brief This method is used to test collection existence.
@@ -77,6 +97,12 @@ service RootCoord {
     rpc AlterCollection(milvus.AlterCollectionRequest) returns (common.Status) {}
     
     rpc AlterCollectionField(milvus.AlterCollectionFieldRequest) returns (common.Status) {}
+
+    rpc AddCollectionFunction(milvus.AddCollectionFunctionRequest) returns (common.Status) {}
+
+    rpc AlterCollectionFunction(milvus.AlterCollectionFunctionRequest) returns (common.Status) {}    
+    
+    rpc DropCollectionFunction(milvus.DropCollectionFunctionRequest) returns (common.Status) {}    
   /**
    * @brief This method is used to create partition
    *
@@ -154,6 +180,17 @@ service RootCoord {
     rpc AlterDatabase(AlterDatabaseRequest) returns(common.Status){}
 
     rpc GetQuotaMetrics(internal.GetQuotaMetricsRequest) returns (internal.GetQuotaMetricsResponse) {}
+    rpc BackupEzk(internal.BackupEzkRequest) returns (internal.BackupEzkResponse) {}
+    // File Resource Management
+    rpc AddFileResource(milvus.AddFileResourceRequest) returns (common.Status) {}
+    rpc RemoveFileResource(milvus.RemoveFileResourceRequest) returns (common.Status) {}
+    rpc ListFileResources(milvus.ListFileResourcesRequest) returns (milvus.ListFileResourcesResponse) {}
+
+    // Client Telemetry RPCs (forwarded to rootcoord implementation)
+    rpc ClientHeartbeat(milvus.ClientHeartbeatRequest) returns (milvus.ClientHeartbeatResponse) {}
+    rpc GetClientTelemetry(milvus.GetClientTelemetryRequest) returns (milvus.GetClientTelemetryResponse) {}
+    rpc PushClientCommand(milvus.PushClientCommandRequest) returns (milvus.PushClientCommandResponse) {}
+    rpc DeleteClientCommand(milvus.DeleteClientCommandRequest) returns (milvus.DeleteClientCommandResponse) {}
 }
 
 message AllocTimestampRequest {

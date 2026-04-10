@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/collector"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
@@ -67,6 +68,11 @@ func getQuotaMetrics(node *QueryNode) (*metricsinfo.QueryNodeQuotaMetrics, error
 	minTsafe := uint64(math.MaxUint64)
 	node.delegators.Range(func(channel string, delegator delegator.ShardDelegator) bool {
 		tsafe := delegator.GetTSafe()
+		if delegator.CatchingUpStreamingData() {
+			// If the channel is on-catching up with streaming data.
+			// We should skip this channel to avoid the quota center to make wrong decision.
+			return true
+		}
 		if tsafe < minTsafe {
 			minTsafeChannel = channel
 			minTsafe = tsafe
@@ -268,6 +274,9 @@ func getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest, 
 		log.Ctx(ctx).Warn("get iowait failed", zap.Error(err))
 	}
 
+	// Get jemalloc memory statistics
+	jemallocStats := segcore.GetJemallocStats()
+
 	hardwareInfos := metricsinfo.HardwareMetrics{
 		IP:               node.session.Address,
 		CPUCoreCount:     hardware.GetCPUNum(),
@@ -277,6 +286,16 @@ func getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest, 
 		Disk:             totalDiskGB,
 		DiskUsage:        usedDiskGB,
 		IOWaitPercentage: ioWait,
+		// Jemalloc memory statistics (comprehensive metrics)
+		JemallocAllocated:     jemallocStats.Allocated,
+		JemallocActive:        jemallocStats.Active,
+		JemallocMetadata:      jemallocStats.Metadata,
+		JemallocResident:      jemallocStats.Resident,
+		JemallocMapped:        jemallocStats.Mapped,
+		JemallocRetained:      jemallocStats.Retained,
+		JemallocFragmentation: jemallocStats.Fragmentation,
+		JemallocOverhead:      jemallocStats.Overhead,
+		JemallocSuccess:       jemallocStats.Success,
 	}
 
 	quotaMetrics, err := getQuotaMetrics(node)

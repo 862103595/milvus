@@ -146,20 +146,6 @@ func getZeroTime() time.Time {
 	return t
 }
 
-// getCollectionTTL returns ttl if collection's ttl is specified, or return global ttl
-func getCollectionTTL(properties map[string]string) (time.Duration, error) {
-	v, ok := properties[common.CollectionTTLConfigKey]
-	if ok {
-		ttl, err := strconv.Atoi(v)
-		if err != nil {
-			return -1, err
-		}
-		return time.Duration(ttl) * time.Second, nil
-	}
-
-	return Params.CommonCfg.EntityExpirationTTL.GetAsDuration(time.Second), nil
-}
-
 func UpdateCompactionSegmentSizeMetrics(segments []*datapb.CompactionSegment) {
 	var totalSize int64
 	for _, seg := range segments {
@@ -197,6 +183,10 @@ func getCompactedSegmentSize(s *datapb.CompactionSegment) int64 {
 // getCollectionAutoCompactionEnabled returns whether auto compaction for collection is enabled.
 // if not set, returns global auto compaction config.
 func getCollectionAutoCompactionEnabled(properties map[string]string) (bool, error) {
+	// when collection is on truncating, disable auto compaction.
+	if _, ok := properties[common.CollectionOnTruncatingKey]; ok {
+		return false, nil
+	}
 	v, ok := properties[common.CollectionAutoCompactionKey]
 	if ok {
 		enabled, err := strconv.ParseBool(v)
@@ -356,6 +346,8 @@ func createStorageConfig() *indexpb.StorageConfig {
 			CloudProvider:     Params.MinioCfg.CloudProvider.GetValue(),
 			RequestTimeoutMs:  Params.MinioCfg.RequestTimeoutMs.GetAsInt64(),
 			GcpCredentialJSON: Params.MinioCfg.GcpCredentialJSON.GetValue(),
+			SslTlsMinVersion:  Params.MinioCfg.SslTLSMinVersion.GetValue(),
+			UseCrc32CChecksum: Params.MinioCfg.UseCRC32C.GetAsBool(),
 		}
 	}
 
@@ -369,14 +361,17 @@ func getSortStatus(sorted bool) string {
 	return "unsorted"
 }
 
-func calculateIndexTaskSlot(segmentSize int64) int64 {
+func calculateIndexTaskSlot(fieldSize int64, isVectorIndex bool) int64 {
 	defaultSlots := Params.DataCoordCfg.IndexTaskSlotUsage.GetAsInt64()
-	if segmentSize > 512*1024*1024 {
-		taskSlot := max(segmentSize/512/1024/1024, 1) * defaultSlots
+	if !isVectorIndex {
+		defaultSlots = Params.DataCoordCfg.ScalarIndexTaskSlotUsage.GetAsInt64()
+	}
+	if fieldSize > 512*1024*1024 {
+		taskSlot := max(fieldSize/512/1024/1024, 1) * defaultSlots
 		return max(taskSlot, 1)
-	} else if segmentSize > 100*1024*1024 {
+	} else if fieldSize > 100*1024*1024 {
 		return max(defaultSlots/4, 1)
-	} else if segmentSize > 10*1024*1024 {
+	} else if fieldSize > 10*1024*1024 {
 		return max(defaultSlots/16, 1)
 	}
 	return max(defaultSlots/64, 1)

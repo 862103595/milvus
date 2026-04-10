@@ -1240,7 +1240,12 @@ func (suite *ServiceSuite) syncDistribution(ctx context.Context) {
 			PartitionIDs: suite.partitionIDs,
 		},
 		Actions: []*querypb.SyncAction{
-			{Type: querypb.SyncType_UpdateVersion, SealedInTarget: suite.validSegmentIDs, TargetVersion: time.Now().UnixNano()},
+			{
+				Type:                  querypb.SyncType_UpdateVersion,
+				SealedInTarget:        suite.validSegmentIDs,
+				SealedSegmentRowCount: map[int64]int64{1: 100, 2: 100, 3: 100},
+				TargetVersion:         time.Now().UnixNano(),
+			},
 		},
 	})
 }
@@ -1381,7 +1386,8 @@ func (suite *ServiceSuite) TestSearch_Failed() {
 	}
 
 	syncVersionAction := &querypb.SyncAction{
-		Type: querypb.SyncType_UpdateVersion,
+		Type:           querypb.SyncType_UpdateVersion,
+		SealedInTarget: suite.validSegmentIDs,
 		SealedSegmentRowCount: map[int64]int64{
 			1: 100,
 			2: 200,
@@ -1860,6 +1866,7 @@ func (suite *ServiceSuite) TestGetMetric_Normal() {
 	suite.NoError(err)
 
 	sd1 := delegator.NewMockShardDelegator(suite.T())
+	sd1.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
 	sd1.EXPECT().Collection().Return(100)
 	sd1.EXPECT().GetDeleteBufferSize().Return(10, 1000)
 	sd1.EXPECT().GetTSafe().Return(100)
@@ -1868,6 +1875,7 @@ func (suite *ServiceSuite) TestGetMetric_Normal() {
 	defer suite.node.delegators.GetAndRemove("qn_unitest_dml_0_100v0")
 
 	sd2 := delegator.NewMockShardDelegator(suite.T())
+	sd2.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
 	sd2.EXPECT().Collection().Return(100)
 	sd2.EXPECT().GetTSafe().Return(200)
 	sd2.EXPECT().GetDeleteBufferSize().Return(10, 1000)
@@ -1956,6 +1964,32 @@ func (suite *ServiceSuite) TestGetDataDistribution_Failed() {
 	resp, err := suite.node.GetDataDistribution(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_NotReadyServe, resp.Status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_LeaderViewStatus() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	req := &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+	}
+
+	resp, err := suite.node.GetDataDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+
+	// Verify LeaderView has Status field with CatchingUpStreamingData
+	suite.NotEmpty(resp.LeaderViews)
+	for _, leaderView := range resp.LeaderViews {
+		suite.NotNil(leaderView.Status, "LeaderView should have Status field")
+		// Initially delegator is catching up streaming data (true)
+		suite.True(leaderView.Status.CatchingUpStreamingData,
+			"New delegator should be catching up streaming data")
+	}
 }
 
 func (suite *ServiceSuite) TestSyncDistribution_Normal() {
@@ -2168,6 +2202,57 @@ func (suite *ServiceSuite) TestSyncDistribution_Failed() {
 	status, err := suite.node.SyncDistribution(ctx, req)
 	suite.NoError(err)
 	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_RejectV25Message() {
+	ctx := context.Background()
+	// prepare
+	// watch dmchannel and load some segments
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// data
+	req := &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      suite.vchannel,
+		LoadMeta: &querypb.LoadMetaInfo{
+			PartitionIDs: suite.partitionIDs,
+		},
+	}
+
+	// Create a v2.5 style message: SealedInTarget is not empty but SealedSegmentRowCount is empty
+	v25StyleAction := &querypb.SyncAction{
+		Type:           querypb.SyncType_UpdateVersion,
+		SealedInTarget: []int64{3, 4, 5}, // Non-empty
+		// Note: SealedSegmentRowCount is not set (empty), simulating v2.5 format
+		GrowingInTarget: []int64{6},
+		DroppedInTarget: []int64{1, 2},
+		TargetVersion:   time.Now().UnixMilli(),
+		Checkpoint:      &msgpb.MsgPosition{Timestamp: 1000},
+		DeleteCP:        &msgpb.MsgPosition{Timestamp: 500},
+	}
+
+	req.Actions = []*querypb.SyncAction{v25StyleAction}
+
+	// This should succeed (no error returned), but the v2.5 message should be rejected
+	status, err := suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	// Verify that the v2.5 message was rejected by checking that no version sync happened
+	// The delegator should not have processed this message
+	// We can verify this by checking if the state was not updated (delegator should remain serviceable: false)
+	shardDelegator, ok := suite.node.delegators.Get(suite.vchannel)
+	suite.True(ok)
+
+	// After rejection, the delegator's version should still be at initial state
+	// (not updated by the v2.5 message)
+	// We verify this indirectly by checking that no segments were marked as excluded
+	suite.Equal(int64(0), shardDelegator.Version())
 }
 
 func (suite *ServiceSuite) TestDelete_Int64() {
@@ -2433,7 +2518,7 @@ func (suite *ServiceSuite) TestValidateAnalyzer() {
 
 		resp, err := suite.node.ValidateAnalyzer(ctx, req)
 		suite.Require().NoError(err)
-		suite.Require().Equal(commonpb.ErrorCode_Success, resp.GetErrorCode())
+		suite.Require().Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	suite.Run("invalid analyzer params", func() {
@@ -2449,7 +2534,7 @@ func (suite *ServiceSuite) TestValidateAnalyzer() {
 
 		resp, err := suite.node.ValidateAnalyzer(ctx, req)
 		suite.Require().NoError(err)
-		suite.Require().NotEqual(commonpb.ErrorCode_Success, resp.GetErrorCode())
+		suite.Require().NotEqual(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	suite.Run("abnormal node", func() {
@@ -2467,7 +2552,50 @@ func (suite *ServiceSuite) TestValidateAnalyzer() {
 
 		resp, err := suite.node.ValidateAnalyzer(ctx, req)
 		suite.Require().NoError(err)
-		suite.Require().NotEqual(commonpb.ErrorCode_Success, resp.GetErrorCode())
+		suite.Require().NotEqual(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+}
+
+func (suite *ServiceSuite) TestGetHighlight() {
+	ctx := context.Background()
+
+	suite.Run("node not healthy", func() {
+		suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+		defer suite.node.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		resp, err := suite.node.GetHighlight(ctx, &querypb.GetHighlightRequest{
+			Channel: suite.vchannel,
+			Topks:   []int64{10},
+		})
+
+		suite.NoError(err)
+		suite.Error(merr.Error(resp.GetStatus()))
+	})
+
+	suite.Run("normal case", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+		delegator.EXPECT().GetHighlight(mock.Anything, mock.Anything).Return(
+			[]*querypb.HighlightResult{}, nil)
+		resp, err := suite.node.GetHighlight(ctx, &querypb.GetHighlightRequest{
+			Channel: suite.vchannel,
+			Topks:   []int64{1, 1},
+			Tasks: []*querypb.HighlightTask{
+				{
+					FieldName:     "text_field",
+					FieldId:       100,
+					Texts:         []string{"target text", "target text2", "text", "text2"},
+					AnalyzerNames: []string{"standard", "standard", "standard", "standard"},
+					SearchTextNum: 2,
+					CorpusTextNum: 2,
+				},
+			},
+		})
+
+		suite.NoError(err)
+		suite.NoError(merr.Error(resp.GetStatus()))
+		suite.NotNil(resp.Results)
 	})
 }
 

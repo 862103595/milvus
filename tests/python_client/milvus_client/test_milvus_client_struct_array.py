@@ -1825,6 +1825,30 @@ class TestMilvusClientStructArraySearch(TestMilvusClientV2Base):
         assert len(results[0]) > 0
 
     @pytest.mark.tags(CaseLabel.L1)
+    def test_search_struct_array_not_support_search_by_pk(self):
+        """
+        target: test searching with multiple vectors (EmbeddingList) in struct array does not supprt search by pk
+        method: search using EmbeddingList by pk
+        expected: search failed with error
+        """
+        collection_name = cf.gen_unique_str(f"{prefix}_search")
+
+        client = self._client()
+        # Create collection with data and index
+        self.create_collection_with_index(client, collection_name)
+
+        # Search using EmbeddingList
+        error = {ct.err_code: 999,
+                 ct.err_msg: "array of vector is not supported for search by IDs"}
+        self.search(client,
+                    collection_name,
+                    ids=[0, 1],
+                    anns_field="clips[clip_embedding1]",
+                    search_params={"metric_type": "MAX_SIM_COSINE"},
+                    limit=10,
+                    check_task=CheckTasks.err_res, check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("retrieval_ann_ratio", [1.0, 3.0, 5.0, 10.0])
     def test_search_with_retrieval_ann_ratio(self, retrieval_ann_ratio):
         """
@@ -1862,6 +1886,233 @@ class TestMilvusClientStructArraySearch(TestMilvusClientV2Base):
         # Verify results are returned
         for hit in results[0]:
             assert hit is not None
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_search_recall_with_maxsim_ground_truth(self):
+        """
+        target: test search recall by comparing with MaxSim ground truth
+        method: calculate brute-force MaxSim similarity as ground truth,
+                then compare with Milvus search results to compute recall
+        expected: higher retrieval_ann_ratio should improve recall
+        """
+
+        def maxsim_similarity_numpy(query_emb: np.ndarray, doc_emb: np.ndarray) -> float:
+            """
+            Standard MaxSim calculation using NumPy (brute-force ground truth).
+
+            MaxSim(Q, D) = sum_i max_j (q_i · d_j)
+            where q_i are query token embeddings and d_j are document patch embeddings.
+            """
+            # Normalize embeddings
+            query_norm = query_emb / (np.linalg.norm(query_emb, axis=1, keepdims=True) + 1e-8)
+            doc_norm = doc_emb / (np.linalg.norm(doc_emb, axis=1, keepdims=True) + 1e-8)
+
+            # Compute similarity matrix: (num_tokens, num_patches)
+            similarities = np.dot(query_norm, doc_norm.T)
+
+            # For each query token, get max similarity across all patches
+            max_scores = np.max(similarities, axis=1)
+
+            # Sum all max scores
+            return np.sum(max_scores)
+
+        collection_name = cf.gen_unique_str(f"{prefix}_recall")
+        client = self._client()
+        dim = default_dim
+        nb = 1000  # Number of documents
+        num_query_vectors = 30  # Number of vectors in query (simulating query tokens)
+        min_patches = 100  # Min patches per document
+        max_patches = 300  # Max patches per document
+
+        log.info(f"Creating collection with {nb} docs, {num_query_vectors} query vectors, "
+                 f"{min_patches}-{max_patches} patches per doc")
+
+        # Create schema
+        schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
+        schema.add_field(
+            field_name="normal_vector", datatype=DataType.FLOAT_VECTOR, dim=dim
+        )
+
+        # Create struct schema
+        struct_schema = client.create_struct_field_schema()
+        struct_schema.add_field("clip_embedding1", DataType.FLOAT_VECTOR, dim=dim)
+        struct_schema.add_field("scalar_field", DataType.INT64)
+
+        schema.add_field(
+            "clips",
+            datatype=DataType.ARRAY,
+            element_type=DataType.STRUCT,
+            struct_schema=struct_schema,
+            max_capacity=max_patches,
+        )
+
+        # Create collection
+        self.create_collection(client, collection_name, schema=schema)
+
+        # Generate and insert data in batches, storing embeddings for ground truth
+        doc_embeddings = {}  # id -> numpy array of embeddings (for ground truth)
+        batch_size = 100
+
+        for batch_start in range(0, nb, batch_size):
+            batch_end = min(batch_start + batch_size, nb)
+            data = []
+
+            for i in range(batch_start, batch_end):
+                array_length = random.randint(min_patches, max_patches)
+                struct_array = []
+                embeddings_list = []
+
+                for j in range(array_length):
+                    embedding = [random.random() for _ in range(dim)]
+                    struct_element = {
+                        "clip_embedding1": embedding,
+                        "scalar_field": i * 10 + j,
+                    }
+                    struct_array.append(struct_element)
+                    embeddings_list.append(embedding)
+
+                row = {
+                    "id": i,
+                    "normal_vector": [random.random() for _ in range(dim)],
+                    "clips": struct_array,
+                }
+                data.append(row)
+                doc_embeddings[i] = np.array(embeddings_list)
+
+            self.insert(client, collection_name, data)
+            log.info(f"Inserted batch {batch_start//batch_size + 1}/{(nb + batch_size - 1)//batch_size}")
+
+        # Create indexes
+        index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="normal_vector",
+            index_type="IVF_FLAT",
+            metric_type="L2",
+            params={"nlist": 128},
+        )
+        index_params.add_index(
+            field_name="clips[clip_embedding1]",
+            index_name="struct_vector_index",
+            index_type="HNSW",
+            metric_type="MAX_SIM_COSINE",
+            params=INDEX_PARAMS,
+        )
+
+        self.create_index(client, collection_name, index_params)
+
+        # Load collection
+        self.load_collection(client, collection_name)
+
+        # Generate query vectors
+        log.info(f"Generating {num_query_vectors} query vectors...")
+        query_vectors = [np.array([random.random() for _ in range(dim)]) for _ in range(num_query_vectors)]
+        query_emb = np.array(query_vectors)  # Shape: (num_query_vectors, dim)
+
+        # Calculate ground truth: compute MaxSim score for each document
+        log.info(f"Calculating ground truth MaxSim scores for {nb} documents...")
+        start_time = time.time()
+        ground_truth_scores = []
+        for idx, (doc_id, doc_emb) in enumerate(doc_embeddings.items()):
+            score = maxsim_similarity_numpy(query_emb, doc_emb)
+            ground_truth_scores.append((doc_id, score))
+            if (idx + 1) % 500 == 0:
+                elapsed = time.time() - start_time
+                log.info(f"Calculated {idx + 1}/{nb} ground truth scores, elapsed: {elapsed:.1f}s")
+
+        gt_calc_time = time.time() - start_time
+        log.info(f"Ground truth calculation completed in {gt_calc_time:.1f}s")
+
+        # Sort by score descending to get ground truth ranking
+        ground_truth_scores.sort(key=lambda x: x[1], reverse=True)
+
+        limit = 10
+        ground_truth_ids = set([item[0] for item in ground_truth_scores[:limit]])
+
+        # Create EmbeddingList for Milvus search
+        search_tensor = EmbeddingList()
+        for vec in query_vectors:
+            search_tensor.add(vec.tolist())
+
+        # Log ground truth top-10 with scores (only once)
+        log.info(f"Ground truth top-{limit} IDs: {sorted(ground_truth_ids)}")
+        log.info(f"Ground truth top-{limit} with scores:")
+        for i, (doc_id, score) in enumerate(ground_truth_scores[:limit]):
+            num_patches = len(doc_embeddings[doc_id])
+            log.info(f"  GT rank {i+1}: id={doc_id}, score={score:.6f}, num_patches={num_patches}")
+
+        # Search with different retrieval_ann_ratio values
+        retrieval_ann_ratios = [0.1, 1.0, 3.0, 5.0]
+        recall_results = {}  # Track recall for each ratio
+        for retrieval_ann_ratio in retrieval_ann_ratios:
+            log.info(f"\n{'='*50}")
+            log.info(f"Testing retrieval_ann_ratio={retrieval_ann_ratio}")
+
+            results, _ = self.search(
+                client,
+                collection_name,
+                data=[search_tensor],
+                anns_field="clips[clip_embedding1]",
+                search_params={
+                    "metric_type": "MAX_SIM_COSINE",
+                    "params": {"retrieval_ann_ratio": retrieval_ann_ratio}
+                },
+                limit=limit,
+            )
+            assert len(results[0]) > 0
+
+            # Get Milvus search result IDs
+            milvus_result_ids = set([hit["id"] for hit in results[0]])
+
+            # Calculate recall: intersection of ground truth and Milvus results
+            recall_hits = len(ground_truth_ids.intersection(milvus_result_ids))
+            recall = recall_hits / len(ground_truth_ids)
+            recall_results[retrieval_ann_ratio] = recall
+
+            log.info(f"retrieval_ann_ratio={retrieval_ann_ratio}, recall={recall:.4f}, "
+                     f"recall_hits={recall_hits}/{limit}")
+            log.info(f"Milvus result IDs: {sorted(milvus_result_ids)}")
+
+            # Log detailed comparison for Milvus results
+            log.info(f"Milvus results with ground truth comparison:")
+            gt_ranks_for_milvus = []
+            for i, hit in enumerate(results[0][:limit]):
+                gt_score = next((s for doc_id, s in ground_truth_scores if doc_id == hit["id"]), None)
+                gt_rank = next((idx+1 for idx, (doc_id, _) in enumerate(ground_truth_scores) if doc_id == hit["id"]), None)
+                gt_ranks_for_milvus.append(gt_rank)
+                log.info(f"  Milvus rank {i+1}: id={hit['id']}, distance={hit['distance']:.6f}, "
+                         f"gt_score={gt_score:.6f}, gt_rank={gt_rank}")
+
+            # Calculate recall at different K values
+            for k in [1, 5, 10]:
+                gt_top_k = set([item[0] for item in ground_truth_scores[:k]])
+                recall_at_k = len(gt_top_k.intersection(milvus_result_ids)) / min(k, limit)
+                log.info(f"Recall@{k}: {recall_at_k:.4f}")
+
+            # Calculate average ground truth rank for Milvus results
+            avg_gt_rank = sum(gt_ranks_for_milvus) / len(gt_ranks_for_milvus)
+            log.info(f"Average GT rank for Milvus top-{limit}: {avg_gt_rank:.1f}")
+
+            # Verify results
+            assert recall >= 0, f"Recall should be non-negative, got {recall}"
+            assert len(results[0]) == limit, f"Expected {limit} results, got {len(results[0])}"
+
+        # Verify that higher retrieval_ann_ratio leads to higher or equal recall
+        log.info(f"\nRecall results summary: {recall_results}")
+        for i in range(len(retrieval_ann_ratios) - 1):
+            ratio_curr = retrieval_ann_ratios[i]
+            ratio_next = retrieval_ann_ratios[i + 1]
+            assert recall_results[ratio_next] >= recall_results[ratio_curr], \
+                f"Recall should increase with higher retrieval_ann_ratio: " \
+                f"ratio {ratio_curr} has recall {recall_results[ratio_curr]}, " \
+                f"but ratio {ratio_next} has recall {recall_results[ratio_next]}"
+
+        # Verify that recall >= 0.8 when retrieval_ann_ratio >= 3
+        for ratio, recall in recall_results.items():
+            if ratio >= 3:
+                assert recall >= 0.8, \
+                    f"Recall should be >= 0.8 when retrieval_ann_ratio >= 3, " \
+                    f"but ratio {ratio} has recall {recall}"
 
 
 class TestMilvusClientStructArrayHybridSearch(TestMilvusClientV2Base):
@@ -2633,7 +2884,7 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
         schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
         schema.add_field(
-            field_name="normal_vector", datatype=DataType.FLOAT_VECTOR, dim=default_dim
+            field_name="normal_vector", datatype=DataType.FLOAT_VECTOR, dim=default_dim, nullable=True
         )
 
         struct_schema = client.create_struct_field_schema()
@@ -2659,7 +2910,7 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
     def test_upsert_struct_array_data(self):
         """
         target: test upsert operation with struct array data
-        method: insert data then upsert with modified struct array
+        method: insert 3000 records, flush 2000, insert 1000 growing, then upsert with modified struct array
         expected: data successfully upserted
         """
         collection_name = cf.gen_unique_str(f"{prefix}_crud")
@@ -2669,25 +2920,50 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         # Create collection
         self.create_collection_with_schema(client, collection_name)
 
-        # Initial insert
-        initial_data = [
-            {
-                "id": 1,
-                "normal_vector": [random.random() for _ in range(default_dim)],
+        # Insert 2000 records for flushed data
+        flushed_data = []
+        for i in range(2000):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)] if random.random() > 0.8 else None,
                 "clips": [
                     {
-                        "clip_embedding1": [
-                            random.random() for _ in range(default_dim)
-                        ],
-                        "scalar_field": 100,
-                        "label": "initial",
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i,
+                        "label": f"flushed_{i}",
                     }
                 ],
             }
-        ]
+            flushed_data.append(row)
 
-        res, check = self.insert(client, collection_name, initial_data)
+        res, check = self.insert(client, collection_name, flushed_data)
         assert check
+        assert res["insert_count"] == 2000
+
+        # Flush to persist data
+        res, check = self.flush(client, collection_name)
+        assert check
+
+        # Insert 1000 records for growing data
+        growing_data = []
+        for i in range(2000, 3000):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)] if random.random() > 0.8 else None,
+                "clips": [
+                    {
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i,
+                        "label": f"growing_{i}",
+                    }
+                ],
+            }
+            growing_data.append(row)
+
+        res, check = self.insert(client, collection_name, growing_data)
+        assert check
+        assert res["insert_count"] == 1000
+
         # create index and load collection
         index_params = client.prepare_index_params()
         index_params.add_index(
@@ -2707,40 +2983,63 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         res, check = self.load_collection(client, collection_name)
         assert check
 
-        # Upsert with modified data
-        upsert_data = [
-            {
-                "id": 1,  # Same ID
-                "normal_vector": [random.random() for _ in range(default_dim)],
+        # Upsert data in both flushed and growing segments
+        upsert_data = []
+        # Upsert 10 records from flushed data
+        for i in range(0, 10):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)] if random.random() > 0.8 else None,
                 "clips": [
                     {
-                        "clip_embedding1": [
-                            random.random() for _ in range(default_dim)
-                        ],
-                        "scalar_field": 200,  # Modified
-                        "label": "updated",  # Modified
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i + 10000,  # Modified
+                        "label": f"updated_flushed_{i}",  # Modified
                     }
                 ],
             }
-        ]
+            upsert_data.append(row)
+
+        # Upsert 10 records from growing data
+        for i in range(2000, 2010):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)] if random.random() > 0.8 else None,
+                "clips": [
+                    {
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i + 10000,  # Modified
+                        "label": f"updated_growing_{i}",  # Modified
+                    }
+                ],
+            }
+            upsert_data.append(row)
 
         res, check = self.upsert(client, collection_name, upsert_data)
         assert check
 
-        # Verify upsert worked
+        # Verify upsert worked for flushed data
         res, check = self.flush(client, collection_name)
         assert check
 
-        results, check = self.query(client, collection_name, filter="id == 1")
+        results, check = self.query(client, collection_name, filter="id < 10")
         assert check
-        assert len(results) == 1
-        assert results[0]["clips"][0]["label"] == "updated"
+        assert len(results) == 10
+        for result in results:
+            assert "updated_flushed" in result["clips"][0]["label"]
+
+        # Verify upsert worked for growing data
+        results, check = self.query(client, collection_name, filter="id >= 2000 and id < 2010")
+        assert check
+        assert len(results) == 10
+        for result in results:
+            assert "updated_growing" in result["clips"][0]["label"]
 
     @pytest.mark.tags(CaseLabel.L0)
     def test_delete_struct_array_data(self):
         """
         target: test delete operation with struct array data
-        method: insert struct array data then delete by ID
+        method: insert 3000 records (2000 flushed + 1000 growing), then delete by ID from both segments
         expected: data successfully deleted
         """
         collection_name = cf.gen_unique_str(f"{prefix}_crud")
@@ -2750,25 +3049,50 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         # Create collection and insert data
         self.create_collection_with_schema(client, collection_name)
 
-        data = []
-        for i in range(10):
+        # Insert 2000 records for flushed data
+        flushed_data = []
+        for i in range(2000):
             row = {
                 "id": i,
                 "normal_vector": [random.random() for _ in range(default_dim)],
                 "clips": [
                     {
-                        "clip_embedding1": [
-                            random.random() for _ in range(default_dim)
-                        ],
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
                         "scalar_field": i,
-                        "label": f"label_{i}",
+                        "label": f"flushed_{i}",
                     }
                 ],
             }
-            data.append(row)
+            flushed_data.append(row)
 
-        res, check = self.insert(client, collection_name, data)
+        res, check = self.insert(client, collection_name, flushed_data)
         assert check
+        assert res["insert_count"] == 2000
+
+        # Flush to persist data
+        res, check = self.flush(client, collection_name)
+        assert check
+
+        # Insert 1000 records for growing data
+        growing_data = []
+        for i in range(2000, 3000):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)],
+                "clips": [
+                    {
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i,
+                        "label": f"growing_{i}",
+                    }
+                ],
+            }
+            growing_data.append(row)
+
+        res, check = self.insert(client, collection_name, growing_data)
+        assert check
+        assert res["insert_count"] == 1000
+
         # create index and load collection
         index_params = client.prepare_index_params()
         index_params.add_index(
@@ -2788,9 +3112,14 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         res, check = self.load_collection(client, collection_name)
         assert check
 
-        # Delete some records
-        delete_ids = [1, 3, 5]
-        res, check = self.delete(client, collection_name, filter=f"id in {delete_ids}")
+        # Delete some records from flushed segment
+        delete_flushed_ids = [1, 3, 5, 100, 500, 1000]
+        res, check = self.delete(client, collection_name, filter=f"id in {delete_flushed_ids}")
+        assert check
+
+        # Delete some records from growing segment
+        delete_growing_ids = [2001, 2003, 2500, 2999]
+        res, check = self.delete(client, collection_name, filter=f"id in {delete_growing_ids}")
         assert check
 
         # Verify deletion
@@ -2801,14 +3130,21 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         assert check
 
         remaining_ids = {result["id"] for result in results}
-        for delete_id in delete_ids:
+        # Verify flushed data deletion
+        for delete_id in delete_flushed_ids:
             assert delete_id not in remaining_ids
+        # Verify growing data deletion
+        for delete_id in delete_growing_ids:
+            assert delete_id not in remaining_ids
+
+        # Verify total count is correct (3000 - 10 deleted)
+        assert len(results) == 2990
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_batch_operations(self):
         """
         target: test batch insert/upsert operations with struct array
-        method: perform large batch operations
+        method: insert 3000 records (2000 flushed + 1000 growing), then perform batch upsert
         expected: all operations successful
         """
         collection_name = cf.gen_unique_str(f"{prefix}_crud")
@@ -2818,42 +3154,77 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         # Create collection
         self.create_collection_with_schema(client, collection_name)
 
-        # Large batch insert
-        batch_size = 1000
-        data = []
-        for i in range(batch_size):
+        # Insert 2000 records for flushed data
+        flushed_data = []
+        for i in range(2000):
             row = {
                 "id": i,
                 "normal_vector": [random.random() for _ in range(default_dim)],
                 "clips": [
                     {
-                        "clip_embedding1": [
-                            random.random() for _ in range(default_dim)
-                        ],
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
                         "scalar_field": i % 100,
-                        "label": f"batch_{i}",
+                        "label": f"flushed_{i}",
                     }
                 ],
             }
-            data.append(row)
+            flushed_data.append(row)
 
-        res, check = self.insert(client, collection_name, data)
+        res, check = self.insert(client, collection_name, flushed_data)
         assert check
-        assert res["insert_count"] == batch_size
+        assert res["insert_count"] == 2000
 
-        # Batch upsert (update first 100 records)
+        # Flush to persist data
+        res, check = self.flush(client, collection_name)
+        assert check
+
+        # Insert 1000 records for growing data
+        growing_data = []
+        for i in range(2000, 3000):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)],
+                "clips": [
+                    {
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i % 100,
+                        "label": f"growing_{i}",
+                    }
+                ],
+            }
+            growing_data.append(row)
+
+        res, check = self.insert(client, collection_name, growing_data)
+        assert check
+        assert res["insert_count"] == 1000
+
+        # Batch upsert (update first 100 flushed records and 50 growing records)
         upsert_data = []
+        # Update first 100 flushed records
         for i in range(100):
             row = {
                 "id": i,
                 "normal_vector": [random.random() for _ in range(default_dim)],
                 "clips": [
                     {
-                        "clip_embedding1": [
-                            random.random() for _ in range(default_dim)
-                        ],
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
                         "scalar_field": i + 1000,  # Modified
-                        "label": f"upserted_{i}",  # Modified
+                        "label": f"upserted_flushed_{i}",  # Modified
+                    }
+                ],
+            }
+            upsert_data.append(row)
+
+        # Update first 50 growing records
+        for i in range(2000, 2050):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)],
+                "clips": [
+                    {
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i + 1000,  # Modified
+                        "label": f"upserted_growing_{i}",  # Modified
                     }
                 ],
             }
@@ -2862,11 +3233,15 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         res, check = self.upsert(client, collection_name, upsert_data)
         assert check
 
+        # Verify upsert success with flush
+        res, check = self.flush(client, collection_name)
+        assert check
+
     @pytest.mark.tags(CaseLabel.L1)
     def test_collection_operations(self):
         """
         target: test collection operations (load/release/drop) with struct array
-        method: perform collection management operations
+        method: insert 3000 records (2000 flushed + 1000 growing), then perform collection management operations
         expected: all operations successful
         """
         collection_name = cf.gen_unique_str(f"{prefix}_crud")
@@ -2876,25 +3251,49 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         # Create collection with data
         self.create_collection_with_schema(client, collection_name)
 
-        # Insert some data
-        data = [
-            {
-                "id": 1,
+        # Insert 2000 records for flushed data
+        flushed_data = []
+        for i in range(2000):
+            row = {
+                "id": i,
                 "normal_vector": [random.random() for _ in range(default_dim)],
                 "clips": [
                     {
-                        "clip_embedding1": [
-                            random.random() for _ in range(default_dim)
-                        ],
-                        "scalar_field": 100,
-                        "label": "test",
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i,
+                        "label": f"flushed_{i}",
                     }
                 ],
             }
-        ]
+            flushed_data.append(row)
 
-        res, check = self.insert(client, collection_name, data)
+        res, check = self.insert(client, collection_name, flushed_data)
         assert check
+        assert res["insert_count"] == 2000
+
+        # Flush to persist data
+        res, check = self.flush(client, collection_name)
+        assert check
+
+        # Insert 1000 records for growing data
+        growing_data = []
+        for i in range(2000, 3000):
+            row = {
+                "id": i,
+                "normal_vector": [random.random() for _ in range(default_dim)],
+                "clips": [
+                    {
+                        "clip_embedding1": [random.random() for _ in range(default_dim)],
+                        "scalar_field": i,
+                        "label": f"growing_{i}",
+                    }
+                ],
+            }
+            growing_data.append(row)
+
+        res, check = self.insert(client, collection_name, growing_data)
+        assert check
+        assert res["insert_count"] == 1000
 
         # Create index for loading
         index_params = client.prepare_index_params()
@@ -2921,6 +3320,11 @@ class TestMilvusClientStructArrayCRUD(TestMilvusClientV2Base):
         # Verify collection is loaded
         load_state = client.get_load_state(collection_name)
         assert str(load_state["state"]) == "Loaded"
+
+        # Query to verify both flushed and growing data are accessible
+        results, check = self.query(client, collection_name, filter="id >= 0", limit=3000)
+        assert check
+        assert len(results) == 3000
 
         # Release collection
         res, check = self.release_collection(client, collection_name)
@@ -2979,9 +3383,9 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
     @pytest.mark.tags(CaseLabel.L2)
     def test_struct_with_unsupported_vector_field(self):
         """
-        target: test creating struct with BinaryVector field (should fail)
-        method: attempt to create struct with BinaryVector field
-        expected: creation should fail
+        target: test creating struct with SparseFloatVector field (should fail)
+        method: attempt to create struct with SparseFloatVector field
+        expected: creation should fail (sparse vectors not supported in struct)
         """
         collection_name = cf.gen_unique_str(f"{prefix}_invalid")
 
@@ -2995,7 +3399,7 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
         )
 
         struct_schema = client.create_struct_field_schema()
-        struct_schema.add_field("binary_vector_field", DataType.BINARY_VECTOR, dim=default_dim)
+        struct_schema.add_field("sparse_vector_field", DataType.SPARSE_FLOAT_VECTOR)
         schema.add_field(
             "struct_array",
             datatype=DataType.ARRAY,
@@ -3005,7 +3409,7 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
         )
         error = {
             ct.err_code: 65535,
-            ct.err_msg: "now only float vector is supported",
+            ct.err_msg: "only fixed dimension vector types are supported",
         }
         self.create_collection(
             client,
@@ -3268,22 +3672,12 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
         )
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize(
-        "vector_type",
-        [
-            DataType.BINARY_VECTOR,
-            DataType.FLOAT16_VECTOR,
-            DataType.BFLOAT16_VECTOR,
-            DataType.SPARSE_FLOAT_VECTOR,
-            DataType.INT8_VECTOR,
-        ],
-    )
-    def test_struct_array_with_unsupported_vector_types(self, vector_type):
+    def test_struct_array_with_unsupported_vector_types(self):
         """
-        target: test creating struct array with unsupported vector types (non-FLOAT_VECTOR)
-        method: attempt to create struct array with BINARY_VECTOR, FLOAT16_VECTOR,
-                BFLOAT16_VECTOR, SPARSE_FLOAT_VECTOR, INT8_VECTOR vector types
-        expected: creation should fail as only FLOAT_VECTOR is supported in struct array
+        target: test creating struct array with unsupported vector types
+        method: attempt to create struct array with SPARSE_FLOAT_VECTOR
+        expected: creation should fail as only fixed dimension vector types are supported
+        note: FLOAT_VECTOR, FLOAT16_VECTOR, BFLOAT16_VECTOR, BINARY_VECTOR, INT8_VECTOR are supported
         """
         collection_name = cf.gen_unique_str(f"{prefix}_invalid")
 
@@ -3296,20 +3690,9 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
             field_name="normal_vector", datatype=DataType.FLOAT_VECTOR, dim=default_dim
         )
 
-        # Try to create struct with unsupported vector type
+        # Try to create struct with unsupported vector type (sparse vector)
         struct_schema = client.create_struct_field_schema()
-
-        # SPARSE_FLOAT_VECTOR doesn't need dim parameter
-        if vector_type == DataType.SPARSE_FLOAT_VECTOR:
-            struct_schema.add_field("unsupported_vector", vector_type)
-        else:
-            # BINARY_VECTOR needs dim to be multiple of 8
-            if vector_type == DataType.BINARY_VECTOR:
-                struct_schema.add_field("unsupported_vector", vector_type, dim=128)
-            else:
-                struct_schema.add_field(
-                    "unsupported_vector", vector_type, dim=default_dim
-                )
+        struct_schema.add_field("unsupported_vector", DataType.SPARSE_FLOAT_VECTOR)
 
         schema.add_field(
             "struct_array",
@@ -3319,8 +3702,8 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
             max_capacity=100,
         )
 
-        # Should fail - only FLOAT_VECTOR is supported in struct array
-        error = {ct.err_code: 65535, ct.err_msg: "now only float vector is supported"}
+        # Should fail - sparse vectors are not supported in struct array
+        error = {ct.err_code: 65535, ct.err_msg: "only fixed dimension vector types are supported"}
         self.create_collection(
             client,
             collection_name,
@@ -3328,6 +3711,37 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
             check_task=CheckTasks.err_res,
             check_items=error,
         )
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("nullable_field", ["clip_embedding1", "scalar_field"])
+    def test_struct_array_with_nullable_field(self, nullable_field):
+
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
+        schema.add_field(
+            field_name="normal_vector", datatype=DataType.FLOAT_VECTOR, dim=default_dim
+        )
+
+        struct_schema = client.create_struct_field_schema()
+        struct_schema.add_field("clip_embedding1", DataType.FLOAT_VECTOR, dim=default_dim,
+                                nullable=("clip_embedding1" == nullable_field))
+        struct_schema.add_field("scalar_field", DataType.INT64,
+                                nullable=("scalar_field" == nullable_field))
+        struct_schema.add_field("label", DataType.VARCHAR, max_length=128)
+
+        schema.add_field(
+            "clips",
+            datatype=DataType.ARRAY,
+            element_type=DataType.STRUCT,
+            struct_schema=struct_schema,
+            max_capacity=100,
+        )
+        error = {ct.err_code: 999,
+                 ct.err_msg: f"nullable is not supported for fields in struct array now, fieldName = {nullable_field}"}
+        self.create_collection(client, collection_name, schema=schema,
+                               check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L0)
     def test_struct_array_range_search_not_supported(self):
@@ -3876,7 +4290,6 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
     @pytest.mark.parametrize("entities", [1000])
     @pytest.mark.parametrize("array_capacity", [100])
     @pytest.mark.parametrize("file_type", ["PARQUET", "JSON"])
-    @pytest.mark.xfail(reason="issue: https://github.com/milvus-io/pymilvus/issues/3050")
     def test_import_struct_array_with_local_bulk_writer(self, dim, entities, array_capacity, file_type):
         """
         Test bulk import of struct array data using LocalBulkWriter
@@ -3960,23 +4373,29 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
         # Step 2: Generate insert-format data with all supported types
         log.info(f"Generating {entities} rows of insert-format data")
         insert_data = []
+        empty_array_count = 0
         for i in range(entities):
-            # Generate random number of struct elements (1-5)
-            arr_len = random.randint(1, 5)
-            struct_list = []
-            for j in range(arr_len):
-                struct_obj = {
-                    "struct_varchar": f"varchar_{i}_{j}_{cf.gen_unique_str()}",
-                    "struct_int8": random.randint(-128, 127),
-                    "struct_int16": random.randint(-32768, 32767),
-                    "struct_int32": random.randint(-2147483648, 2147483647),
-                    "struct_int64": random.randint(-9223372036854775808, 9223372036854775807),
-                    "struct_float": random.random() * 100,
-                    "struct_double": random.random() * 1000,
-                    "struct_bool": random.choice([True, False]),
-                    "struct_float_vec": [random.random() for _ in range(dim)]
-                }
-                struct_list.append(struct_obj)
+            # 10% probability to generate empty array
+            if random.random() < 0.1:
+                struct_list = []
+                empty_array_count += 1
+            else:
+                # Generate random number of struct elements (1-5)
+                arr_len = random.randint(1, 5)
+                struct_list = []
+                for j in range(arr_len):
+                    struct_obj = {
+                        "struct_varchar": f"varchar_{i}_{j}_{cf.gen_unique_str()}",
+                        "struct_int8": random.randint(-128, 127),
+                        "struct_int16": random.randint(-32768, 32767),
+                        "struct_int32": random.randint(-2147483648, 2147483647),
+                        "struct_int64": random.randint(-9223372036854775808, 9223372036854775807),
+                        "struct_float": random.random() * 100,
+                        "struct_double": random.random() * 1000,
+                        "struct_bool": random.choice([True, False]),
+                        "struct_float_vec": [random.random() for _ in range(dim)]
+                    }
+                    struct_list.append(struct_obj)
 
             row = {
                 "id": i,
@@ -3984,6 +4403,7 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
                 "struct_array": struct_list
             }
             insert_data.append(row)
+        log.info(f"Generated {empty_array_count} rows with empty struct_array")
 
         # Step 3: Use LocalBulkWriter to convert data to import files
         log.info(f"Using LocalBulkWriter to generate {file_type} files")

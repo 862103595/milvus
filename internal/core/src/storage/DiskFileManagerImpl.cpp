@@ -14,42 +14,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <sys/fcntl.h>
+#include <cxxabi.h>
+#include <string.h>
 #include <algorithm>
-#include <boost/filesystem.hpp>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <future>
+#include <iosfwd>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <type_traits>
+#include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "arrow/api.h"
+#include "arrow/filesystem/filesystem.h"
+#include "boost/filesystem/path.hpp"
 #include "common/Common.h"
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "common/FieldData.h"
 #include "common/FieldDataInterface.h"
-#include "common/File.h"
-#include "common/Slice.h"
+#include "common/TypeTraits.h"
 #include "common/Types.h"
-#include "index/Utils.h"
+#include "common/VectorArray.h"
+#include "common/VectorTrait.h"
+#include "filemanager/FileManager.h"
+#include "fmt/core.h"
+#include "glog/logging.h"
 #include "index/Meta.h"
+#include "index/Utils.h"
+#include "knowhere/sparse_utils.h"
 #include "log/Log.h"
-
+#include "milvus-storage/filesystem/fs.h"
+#include "nlohmann/json.hpp"
+#include "storage/ChunkManager.h"
+#include "storage/DataCodec.h"
 #include "storage/DiskFileManagerImpl.h"
 #include "storage/FileManager.h"
-#include "storage/IndexData.h"
+#include "storage/FileWriter.h"
+#include "storage/LocalChunkManager.h"
 #include "storage/LocalChunkManagerSingleton.h"
+#include "storage/RemoteOutputStream.h"
+#include "storage/ThreadPool.h"
 #include "storage/ThreadPools.h"
 #include "storage/Types.h"
 #include "storage/Util.h"
-#include "storage/FileWriter.h"
-
-#include "storage/RemoteOutputStream.h"
-#include "storage/RemoteInputStream.h"
 
 namespace milvus::storage {
 DiskFileManagerImpl::DiskFileManagerImpl(
@@ -59,6 +75,8 @@ DiskFileManagerImpl::DiskFileManagerImpl(
     rcm_ = fileManagerContext.chunkManagerPtr;
     fs_ = fileManagerContext.fs;
     plugin_context_ = fileManagerContext.plugin_context;
+    loon_ffi_properties_ = fileManagerContext.loon_ffi_properties;
+    stats_base_path_ = fileManagerContext.stats_base_path;
 }
 
 DiskFileManagerImpl::~DiskFileManagerImpl() {
@@ -83,7 +101,7 @@ DiskFileManagerImpl::GetRemoteIndexPath(const std::string& file_name,
 
 std::string
 DiskFileManagerImpl::GetRemoteIndexPathV2(const std::string& file_name) const {
-    std::string remote_prefix = GetRemoteIndexFilePrefixV2();
+    std::string remote_prefix = GetRemoteIndexObjectPrefixV2();
     return remote_prefix + "/" + file_name;
 }
 
@@ -110,6 +128,18 @@ DiskFileManagerImpl::GetRemoteJsonStatsShreddingPrefix() {
     fs::path prefix = GetRemoteJsonStatsLogPrefix();
     fs::path suffix = JSON_STATS_SHREDDING_DATA_PATH;
     return (prefix / suffix).string();
+}
+
+std::string
+DiskFileManagerImpl::GetRemoteJsonStatsMetaPath(const std::string& file_name) {
+    namespace fs = std::filesystem;
+    fs::path prefix = GetRemoteJsonStatsLogPrefix();
+    return (prefix / file_name).string();
+}
+
+std::string
+DiskFileManagerImpl::GetLocalJsonStatsMetaPrefix() {
+    return GetLocalJsonStatsPrefix();
 }
 
 bool
@@ -167,42 +197,6 @@ DiskFileManagerImpl::AddFileInternal(
     return true;
 }  // namespace knowhere
 
-// Opens an input stream with fs_
-// note that `fs_` must not be nullptr.
-std::shared_ptr<InputStream>
-DiskFileManagerImpl::OpenInputStream(const std::string& filename) {
-    auto local_file_name = GetFileName(filename);
-    auto remote_file_path = GetRemoteIndexPathV2(local_file_name);
-
-    auto fs = fs_;
-    AssertInfo(fs, "fs is nullptr");
-
-    auto remote_file = fs->OpenInputFile(remote_file_path);
-    AssertInfo(remote_file.ok(), "failed to open remote file");
-    return std::static_pointer_cast<milvus::InputStream>(
-        std::make_shared<milvus::storage::RemoteInputStream>(
-            std::move(remote_file.ValueOrDie())));
-}
-
-// Opens an output stream with fs_
-// note that `fs_` must not be nullptr.
-std::shared_ptr<OutputStream>
-DiskFileManagerImpl::OpenOutputStream(const std::string& filename) {
-    auto local_file_name = GetFileName(filename);
-    auto remote_file_path = GetRemoteIndexPathV2(local_file_name);
-
-    auto fs = fs_;
-    AssertInfo(fs, "fs is nullptr");
-
-    auto remote_stream = fs->OpenOutputStream(remote_file_path);
-    AssertInfo(remote_stream.ok(),
-               "failed to open remote stream, reason: {}",
-               remote_stream.status().ToString());
-
-    return std::make_shared<milvus::storage::RemoteOutputStream>(
-        std::move(remote_stream.ValueOrDie()));
-}
-
 bool
 DiskFileManagerImpl::AddFile(const std::string& file) noexcept {
     return AddFileInternal(file,
@@ -226,6 +220,38 @@ DiskFileManagerImpl::AddJsonSharedIndexLog(const std::string& file) noexcept {
         file, [this](const std::string& file_name, int slice_num) {
             return GetRemoteJsonStatsSharedIndexPath(file_name, slice_num);
         });
+}
+
+bool
+DiskFileManagerImpl::AddJsonStatsMetaLog(const std::string& file) noexcept {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    FILEMANAGER_TRY
+    if (!local_chunk_manager->Exist(file)) {
+        LOG_ERROR("local meta file {} not exists", file);
+        return false;
+    }
+
+    local_paths_.emplace_back(file);
+    auto fileName = GetFileName(file);
+    auto fileSize = local_chunk_manager->Size(file);
+    added_total_file_size_ += fileSize;
+
+    // Meta file is small, upload directly without slicing
+    auto remote_path = GetRemoteJsonStatsMetaPath(fileName);
+    auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[fileSize]);
+    local_chunk_manager->Read(file, buf.get(), fileSize);
+    rcm_->Write(remote_path, buf.get(), fileSize);
+
+    remote_paths_to_size_[remote_path] = fileSize;
+    LOG_INFO("upload json stats meta file: {} to remote: {}, size: {}",
+             file,
+             remote_path,
+             fileSize);
+
+    FILEMANAGER_CATCH
+    FILEMANAGER_END
+    return true;
 }
 
 bool
@@ -307,7 +333,7 @@ DiskFileManagerImpl::CacheIndexToDiskInternal(
         } catch (const std::logic_error& e) {
             auto err_message = fmt::format(
                 "invalided index file path:{}, error:{}", file_path, e.what());
-            LOG_ERROR(err_message);
+            LOG_ERROR("{}", err_message);
             throw std::logic_error(err_message);
         }
     }
@@ -315,6 +341,11 @@ DiskFileManagerImpl::CacheIndexToDiskInternal(
     for (auto& slices : index_slices) {
         std::sort(slices.second.begin(), slices.second.end());
     }
+
+    // TODO: remove this log when #45590 is solved
+    LOG_INFO("CacheIndexToDisk: caching {} files to {}",
+             index_slices.size(),
+             local_index_prefix);
 
     for (auto& slices : index_slices) {
         auto prefix = slices.first;
@@ -338,11 +369,12 @@ DiskFileManagerImpl::CacheIndexToDiskInternal(
                     GetObjectData(rcm_.get(),
                                   batch_remote_files,
                                   milvus::PriorityForLoad(priority));
-                for (auto& chunk_future : index_chunks_futures) {
-                    auto chunk_codec = chunk_future.get();
-                    file_writer.Write(chunk_codec->PayloadData(),
-                                      chunk_codec->PayloadSize());
-                }
+                storage::ProcessFuturesInOrder(
+                    index_chunks_futures,
+                    [&](std::unique_ptr<DataCodec> chunk_codec) {
+                        file_writer.Write(chunk_codec->PayloadData(),
+                                          chunk_codec->PayloadSize());
+                    });
                 batch_remote_files.clear();
             };
 
@@ -361,6 +393,8 @@ DiskFileManagerImpl::CacheIndexToDiskInternal(
         }
 
         local_paths_.emplace_back(local_index_file_name);
+        // TODO: remove this log when #45590 is solved
+        LOG_INFO("CacheIndexToDisk: cached file {}", local_index_file_name);
     }
 }
 
@@ -396,13 +430,44 @@ DiskFileManagerImpl::CacheJsonStatsSharedIndexToDisk(
         remote_files, GetLocalJsonStatsSharedIndexPrefix(), priority);
 }
 
+std::string
+DiskFileManagerImpl::CacheJsonStatsMetaToDisk(
+    const std::string& remote_file,
+    milvus::proto::common::LoadPriority priority) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto local_prefix = GetLocalJsonStatsMetaPrefix();
+
+    auto file_name = remote_file.substr(remote_file.find_last_of('/') + 1);
+    auto local_file =
+        (std::filesystem::path(local_prefix) / file_name).string();
+
+    auto parent_path = std::filesystem::path(local_file).parent_path();
+    if (!local_chunk_manager->Exist(parent_path.string())) {
+        local_chunk_manager->CreateDir(parent_path.string());
+    }
+
+    // remote_file is an absolute remote path (basePath already prepended by caller)
+    auto file_size = rcm_->Size(remote_file);
+    auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[file_size]);
+    rcm_->Read(remote_file, buf.get(), file_size);
+    local_chunk_manager->Write(local_file, buf.get(), file_size);
+
+    LOG_INFO("Cached json stats meta file from {} to {}, size: {}",
+             remote_file,
+             local_file,
+             file_size);
+
+    return local_file;
+}
+
 template <typename DataType>
 std::string
 DiskFileManagerImpl::CacheRawDataToDisk(const Config& config) {
     auto storage_version =
         index::GetValueFromConfig<int64_t>(config, STORAGE_VERSION_KEY)
             .value_or(0);
-    if (storage_version == STORAGE_V2) {
+    if (storage_version == STORAGE_V2 || storage_version == STORAGE_V3) {
         return cache_raw_data_to_disk_storage_v2<DataType>(config);
     }
     return cache_raw_data_to_disk_internal<DataType>(config);
@@ -418,9 +483,6 @@ DiskFileManagerImpl::cache_raw_data_to_disk_internal(const Config& config) {
     auto remote_files = insert_files.value();
     SortByPath(remote_files);
 
-    auto segment_id = GetFieldDataMeta().segment_id;
-    auto field_id = GetFieldDataMeta().field_id;
-
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
     std::string local_data_path;
@@ -435,6 +497,12 @@ DiskFileManagerImpl::cache_raw_data_to_disk_internal(const Config& config) {
         offsets.push_back(0);  // Initialize with 0 for cumulative offsets
     }
 
+    auto valid_data_path = index::GetValueFromConfig<std::string>(
+        config, index::VALID_DATA_PATH_KEY);
+    std::vector<uint8_t> valid_bitmap;
+    uint64_t total_num_rows = 0;
+    bool nullable = false;
+
     // get batch raw data from s3 and write batch data to disk file
     // TODO: load and write of different batches at the same time
     std::vector<std::string> batch_files;
@@ -447,19 +515,38 @@ DiskFileManagerImpl::cache_raw_data_to_disk_internal(const Config& config) {
 
     auto FetchRawData = [&]() {
         auto field_datas = GetObjectData(rcm_.get(), batch_files);
-        int batch_size = batch_files.size();
-        for (int i = 0; i < batch_size; i++) {
-            auto field_data = field_datas[i].get()->GetFieldData();
-            num_rows += uint32_t(field_data->get_num_rows());
-            cache_raw_data_to_disk_common<DataType>(
-                field_data,
-                local_chunk_manager,
-                local_data_path,
-                file_created,
-                dim,
-                write_offset,
-                is_vector_array ? &offsets : nullptr);
-        }
+        storage::ProcessFuturesInOrder(
+            field_datas, [&](std::unique_ptr<DataCodec> codec) {
+                auto field_data = codec->GetFieldData();
+                num_rows += uint32_t(field_data->get_valid_rows());
+
+                if (valid_data_path.has_value() && field_data->IsNullable()) {
+                    nullable = true;
+                    auto rows = field_data->get_num_rows();
+                    if (rows > 0) {
+                        auto new_size = (total_num_rows + rows + 7) / 8;
+                        if (new_size >
+                            static_cast<int64_t>(valid_bitmap.size())) {
+                            valid_bitmap.resize(new_size, 0);
+                        }
+                        for (int64_t i = 0; i < rows; ++i) {
+                            if (field_data->is_valid(i)) {
+                                set_bit(valid_bitmap, total_num_rows + i);
+                            }
+                        }
+                        total_num_rows += rows;
+                    }
+                }
+
+                cache_raw_data_to_disk_common<DataType>(
+                    field_data,
+                    local_chunk_manager,
+                    local_data_path,
+                    file_created,
+                    dim,
+                    write_offset,
+                    is_vector_array ? &offsets : nullptr);
+            });
     };
 
     auto parallel_degree =
@@ -511,6 +598,13 @@ DiskFileManagerImpl::cache_raw_data_to_disk_internal(const Config& config) {
                                    offsets.size() * sizeof(size_t));
     }
 
+    if (nullable && valid_data_path.has_value() && total_num_rows > 0) {
+        write_valid_data_file(local_chunk_manager,
+                              valid_data_path.value(),
+                              valid_bitmap,
+                              total_num_rows);
+    }
+
     return local_data_path;
 }
 
@@ -548,7 +642,7 @@ DiskFileManagerImpl::cache_raw_data_to_disk_common(
         auto sparse_rows =
             static_cast<const knowhere::sparse::SparseRow<SparseValueType>*>(
                 field_data->Data());
-        for (size_t i = 0; i < field_data->Length(); ++i) {
+        for (size_t i = 0; i < field_data->get_valid_rows(); ++i) {
             auto row = sparse_rows[i];
             auto row_byte_size = row.data_byte_size();
             uint32_t nnz = row.size();
@@ -603,13 +697,32 @@ DiskFileManagerImpl::cache_raw_data_to_disk_common(
     } else {
         dim = field_data->get_dim();
         auto data_size =
-            field_data->get_num_rows() * milvus::GetVecRowSize<DataType>(dim);
+            field_data->get_valid_rows() * milvus::GetVecRowSize<DataType>(dim);
         local_chunk_manager->Write(local_data_path,
                                    write_offset,
                                    const_cast<void*>(field_data->Data()),
                                    data_size);
         write_offset += data_size;
     }
+}
+
+void
+DiskFileManagerImpl::write_valid_data_file(
+    const std::shared_ptr<LocalChunkManager>& local_chunk_manager,
+    const std::string& valid_data_path,
+    std::vector<uint8_t>& valid_bitmap,
+    uint64_t total_num_rows) {
+    local_chunk_manager->CreateFile(valid_data_path);
+    int64_t valid_write_pos = 0;
+
+    local_chunk_manager->Write(
+        valid_data_path, valid_write_pos, &total_num_rows, sizeof(uint64_t));
+    valid_write_pos += sizeof(uint64_t);
+
+    local_chunk_manager->Write(valid_data_path,
+                               valid_write_pos,
+                               valid_bitmap.data(),
+                               valid_bitmap.size());
 }
 
 template <typename T>
@@ -646,20 +759,68 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
         offsets.push_back(0);  // Initialize with 0 for cumulative offsets
     }
 
+    // Check if we need to track validity data for nullable vector fields
+    auto valid_data_path = index::GetValueFromConfig<std::string>(
+        config, index::VALID_DATA_PATH_KEY);
+
     // file format
     // num_rows(uint32) | dim(uint32) | index_data ([]uint8_t)
     uint32_t num_rows = 0;
     uint32_t var_dim = 0;
     int64_t write_offset = sizeof(num_rows) + sizeof(var_dim);
 
-    auto field_datas = GetFieldDatasFromStorageV2(all_remote_files,
-                                                  GetFieldDataMeta().field_id,
-                                                  data_type.value(),
-                                                  element_type.value(),
-                                                  dim,
-                                                  fs_);
+    std::vector<FieldDataPtr> field_datas;
+    auto manifest =
+        index::GetValueFromConfig<std::string>(config, SEGMENT_MANIFEST_KEY);
+    auto manifest_path_str = manifest.value_or("");
+    if (manifest_path_str != "") {
+        AssertInfo(
+            loon_ffi_properties_ != nullptr,
+            "loon ffi properties is null when build index with manifest");
+        field_datas = GetFieldDatasFromManifest(manifest_path_str,
+                                                loon_ffi_properties_,
+                                                field_meta_,
+                                                data_type,
+                                                dim,
+                                                element_type);
+    } else {
+        field_datas = GetFieldDatasFromStorageV2(all_remote_files,
+                                                 GetFieldDataMeta().field_id,
+                                                 data_type.value(),
+                                                 element_type.value(),
+                                                 dim,
+                                                 fs_);
+    }
+
+    bool nullable = false;
+    uint64_t total_num_rows = 0;
+    if (valid_data_path.has_value()) {
+        for (auto& field_data : field_datas) {
+            if (field_data->IsNullable()) {
+                nullable = true;
+            }
+            total_num_rows += field_data->get_num_rows();
+        }
+    }
+
+    std::vector<uint8_t> valid_bitmap;
+    if (nullable) {
+        valid_bitmap.resize((total_num_rows + 7) / 8, 0);
+    }
+
+    int64_t chunk_offset = 0;
     for (auto& field_data : field_datas) {
-        num_rows += uint32_t(field_data->get_num_rows());
+        num_rows += uint32_t(field_data->get_valid_rows());
+        if (nullable) {
+            auto rows = field_data->get_num_rows();
+            for (int64_t i = 0; i < rows; ++i) {
+                if (field_data->is_valid(i)) {
+                    set_bit(valid_bitmap, chunk_offset + i);
+                }
+            }
+            chunk_offset += rows;
+        }
+
         cache_raw_data_to_disk_common<T>(field_data,
                                          local_chunk_manager,
                                          local_data_path,
@@ -704,6 +865,13 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
                                    offsets.size() * sizeof(size_t));
     }
 
+    if (nullable && valid_data_path.has_value() && total_num_rows > 0) {
+        write_valid_data_file(local_chunk_manager,
+                              valid_data_path.value(),
+                              valid_bitmap,
+                              total_num_rows);
+    }
+
     return local_data_path;
 }
 
@@ -719,6 +887,13 @@ DiskFileManagerImpl::RemoveTextLogFiles() {
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
     local_chunk_manager->RemoveDir(GetLocalTextIndexPrefix());
+}
+
+void
+DiskFileManagerImpl::RemoveJsonStatsSharedIndexFiles() {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    local_chunk_manager->RemoveDir(GetLocalJsonStatsSharedIndexPrefix());
 }
 
 void
@@ -864,7 +1039,7 @@ DiskFileManagerImpl::CacheOptFieldToDisk(const Config& config) {
     }
 
     std::vector<std::vector<std::string>> remote_files_storage_v2;
-    if (storage_version == STORAGE_V2) {
+    if (storage_version == STORAGE_V2 || storage_version == STORAGE_V3) {
         auto segment_insert_files =
             index::GetValueFromConfig<std::vector<std::vector<std::string>>>(
                 config, SEGMENT_INSERT_FILES_KEY);
@@ -906,7 +1081,7 @@ DiskFileManagerImpl::CacheOptFieldToDisk(const Config& config) {
 
         std::vector<FieldDataPtr> field_datas;
         // fetch scalar data from storage v2
-        if (storage_version == STORAGE_V2) {
+        if (storage_version == STORAGE_V2 || storage_version == STORAGE_V3) {
             field_datas = GetFieldDatasFromStorageV2(remote_files_storage_v2,
                                                      field_id,
                                                      field_type,
@@ -1094,6 +1269,9 @@ DiskFileManagerImpl::GetLocalTempNgramIndexPrefix() {
 
 std::string
 DiskFileManagerImpl::GetRemoteJsonStatsLogPrefix() {
+    if (!stats_base_path_.empty()) {
+        return stats_base_path_;
+    }
     return GenRemoteJsonStatsPathPrefix(rcm_,
                                         index_meta_.build_id,
                                         index_meta_.index_version,
@@ -1143,10 +1321,5 @@ template std::string
 DiskFileManagerImpl::CacheRawDataToDisk<sparse_u32_f32>(const Config& config);
 template std::string
 DiskFileManagerImpl::CacheRawDataToDisk<int8_t>(const Config& config);
-
-std::string
-DiskFileManagerImpl::GetRemoteIndexFilePrefixV2() const {
-    return FileManagerImpl::GetRemoteIndexFilePrefixV2();
-}
 
 }  // namespace milvus::storage

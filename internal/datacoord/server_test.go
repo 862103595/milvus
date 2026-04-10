@@ -21,11 +21,9 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"os/signal"
 	"path"
 	"strconv"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -724,57 +722,54 @@ func TestGetSegmentsByStates(t *testing.T) {
 }
 
 func TestService_WatchServices(t *testing.T) {
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT)
-	defer signal.Reset(syscall.SIGINT)
 	factory := dependency.NewDefaultFactory(true)
-	svr := CreateServer(context.TODO(), factory)
-	svr.session = &sessionutil.Session{
-		SessionRaw: sessionutil.SessionRaw{TriggerKill: true},
-	}
+	svrCtx, svrCancel := context.WithCancel(context.Background())
+	svr := CreateServer(svrCtx, factory)
+	svr.session = &sessionutil.Session{}
 	svr.serverLoopWg.Add(1)
 
 	ech := make(chan *sessionutil.SessionEvent)
-	svr.dnEventCh = ech
+	mockDnWatcher := sessionutil.NewMockSessionWatcher(t)
+	mockDnWatcher.EXPECT().EventChannel().Return(ech)
+	svr.dnSessionWatcher = mockDnWatcher
+	mockQnWatcher := sessionutil.NewMockSessionWatcher(t)
+	mockQnWatcher.EXPECT().EventChannel().Return(nil)
+	svr.qnSessionWatcher = mockQnWatcher
 
 	flag := false
-	closed := false
-	sigDone := make(chan struct{}, 1)
-	sigQuit := make(chan struct{}, 1)
+	done := make(chan struct{}, 1)
 
 	go func() {
 		svr.watchService(context.Background())
 		flag = true
-		sigDone <- struct{}{}
-	}()
-	go func() {
-		<-sc
-		closed = true
-		sigQuit <- struct{}{}
+		done <- struct{}{}
 	}()
 
+	// Cancel svr.ctx before closing the channel so stopServiceWatch sees ctx.Err() != nil
+	// and skips os.Exit (simulating normal shutdown).
+	svrCancel()
 	close(ech)
-	<-sigDone
-	<-sigQuit
+	<-done
 	assert.True(t, flag)
-	assert.True(t, closed)
 
 	ech = make(chan *sessionutil.SessionEvent)
 
 	flag = false
-	svr.dnEventCh = ech
+	mockDnWatcher = sessionutil.NewMockSessionWatcher(t)
+	mockDnWatcher.EXPECT().EventChannel().Return(ech)
+	svr.dnSessionWatcher = mockDnWatcher
 	ctx, cancel := context.WithCancel(context.Background())
 	svr.serverLoopWg.Add(1)
 
 	go func() {
 		svr.watchService(ctx)
 		flag = true
-		sigDone <- struct{}{}
+		done <- struct{}{}
 	}()
 
 	ech <- nil
 	cancel()
-	<-sigDone
+	<-done
 	assert.True(t, flag)
 }
 
@@ -1645,7 +1640,7 @@ func TestGetCompactionState(t *testing.T) {
 				{State: datapb.CompactionTaskState_timeout},
 				{State: datapb.CompactionTaskState_timeout},
 			})
-		mockHandler := newCompactionInspector(mockMeta, nil, nil, nil, newMockVersionManager())
+		mockHandler := newCompactionInspector(mockMeta, nil, nil, nil, nil, newMockVersionManager())
 		svr.compactionInspector = mockHandler
 		resp, err := svr.GetCompactionState(context.Background(), &milvuspb.GetCompactionStateRequest{CompactionID: 1})
 		assert.NoError(t, err)
@@ -1673,6 +1668,11 @@ func TestManualCompaction(t *testing.T) {
 	t.Run("test manual compaction successfully", func(t *testing.T) {
 		svr := &Server{allocator: allocator.NewMockAllocator(t)}
 		svr.stateCode.Store(commonpb.StateCode_Healthy)
+		svr.meta = &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()}
+		svr.meta.collections.Insert(1, &collectionInfo{
+			ID:     1,
+			Schema: &schemapb.CollectionSchema{},
+		})
 		mockTrigger := NewMockTrigger(t)
 		svr.compactionTrigger = mockTrigger
 		mockTrigger.EXPECT().TriggerCompaction(mock.Anything, mock.Anything).Return(1, nil)
@@ -1691,9 +1691,14 @@ func TestManualCompaction(t *testing.T) {
 	t.Run("test manual l0 compaction successfully", func(t *testing.T) {
 		svr := &Server{allocator: allocator.NewMockAllocator(t)}
 		svr.stateCode.Store(commonpb.StateCode_Healthy)
+		svr.meta = &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()}
+		svr.meta.collections.Insert(1, &collectionInfo{
+			ID:     1,
+			Schema: &schemapb.CollectionSchema{},
+		})
 		mockTriggerManager := NewMockTriggerManager(t)
 		svr.compactionTriggerManager = mockTriggerManager
-		mockTriggerManager.EXPECT().ManualTrigger(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(1, nil)
+		mockTriggerManager.EXPECT().ManualTrigger(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(1, nil)
 
 		mockHandler := NewMockCompactionInspector(t)
 		mockHandler.EXPECT().getCompactionTasksNumBySignalID(mock.Anything).Return(1)
@@ -1710,6 +1715,11 @@ func TestManualCompaction(t *testing.T) {
 	t.Run("test manual compaction failure", func(t *testing.T) {
 		svr := &Server{allocator: allocator.NewMockAllocator(t)}
 		svr.stateCode.Store(commonpb.StateCode_Healthy)
+		svr.meta = &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()}
+		svr.meta.collections.Insert(1, &collectionInfo{
+			ID:     1,
+			Schema: &schemapb.CollectionSchema{},
+		})
 		mockTrigger := NewMockTrigger(t)
 		svr.compactionTrigger = mockTrigger
 		mockTrigger.EXPECT().TriggerCompaction(mock.Anything, mock.Anything).Return(0, errors.New("mock error"))
@@ -1922,199 +1932,6 @@ func TestPostFlush(t *testing.T) {
 		err = svr.postFlush(context.Background(), 1)
 		assert.NoError(t, err)
 	})
-}
-
-func TestGetFlushAllState(t *testing.T) {
-	tests := []struct {
-		testName                 string
-		ChannelCPs               []Timestamp
-		FlushAllTs               Timestamp
-		ServerIsHealthy          bool
-		ListDatabaseFailed       bool
-		ShowCollectionFailed     bool
-		DescribeCollectionFailed bool
-		ExpectedSuccess          bool
-		ExpectedFlushed          bool
-	}{
-		{
-			"test FlushAll flushed",
-			[]Timestamp{100, 200},
-			99,
-			true, false, false, false, true, true,
-		},
-		{
-			"test FlushAll not flushed",
-			[]Timestamp{100, 200},
-			150,
-			true, false, false, false, true, false,
-		},
-		{
-			"test Sever is not healthy", nil, 0,
-			false, false, false, false, false, false,
-		},
-		{
-			"test ListDatabase failed", nil, 0,
-			true, true, false, false, false, false,
-		},
-		{
-			"test ShowCollections failed", nil, 0,
-			true, false, true, false, false, false,
-		},
-		{
-			"test DescribeCollection failed", nil, 0,
-			true, false, false, true, false, false,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.testName, func(t *testing.T) {
-			collection := UniqueID(0)
-			vchannels := []string{"mock-vchannel-0", "mock-vchannel-1"}
-
-			svr := &Server{}
-			if test.ServerIsHealthy {
-				svr.stateCode.Store(commonpb.StateCode_Healthy)
-			}
-			var err error
-			svr.meta = &meta{}
-			svr.mixCoord = mocks.NewMixCoord(t)
-			svr.broker = broker.NewCoordinatorBroker(svr.mixCoord)
-			if test.ListDatabaseFailed {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, atr *milvuspb.ListDatabasesRequest) (*milvuspb.ListDatabasesResponse, error) {
-					return &milvuspb.ListDatabasesResponse{
-						Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError},
-					}, nil
-				}).Once()
-			} else {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).
-					Return(&milvuspb.ListDatabasesResponse{
-						DbNames: []string{"db1"},
-						Status:  merr.Success(),
-					}, nil).Maybe()
-			}
-
-			if test.ShowCollectionFailed {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().ShowCollections(mock.Anything, mock.Anything).
-					Return(&milvuspb.ShowCollectionsResponse{
-						Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError},
-					}, nil).Maybe()
-			} else {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().ShowCollections(mock.Anything, mock.Anything).
-					Return(&milvuspb.ShowCollectionsResponse{
-						Status:        merr.Success(),
-						CollectionIds: []int64{collection},
-					}, nil).Maybe()
-			}
-
-			if test.DescribeCollectionFailed {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
-					Return(&milvuspb.DescribeCollectionResponse{
-						Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError},
-					}, nil).Maybe()
-			} else {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
-					Return(&milvuspb.DescribeCollectionResponse{
-						Status:              merr.Success(),
-						VirtualChannelNames: vchannels,
-					}, nil).Maybe()
-			}
-
-			svr.meta.channelCPs = newChannelCps()
-			for i, ts := range test.ChannelCPs {
-				channel := vchannels[i]
-				svr.meta.channelCPs.checkpoints[channel] = &msgpb.MsgPosition{
-					ChannelName: channel,
-					Timestamp:   ts,
-				}
-			}
-
-			resp, err := svr.GetFlushAllState(context.TODO(), &milvuspb.GetFlushAllStateRequest{FlushAllTs: test.FlushAllTs})
-			assert.NoError(t, err)
-			if test.ExpectedSuccess {
-				assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
-			} else if test.ServerIsHealthy {
-				assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetStatus().GetErrorCode())
-			} else {
-				assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
-			}
-			assert.Equal(t, test.ExpectedFlushed, resp.GetFlushed())
-		})
-	}
-}
-
-func TestGetFlushAllStateWithDB(t *testing.T) {
-	tests := []struct {
-		testName        string
-		FlushAllTs      Timestamp
-		DbExist         bool
-		ExpectedSuccess bool
-		ExpectedFlushed bool
-	}{
-		{"test FlushAllWithDB, db exist", 99, true, true, true},
-		{"test FlushAllWithDB, db not exist", 99, false, false, false},
-	}
-	for _, test := range tests {
-		t.Run(test.testName, func(t *testing.T) {
-			collectionID := UniqueID(0)
-			dbName := "db"
-			collectionName := "collection"
-			vchannels := []string{"mock-vchannel-0", "mock-vchannel-1"}
-
-			svr := &Server{}
-			svr.stateCode.Store(commonpb.StateCode_Healthy)
-			var err error
-			svr.meta = &meta{}
-			svr.mixCoord = mocks.NewMixCoord(t)
-			svr.broker = broker.NewCoordinatorBroker(svr.mixCoord)
-
-			if test.DbExist {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).
-					Return(&milvuspb.ListDatabasesResponse{
-						DbNames: []string{dbName},
-						Status:  merr.Success(),
-					}, nil).Maybe()
-			} else {
-				svr.mixCoord.(*mocks.MixCoord).EXPECT().ListDatabases(mock.Anything, mock.Anything).
-					Return(&milvuspb.ListDatabasesResponse{
-						DbNames: []string{},
-						Status:  merr.Success(),
-					}, nil).Maybe()
-			}
-
-			svr.mixCoord.(*mocks.MixCoord).EXPECT().ShowCollections(mock.Anything, mock.Anything).
-				Return(&milvuspb.ShowCollectionsResponse{
-					Status:        merr.Success(),
-					CollectionIds: []int64{collectionID},
-				}, nil).Maybe()
-
-			svr.mixCoord.(*mocks.MixCoord).EXPECT().DescribeCollectionInternal(mock.Anything, mock.Anything).
-				Return(&milvuspb.DescribeCollectionResponse{
-					Status:              merr.Success(),
-					VirtualChannelNames: vchannels,
-					CollectionID:        collectionID,
-					CollectionName:      collectionName,
-				}, nil).Maybe()
-
-			svr.meta.channelCPs = newChannelCps()
-			channelCPs := []Timestamp{100, 200}
-			for i, ts := range channelCPs {
-				channel := vchannels[i]
-				svr.meta.channelCPs.checkpoints[channel] = &msgpb.MsgPosition{
-					ChannelName: channel,
-					Timestamp:   ts,
-				}
-			}
-
-			var resp *milvuspb.GetFlushAllStateResponse
-			resp, err = svr.GetFlushAllState(context.TODO(), &milvuspb.GetFlushAllStateRequest{FlushAllTs: test.FlushAllTs, DbName: dbName})
-			assert.NoError(t, err)
-			if test.ExpectedSuccess {
-				assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
-			} else {
-				assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetStatus().GetErrorCode())
-			}
-			assert.Equal(t, test.ExpectedFlushed, resp.GetFlushed())
-		})
-	}
 }
 
 func TestDataCoordServer_SetSegmentState(t *testing.T) {
@@ -2764,22 +2581,8 @@ func TestServer_InitMessageCallback(t *testing.T) {
 	}
 	server.stateCode.Store(commonpb.StateCode_Abnormal)
 
-	// Test initMessageCallback
-	server.initMessageCallback()
-
-	// Test Import message check callback
-	resourceKey := message.NewImportJobIDResourceKey(1)
-	msg, err := message.NewImportMessageBuilderV1().
-		WithHeader(&message.ImportMessageHeader{}).
-		WithBody(&msgpb.ImportMsg{
-			Base: &commonpb.MsgBase{
-				MsgType: commonpb.MsgType_Import,
-			},
-		}).
-		WithBroadcast([]string{"ch-0"}, resourceKey).
-		BuildBroadcast()
-	err = registry.CallMessageCheckCallback(ctx, msg)
-	assert.NoError(t, err)
+	registry.ResetRegistration()
+	RegisterDDLCallbacks(server)
 
 	// Test Import message ack callback
 	importMsg := message.NewImportMessageBuilderV1().
@@ -2788,10 +2591,11 @@ func TestServer_InitMessageCallback(t *testing.T) {
 			Base: &commonpb.MsgBase{
 				MsgType: commonpb.MsgType_Import,
 			},
+			Schema: &schemapb.CollectionSchema{},
 		}).
-		WithBroadcast([]string{"test_channel"}, resourceKey).
+		WithBroadcast([]string{"test_channel"}).
 		MustBuildBroadcast()
-	err = registry.CallMessageAckCallback(ctx, importMsg, map[string]*message.AppendResult{
+	err := registry.CallMessageAckCallback(ctx, importMsg, map[string]*message.AppendResult{
 		"test_channel": {
 			MessageID:              walimplstest.NewTestMessageID(1),
 			LastConfirmedMessageID: walimplstest.NewTestMessageID(1),

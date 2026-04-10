@@ -1,12 +1,16 @@
+#include <arrow/type.h>
 #include <gtest/gtest.h>
-#include "index/json_stats/parquet_writer.h"
-#include <arrow/io/memory.h>
-#include <arrow/io/file.h>
-#include <parquet/arrow/writer.h>
+#include <map>
 #include <memory>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
-#include <map>
+
+#include "common/protobuf_utils.h"
+#include "gtest/gtest.h"
+#include "index/json_stats/parquet_writer.h"
+#include "index/json_stats/utils.h"
 
 namespace milvus::index {
 class ParquetWriterFactoryTest : public ::testing::Test {
@@ -58,7 +62,7 @@ TEST_F(ParquetWriterFactoryTest, CreateContextBasicTest) {
     EXPECT_EQ(context.builders_map.size(), column_map_.size());
 
     // Verify metadata
-    EXPECT_FALSE(context.kv_metadata.empty());
+    EXPECT_TRUE(context.kv_metadata.empty());
 
     // Verify column groups
     EXPECT_FALSE(context.column_groups.empty());

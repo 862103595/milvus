@@ -36,11 +36,13 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/agg"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
 	"github.com/milvus-io/milvus/internal/proxy/privilege"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
+	"github.com/milvus-io/milvus/internal/util/function/models"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/internal/util/segcore"
@@ -59,6 +61,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metric"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -175,7 +178,7 @@ func validateRunAnalyzer(req *milvuspb.RunAnalyzerRequest) error {
 	return nil
 }
 
-func validateMaxQueryResultWindow(offset int64, limit int64) error {
+func validateMaxQueryResultWindow(offset int64, limit int64, largeTopKEnabled bool) error {
 	if offset < 0 {
 		return fmt.Errorf("%s [%d] is invalid, should be gte than 0", OffsetKey, offset)
 	}
@@ -185,14 +188,20 @@ func validateMaxQueryResultWindow(offset int64, limit int64) error {
 
 	depth := offset + limit
 	maxQueryResultWindow := Params.QuotaConfig.MaxQueryResultWindow.GetAsInt64()
+	if largeTopKEnabled {
+		maxQueryResultWindow = Params.QuotaConfig.LargeMaxQueryResultWindow.GetAsInt64()
+	}
 	if depth <= 0 || depth > maxQueryResultWindow {
 		return fmt.Errorf("(offset+limit) should be in range [1, %d], but got %d", maxQueryResultWindow, depth)
 	}
 	return nil
 }
 
-func validateLimit(limit int64) error {
+func validateLimit(limit int64, largeTopKEnabled bool) error {
 	topKLimit := Params.QuotaConfig.TopKLimit.GetAsInt64()
+	if largeTopKEnabled {
+		topKLimit = Params.QuotaConfig.LargeTopKLimit.GetAsInt64()
+	}
 	if limit <= 0 || limit > topKLimit {
 		return fmt.Errorf("it should be in range [1, %d], but got %d", topKLimit, limit)
 	}
@@ -627,6 +636,14 @@ func ValidateField(field *schemapb.FieldSchema, schema *schemapb.CollectionSchem
 	if err = ValidateAutoIndexMmapConfig(isVectorType, indexParams); err != nil {
 		return err
 	}
+
+	// Validate warmup policy if specified in field TypeParams
+	if warmupPolicy, exist := common.GetWarmupPolicy(field.GetTypeParams()...); exist {
+		if err = common.ValidateWarmupPolicy(warmupPolicy); err != nil {
+			return merr.WrapErrParameterInvalidMsg("invalid warmup policy for field %s: %s", field.Name, err.Error())
+		}
+	}
+
 	return nil
 }
 
@@ -651,14 +668,11 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 			return err
 		}
 	} else {
-		// TODO(SpadeA): only support float vector now
-		if field.GetElementType() != schemapb.DataType_FloatVector {
-			return fmt.Errorf("Unsupported element type of array field %s, now only float vector is supported", field.Name)
+		// ArrayOfVector: support FloatVector, Float16Vector, BFloat16Vector, Int8Vector, BinaryVector
+		if !typeutil.IsFixDimVectorType(field.GetElementType()) {
+			return fmt.Errorf("Unsupported element type %s of ArrayOfVector field %s, only fixed dimension vector types are supported", field.GetElementType().String(), field.Name)
 		}
 
-		// if !typeutil.IsVectorType(field.GetElementType()) {
-		// 	return fmt.Errorf("Inconsistent schema: element type of array field %s is not a vector type", field.Name)
-		// }
 		err = validateDimension(field)
 		if err != nil {
 			return err
@@ -678,12 +692,27 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 	if field.GetNullable() {
 		return fmt.Errorf("nullable is not supported for fields in struct array now, fieldName = %s", field.Name)
 	}
+
+	// Validate warmup policy if specified in field TypeParams
+	if warmupPolicy, exist := common.GetWarmupPolicy(field.GetTypeParams()...); exist {
+		if err = common.ValidateWarmupPolicy(warmupPolicy); err != nil {
+			return merr.WrapErrParameterInvalidMsg("invalid warmup policy for field %s: %s", field.Name, err.Error())
+		}
+	}
+
 	return nil
 }
 
 func ValidateStructArrayField(structArrayField *schemapb.StructArrayFieldSchema, schema *schemapb.CollectionSchema) error {
 	if len(structArrayField.Fields) == 0 {
 		return fmt.Errorf("struct array field %s has no sub-fields", structArrayField.Name)
+	}
+
+	// Validate warmup policy if specified in struct field TypeParams
+	if warmupPolicy, exist := common.GetWarmupPolicy(structArrayField.GetTypeParams()...); exist {
+		if err := common.ValidateWarmupPolicy(warmupPolicy); err != nil {
+			return merr.WrapErrParameterInvalidMsg("invalid warmup policy for struct field %s: %s", structArrayField.Name, err.Error())
+		}
 	}
 
 	for _, subField := range structArrayField.Fields {
@@ -719,7 +748,10 @@ func validatePrimaryKey(coll *schemapb.CollectionSchema) error {
 		}
 	}
 	if idx == -1 {
-		return errors.New("primary key is not specified")
+		// External collections may not have a primary key
+		if !typeutil.IsExternalCollection(coll) {
+			return errors.New("primary key is not specified")
+		}
 	}
 
 	for _, structArrayField := range coll.StructArrayFields {
@@ -729,6 +761,34 @@ func validatePrimaryKey(coll *schemapb.CollectionSchema) error {
 			}
 		}
 	}
+
+	return nil
+}
+
+// injectVirtualPKForExternalCollection adds a virtual PK field for external collections
+// if no primary key field exists. External collections use virtual PKs in the format:
+// (segmentID << 32) | offset
+func injectVirtualPKForExternalCollection(schema *schemapb.CollectionSchema) error {
+	// Check if a primary key already exists
+	for _, field := range schema.Fields {
+		if field.IsPrimaryKey {
+			// PK already exists, nothing to inject
+			return nil
+		}
+	}
+
+	// Create virtual PK field with FieldID=0; RootCoord's assignFieldAndFunctionID
+	// will assign the actual field ID during collection creation.
+	virtualPKField := &schemapb.FieldSchema{
+		Name:         common.VirtualPKFieldName,
+		Description:  "Virtual primary key for external collection: (segmentID << 32) | offset",
+		DataType:     schemapb.DataType_Int64,
+		IsPrimaryKey: true,
+		AutoID:       true, // Virtual PKs are auto-generated
+	}
+
+	// Prepend virtual PK field to the schema fields
+	schema.Fields = append([]*schemapb.FieldSchema{virtualPKField}, schema.Fields...)
 
 	return nil
 }
@@ -786,7 +846,7 @@ func validateMetricType(dataType schemapb.DataType, metricTypeStrRaw string) err
 	return fmt.Errorf("data_type %s mismatch with metric_type %s", dataType.String(), metricTypeStrRaw)
 }
 
-func validateFunction(coll *schemapb.CollectionSchema) error {
+func validateFunction(coll *schemapb.CollectionSchema, needValidateFunctionName string, disableRuntimeCheck bool) error {
 	nameMap := lo.SliceToMap(coll.GetFields(), func(field *schemapb.FieldSchema) (string, *schemapb.FieldSchema) {
 		return field.GetName(), field
 	})
@@ -852,9 +912,10 @@ func validateFunction(coll *schemapb.CollectionSchema) error {
 			return err
 		}
 	}
-
-	if err := embedding.ValidateFunctions(coll); err != nil {
-		return err
+	if !disableRuntimeCheck {
+		if err := embedding.ValidateFunctions(coll, needValidateFunctionName, &models.ModelExtraInfo{ClusterID: paramtable.Get().CommonCfg.ClusterPrefix.GetValue(), DBName: coll.DbName}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -872,6 +933,13 @@ func checkFunctionOutputField(fSchema *schemapb.FunctionSchema, fields []*schema
 	case schemapb.FunctionType_TextEmbedding:
 		if err := embedding.TextEmbeddingOutputsCheck(fields); err != nil {
 			return err
+		}
+	case schemapb.FunctionType_MinHash:
+		if len(fields) != 1 {
+			return fmt.Errorf("MinHash function only need 1 output field, but got %d", len(fields))
+		}
+		if fields[0].GetDataType() != schemapb.DataType_BinaryVector {
+			return fmt.Errorf("MinHash function output field must be a BinaryVector field, but got %s", fields[0].DataType.String())
 		}
 	default:
 		return errors.New("check output field for unknown function type")
@@ -893,6 +961,11 @@ func checkFunctionInputField(function *schemapb.FunctionSchema, fields []*schema
 	case schemapb.FunctionType_TextEmbedding:
 		if err := embedding.TextEmbeddingInputsCheck(function.GetName(), fields); err != nil {
 			return err
+		}
+	case schemapb.FunctionType_MinHash:
+		if len(fields) != 1 || (fields[0].DataType != schemapb.DataType_VarChar && fields[0].DataType != schemapb.DataType_Text) {
+			return fmt.Errorf("MinHash function input field must be a VARCHAR/TEXT field, got %d field with type %s",
+				len(fields), fields[0].DataType.String())
 		}
 	default:
 		return errors.New("check input field with unknown function type")
@@ -939,6 +1012,9 @@ func checkFunctionBasicParams(function *schemapb.FunctionSchema) error {
 		if len(function.GetParams()) == 0 {
 			return errors.New("TextEmbedding function accepts no params")
 		}
+	case schemapb.FunctionType_MinHash:
+		// MinHash function can accept optional params
+		return nil
 	default:
 		return errors.New("check function params with unknown function type")
 	}
@@ -1046,6 +1122,59 @@ func parsePrimaryFieldData2IDs(fieldData *schemapb.FieldData) (*schemapb.IDs, er
 	return primaryData, nil
 }
 
+// hasDuplicates checks if there are any duplicate values in the slice.
+// Returns true immediately when the first duplicate is found (early exit).
+func hasDuplicates[T comparable](ids []T) bool {
+	seen := make(map[T]struct{}, len(ids))
+	for _, id := range ids {
+		if _, exists := seen[id]; exists {
+			return true
+		}
+		seen[id] = struct{}{}
+	}
+	return false
+}
+
+// CheckDuplicatePkExist checks if there are duplicate primary keys in the field data.
+// Returns (true, nil) if duplicates exist, (false, nil) if no duplicates.
+// Returns (false, error) if there's an error during checking.
+func CheckDuplicatePkExist(primaryFieldSchema *schemapb.FieldSchema, fieldsData []*schemapb.FieldData) (bool, error) {
+	if len(fieldsData) == 0 {
+		return false, nil
+	}
+
+	// find primary field data
+	var primaryFieldData *schemapb.FieldData
+	for _, field := range fieldsData {
+		if field.GetFieldName() == primaryFieldSchema.GetName() {
+			primaryFieldData = field
+			break
+		}
+	}
+
+	if primaryFieldData == nil {
+		return false, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("must assign pk when upsert, primary field: %v", primaryFieldSchema.GetName()))
+	}
+
+	// check for duplicates based on primary key type
+	switch primaryFieldData.Field.(type) {
+	case *schemapb.FieldData_Scalars:
+		scalarField := primaryFieldData.GetScalars()
+		switch scalarField.Data.(type) {
+		case *schemapb.ScalarField_LongData:
+			intIDs := scalarField.GetLongData().GetData()
+			return hasDuplicates(intIDs), nil
+		case *schemapb.ScalarField_StringData:
+			strIDs := scalarField.GetStringData().GetData()
+			return hasDuplicates(strIDs), nil
+		default:
+			return false, merr.WrapErrParameterInvalidMsg("unsupported primary key type")
+		}
+	default:
+		return false, merr.WrapErrParameterInvalidMsg("primary field must be scalar type")
+	}
+}
+
 // autoGenPrimaryFieldData generate primary data when autoID == true
 func autoGenPrimaryFieldData(fieldSchema *schemapb.FieldSchema, data interface{}) (*schemapb.FieldData, error) {
 	var fieldData schemapb.FieldData
@@ -1089,6 +1218,10 @@ func autoGenPrimaryFieldData(fieldSchema *schemapb.FieldSchema, data interface{}
 }
 
 func autoGenDynamicFieldData(data [][]byte) *schemapb.FieldData {
+	validData := make([]bool, len(data))
+	for i := range validData {
+		validData[i] = true
+	}
 	return &schemapb.FieldData{
 		FieldName: common.MetaFieldName,
 		Type:      schemapb.DataType_JSON,
@@ -1102,56 +1235,74 @@ func autoGenDynamicFieldData(data [][]byte) *schemapb.FieldData {
 			},
 		},
 		IsDynamic: true,
+		ValidData: validData,
 	}
 }
 
-// fillFieldPropertiesBySchema set fieldID to fieldData according FieldSchemas
-func fillFieldPropertiesBySchema(columns []*schemapb.FieldData, schema *schemapb.CollectionSchema) error {
-	fieldName2Schema := make(map[string]*schemapb.FieldSchema)
-
+// validateFieldDataColumns validates that all required fields are present and no unknown fields exist.
+// It checks:
+// 1. The number of columns matches the expected count (excluding BM25 output fields)
+// 2. All field names exist in the schema
+// Returns detailed error message listing expected and provided fields if validation fails.
+func validateFieldDataColumns(columns []*schemapb.FieldData, schema *schemaInfo) error {
 	expectColumnNum := 0
-	for _, field := range schema.GetFields() {
-		fieldName2Schema[field.Name] = field
-		if !typeutil.IsBM25FunctionOutputField(field, schema) {
+
+	// Count expected columns
+	for _, field := range schema.CollectionSchema.GetFields() {
+		if !(typeutil.IsBM25FunctionOutputField(field, schema.CollectionSchema) || typeutil.IsMinHashFunctionOutputField(field, schema.CollectionSchema)) {
 			expectColumnNum++
 		}
 	}
-
-	for _, structField := range schema.GetStructArrayFields() {
-		for _, field := range structField.GetFields() {
-			fieldName2Schema[field.Name] = field
-			expectColumnNum++
-		}
+	for _, structField := range schema.CollectionSchema.GetStructArrayFields() {
+		expectColumnNum += len(structField.GetFields())
 	}
 
+	// Validate column count
 	if len(columns) != expectColumnNum {
 		return fmt.Errorf("len(columns) mismatch the expectColumnNum, expectColumnNum: %d, len(columns): %d",
 			expectColumnNum, len(columns))
 	}
 
+	// Validate field existence using schemaHelper
 	for _, fieldData := range columns {
-		if fieldSchema, ok := fieldName2Schema[fieldData.FieldName]; ok {
-			fieldData.FieldId = fieldSchema.FieldID
-			fieldData.Type = fieldSchema.DataType
-
-			// Set the ElementType because it may not be set in the insert request.
-			if fieldData.Type == schemapb.DataType_Array {
-				fd, ok := fieldData.Field.(*schemapb.FieldData_Scalars)
-				if !ok || fd.Scalars.GetArrayData() == nil {
-					return fmt.Errorf("field convert FieldData_Scalars fail in fieldData, fieldName: %s,"+
-						" collectionName:%s", fieldData.FieldName, schema.Name)
-				}
-				fd.Scalars.GetArrayData().ElementType = fieldSchema.ElementType
-			} else if fieldData.Type == schemapb.DataType_ArrayOfVector {
-				fd, ok := fieldData.Field.(*schemapb.FieldData_Vectors)
-				if !ok || fd.Vectors.GetVectorArray() == nil {
-					return fmt.Errorf("field convert FieldData_Vectors fail in fieldData, fieldName: %s,"+
-						" collectionName:%s", fieldData.FieldName, schema.Name)
-				}
-				fd.Vectors.GetVectorArray().ElementType = fieldSchema.ElementType
-			}
-		} else {
+		_, err := schema.schemaHelper.GetFieldFromNameDefaultJSON(fieldData.FieldName)
+		if err != nil {
 			return fmt.Errorf("fieldName %v not exist in collection schema", fieldData.FieldName)
+		}
+	}
+
+	return nil
+}
+
+// fillFieldPropertiesOnly fills field properties (FieldId, Type, ElementType) from schema.
+// It assumes that columns have been validated and does not perform validation.
+// Use validateFieldDataColumns before calling this function if validation is needed.
+func fillFieldPropertiesOnly(columns []*schemapb.FieldData, schema *schemaInfo) error {
+	for _, fieldData := range columns {
+		// Use schemaHelper to get field schema, automatically handles dynamic fields
+		fieldSchema, err := schema.schemaHelper.GetFieldFromNameDefaultJSON(fieldData.FieldName)
+		if err != nil {
+			return fmt.Errorf("fieldName %v not exist in collection schema", fieldData.FieldName)
+		}
+
+		fieldData.FieldId = fieldSchema.FieldID
+		fieldData.Type = fieldSchema.DataType
+
+		// Set the ElementType because it may not be set in the insert request.
+		if fieldData.Type == schemapb.DataType_Array {
+			fd, ok := fieldData.Field.(*schemapb.FieldData_Scalars)
+			if !ok || fd.Scalars.GetArrayData() == nil {
+				return fmt.Errorf("field convert FieldData_Scalars fail in fieldData, fieldName: %s, collectionName: %s",
+					fieldData.FieldName, schema.Name)
+			}
+			fd.Scalars.GetArrayData().ElementType = fieldSchema.ElementType
+		} else if fieldData.Type == schemapb.DataType_ArrayOfVector {
+			fd, ok := fieldData.Field.(*schemapb.FieldData_Vectors)
+			if !ok || fd.Vectors.GetVectorArray() == nil {
+				return fmt.Errorf("field convert FieldData_Vectors fail in fieldData, fieldName: %s, collectionName: %s",
+					fieldData.FieldName, schema.Name)
+			}
+			fd.Vectors.GetVectorArray().ElementType = fieldSchema.ElementType
 		}
 	}
 
@@ -1298,6 +1449,11 @@ func ValidateCollectionName(entity string) error {
 	return validateName(entity, "collection name")
 }
 
+// ValidateSnapshotName validates snapshot name using standard naming rules.
+func ValidateSnapshotName(snapshotName string) error {
+	return validateName(snapshotName, "snapshot name")
+}
+
 func ValidateObjectType(entity string) error {
 	return validateName(entity, "ObjectType")
 }
@@ -1336,7 +1492,7 @@ func NewContextWithMetadata(ctx context.Context, username string, dbName string)
 		ctx = contextutil.AppendToIncomingContext(ctx, dbKey, dbName)
 	}
 	if username != "" {
-		originValue := fmt.Sprintf("%s%s%s", username, util.CredentialSeperator, username)
+		originValue := fmt.Sprintf("%s%s%s", username, util.CredentialSeparator, username)
 		authKey := strings.ToLower(util.HeaderAuthorize)
 		authValue := crypto.Base64Encode(originValue)
 		ctx = contextutil.AppendToIncomingContext(ctx, authKey, authValue)
@@ -1347,7 +1503,7 @@ func NewContextWithMetadata(ctx context.Context, username string, dbName string)
 func AppendUserInfoForRPC(ctx context.Context) context.Context {
 	curUser, _ := GetCurUserFromContext(ctx)
 	if curUser != "" {
-		originValue := fmt.Sprintf("%s%s%s", curUser, util.CredentialSeperator, curUser)
+		originValue := fmt.Sprintf("%s%s%s", curUser, util.CredentialSeparator, curUser)
 		authKey := strings.ToLower(util.HeaderAuthorize)
 		authValue := crypto.Base64Encode(originValue)
 		ctx = metadata.AppendToOutgoingContext(ctx, authKey, authValue)
@@ -1438,6 +1594,13 @@ func computeRecall(results *schemapb.SearchResultData, gts *schemapb.SearchResul
 		return fmt.Errorf("num of queries is inconsistent between search results(%d) and ground truth(%d)", results.GetNumQueries(), gts.GetNumQueries())
 	}
 
+	// When search returns no results, IDs field is nil. Set recalls to 0 for all queries.
+	if results.GetIds() == nil || results.GetIds().GetIdField() == nil ||
+		gts.GetIds() == nil || gts.GetIds().GetIdField() == nil {
+		results.Recalls = make([]float32, results.GetNumQueries())
+		return nil
+	}
+
 	switch results.GetIds().GetIdField().(type) {
 	case *schemapb.IDs_IntId:
 		switch gts.GetIds().GetIdField().(type) {
@@ -1500,7 +1663,7 @@ func computeRecall(results *schemapb.SearchResultData, gts *schemapb.SearchResul
 // 4th return value is true if user requested pk field explicitly or using wildcard.
 // if removePkField is true, pk field will not be include in the first(resultFieldNames)/second(userOutputFields)
 // return value.
-func translateOutputFields(outputFields []string, schema *schemaInfo, removePkField bool) ([]string, []string, []string, bool, error) {
+func translateOutputFields(outputFields []string, schema *schemaInfo, removePkField bool) ([]string, []string, []string, []agg.AggregateBase, bool, error) {
 	var primaryFieldName string
 	allFieldNameMap := make(map[string]*schemapb.FieldSchema)
 	resultFieldNameMap := make(map[string]bool)
@@ -1510,6 +1673,7 @@ func translateOutputFields(outputFields []string, schema *schemaInfo, removePkFi
 	userDynamicFieldsMap := make(map[string]bool)
 	userDynamicFields := make([]string, 0)
 	useAllDyncamicFields := false
+	aggregates := make([]agg.AggregateBase, 0)
 	for _, field := range schema.Fields {
 		if field.IsPrimaryKey {
 			primaryFieldName = field.Name
@@ -1546,6 +1710,33 @@ func translateOutputFields(outputFields []string, schema *schemaInfo, removePkFi
 			}
 			useAllDyncamicFields = true
 		} else {
+			if isAgg, aggregateName, aggFieldName := agg.MatchAggregationExpression(outputFieldName); isAgg {
+				if aggField, ok := allFieldNameMap[aggFieldName]; ok {
+					aggFuncs, aggErr := agg.NewAggregate(aggregateName, aggField.GetFieldID(), outputFieldName, aggField.GetDataType())
+					if aggErr != nil {
+						return nil, nil, nil, nil, false, aggErr
+					}
+					aggregates = append(aggregates, aggFuncs...)
+				} else if aggFieldName == "*" {
+					// only count(*) is allowed
+					if aggregateName != "count" {
+						return nil, nil, nil, nil, false, fmt.Errorf("%s(*) is not supported, only count(*) is allowed", aggregateName)
+					}
+					if err := agg.ValidateAggFieldType(aggregateName, schemapb.DataType_None); err != nil {
+						return nil, nil, nil, nil, false, err
+					}
+					aggFuncs, aggErr := agg.NewAggregate(aggregateName, 0, outputFieldName, schemapb.DataType_None)
+					if aggErr != nil {
+						return nil, nil, nil, nil, false, aggErr
+					}
+					aggregates = append(aggregates, aggFuncs...)
+				} else {
+					return nil, nil, nil, nil, false, fmt.Errorf("target field %s for aggregation:%s does not exist", aggFieldName, aggregateName)
+				}
+				userOutputFieldsMap[outputFieldName] = true
+				continue
+			}
+
 			if structArrayField, ok := structArrayNameToFields[outputFieldName]; ok {
 				for _, field := range structArrayField {
 					if schema.CanRetrieveRawFieldData(field) {
@@ -1557,7 +1748,7 @@ func translateOutputFields(outputFields []string, schema *schemaInfo, removePkFi
 			}
 			if field, ok := allFieldNameMap[outputFieldName]; ok {
 				if !schema.CanRetrieveRawFieldData(field) {
-					return nil, nil, nil, false, fmt.Errorf("not allowed to retrieve raw data of field %s", outputFieldName)
+					return nil, nil, nil, nil, false, fmt.Errorf("not allowed to retrieve raw data of field %s", outputFieldName)
 				}
 				resultFieldNameMap[outputFieldName] = true
 				userOutputFieldsMap[outputFieldName] = true
@@ -1588,13 +1779,13 @@ func translateOutputFields(outputFields []string, schema *schemaInfo, removePkFi
 					})
 					if err != nil {
 						log.Info("parse output field name failed", zap.String("field name", outputFieldName), zap.Error(err))
-						return nil, nil, nil, false, fmt.Errorf("parse output field name failed: %s", outputFieldName)
+						return nil, nil, nil, nil, false, fmt.Errorf("parse output field name failed: %s", outputFieldName)
 					}
 					resultFieldNameMap[common.MetaFieldName] = true
 					userOutputFieldsMap[outputFieldName] = true
 					userDynamicFieldsMap[dynamicNestedPath] = true
 				} else {
-					return nil, nil, nil, false, fmt.Errorf("field %s not exist", outputFieldName)
+					return nil, nil, nil, nil, false, fmt.Errorf("field %s not exist", outputFieldName)
 				}
 			}
 		}
@@ -1617,7 +1808,7 @@ func translateOutputFields(outputFields []string, schema *schemaInfo, removePkFi
 		}
 	}
 
-	return resultFieldNames, userOutputFields, userDynamicFields, userRequestedPkFieldExplicitly, nil
+	return resultFieldNames, userOutputFields, userDynamicFields, aggregates, userRequestedPkFieldExplicitly, nil
 }
 
 func validCharInIndexName(c byte) bool {
@@ -1722,12 +1913,12 @@ func checkFieldsDataBySchema(allFields []*schemapb.FieldSchema, schema *schemapb
 		if fieldSchema.GetDefaultValue() != nil && fieldSchema.IsPrimaryKey {
 			return merr.WrapErrParameterInvalidMsg("primary key can't be with default value")
 		}
-		if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && needAutoGenPk && inInsert) || typeutil.IsBM25FunctionOutputField(fieldSchema, schema) {
+		if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && needAutoGenPk && inInsert) || typeutil.IsBM25FunctionOutputField(fieldSchema, schema) || typeutil.IsMinHashFunctionOutputField(fieldSchema, schema) {
 			// when inInsert, no need to pass when pk is autoid and SkipAutoIDCheck is false
 			autoGenFieldNum++
 		}
 		if _, ok := dataNameSet[fieldSchema.GetName()]; !ok {
-			if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && needAutoGenPk && inInsert) || typeutil.IsBM25FunctionOutputField(fieldSchema, schema) {
+			if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && needAutoGenPk && inInsert) || typeutil.IsBM25FunctionOutputField(fieldSchema, schema) || typeutil.IsMinHashFunctionOutputField(fieldSchema, schema) {
 				// autoGenField
 				continue
 			}
@@ -1938,7 +2129,7 @@ func LackOfFieldsDataBySchema(schema *schemapb.CollectionSchema, fieldsData []*s
 
 		if _, ok := dataNameMap[fieldSchema.GetName()]; !ok {
 			if (fieldSchema.IsPrimaryKey && fieldSchema.AutoID && !Params.ProxyCfg.SkipAutoIDCheck.GetAsBool() && skipPkFieldCheck) ||
-				typeutil.IsBM25FunctionOutputField(fieldSchema, schema) ||
+				typeutil.IsBM25FunctionOutputField(fieldSchema, schema) || typeutil.IsMinHashFunctionOutputField(fieldSchema, schema) ||
 				(skipDynamicFieldCheck && fieldSchema.GetIsDynamic()) {
 				// autoGenField
 				continue
@@ -2213,13 +2404,26 @@ func getDefaultPartitionsInPartitionKeyMode(ctx context.Context, dbName string, 
 func assignChannelsByPK(pks *schemapb.IDs, channelNames []string, insertMsg *msgstream.InsertMsg) map[string][]int {
 	insertMsg.HashValues = typeutil.HashPK2Channels(pks, channelNames)
 
-	// groupedHashKeys represents the dmChannel index
-	channel2RowOffsets := make(map[string][]int) //   channelName to count
-	// assert len(it.hashValues) < maxInt
+	numChannels := len(channelNames)
+	if numChannels == 0 {
+		return nil
+	}
+
+	numRows := len(insertMsg.HashValues)
+	avgCapacity := (numRows / numChannels) + 1
+
+	channel2RowOffsets := make(map[string][]int, numChannels)
+
 	for offset, channelID := range insertMsg.HashValues {
-		channelName := channelNames[channelID]
+		idx := int(channelID)
+		if idx >= numChannels {
+			continue
+		}
+
+		channelName := channelNames[idx]
+
 		if _, ok := channel2RowOffsets[channelName]; !ok {
-			channel2RowOffsets[channelName] = []int{}
+			channel2RowOffsets[channelName] = make([]int, 0, avgCapacity)
 		}
 		channel2RowOffsets[channelName] = append(channel2RowOffsets[channelName], offset)
 	}
@@ -2257,7 +2461,7 @@ func ErrWithLog(logger *log.MLogger, msg string, err error) error {
 	return wrapErr
 }
 
-func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg, skipStaticFieldNameCheck bool) error {
 	for _, field := range insertMsg.FieldsData {
 		if field.GetFieldName() == common.MetaFieldName {
 			if !schema.EnableDynamicField {
@@ -2275,10 +2479,12 @@ func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstr
 				if _, ok := jsonData[common.MetaFieldName]; ok {
 					return fmt.Errorf("cannot set json key to: %s", common.MetaFieldName)
 				}
-				for _, f := range schema.GetFields() {
-					if _, ok := jsonData[f.GetName()]; ok {
-						log.Info("dynamic field name include the static field name", zap.String("fieldName", f.GetName()))
-						return fmt.Errorf("dynamic field name cannot include the static field name: %s", f.GetName())
+				if !skipStaticFieldNameCheck {
+					for _, f := range schema.GetFields() {
+						if _, ok := jsonData[f.GetName()]; ok {
+							log.Info("dynamic field name include the static field name", zap.String("fieldName", f.GetName()))
+							return fmt.Errorf("dynamic field name cannot include the static field name: %s", f.GetName())
+						}
 					}
 				}
 			}
@@ -2288,11 +2494,15 @@ func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstr
 	return nil
 }
 
-func checkDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+// doCheckDynamicFieldData is the shared implementation for dynamic field validation.
+// When skipStaticFieldNameCheck is true, $meta keys matching static field names are
+// allowed — this is needed for partial updates after schema evolution, where $meta
+// may legitimately contain keys that now correspond to static columns.
+func doCheckDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg, skipStaticFieldNameCheck bool) error {
 	for _, data := range insertMsg.FieldsData {
 		if data.IsDynamic {
 			data.FieldName = common.MetaFieldName
-			return verifyDynamicFieldData(schema, insertMsg)
+			return verifyDynamicFieldData(schema, insertMsg, skipStaticFieldNameCheck)
 		}
 	}
 	defaultData := make([][]byte, insertMsg.NRows())
@@ -2304,16 +2514,26 @@ func checkDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstre
 	return nil
 }
 
+func checkDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+	return doCheckDynamicFieldData(schema, insertMsg, false)
+}
+
+// checkDynamicFieldDataForPartialUpdate is a relaxed version of checkDynamicFieldData
+// for partial updates. After schema evolution, $meta may legitimately contain keys
+// matching static field names (e.g., a dynamic field "end_timestamp" that was later
+// added as a static column). This function validates JSON format and rejects the
+// reserved $meta key, but skips the static field name conflict check so that
+// existing dynamic field data is preserved.
+func checkDynamicFieldDataForPartialUpdate(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+	return doCheckDynamicFieldData(schema, insertMsg, true)
+}
+
 func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
 	err := common.CheckNamespace(schema, insertMsg.InsertRequest.Namespace)
 	if err != nil {
 		return err
 	}
-	namespaceEnabeld, _, err := common.ParseNamespaceProp(schema.Properties...)
-	if err != nil {
-		return err
-	}
-	if !namespaceEnabeld {
+	if !schema.GetEnableNamespace() {
 		return nil
 	}
 
@@ -2323,10 +2543,28 @@ func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.In
 		return fmt.Errorf("namespace field not found")
 	}
 
-	// check namespace field data is already set
+	// If namespace field data is already present, validate it instead of rejecting outright.
 	for _, fieldData := range insertMsg.FieldsData {
 		if fieldData.FieldId == namespaceField.FieldID {
-			return fmt.Errorf("namespace field data is already set by users")
+			ns := ""
+			if insertMsg.InsertRequest.Namespace != nil {
+				ns = *insertMsg.InsertRequest.Namespace
+			}
+			scalars := fieldData.GetScalars()
+			if scalars == nil {
+				return fmt.Errorf("invalid namespace field data layout")
+			}
+			strData := scalars.GetStringData()
+			if strData == nil {
+				return fmt.Errorf("invalid namespace field data layout")
+			}
+			for _, v := range strData.GetData() {
+				if v != ns {
+					return fmt.Errorf("namespace field value %q mismatches namespace %q", v, ns)
+				}
+			}
+			// Values are consistent with the namespace; nothing more to do.
+			return nil
 		}
 	}
 
@@ -2582,25 +2820,6 @@ func GetFailedResponse(req any, err error) any {
 	return nil
 }
 
-func GetReplicateID(ctx context.Context, database, collectionName string) (string, error) {
-	if globalMetaCache == nil {
-		return "", merr.WrapErrServiceUnavailable("internal: Milvus Proxy is not ready yet. please wait")
-	}
-	colInfo, err := globalMetaCache.GetCollectionInfo(ctx, database, collectionName, 0)
-	if err != nil {
-		return "", err
-	}
-	if colInfo.replicateID != "" {
-		return colInfo.replicateID, nil
-	}
-	dbInfo, err := globalMetaCache.GetDatabaseInfo(ctx, database)
-	if err != nil {
-		return "", err
-	}
-	replicateID, _ := common.GetReplicateID(dbInfo.properties)
-	return replicateID, nil
-}
-
 func GetFunctionOutputFields(collSchema *schemapb.CollectionSchema) []string {
 	fields := make([]string, 0)
 	for _, fSchema := range collSchema.Functions {
@@ -2619,27 +2838,34 @@ func GetBM25FunctionOutputFields(collSchema *schemapb.CollectionSchema) []string
 	return fields
 }
 
-func getCollectionTTL(pairs []*commonpb.KeyValuePair) uint64 {
-	properties := make(map[string]string)
-	for _, pair := range pairs {
-		properties[pair.Key] = pair.Value
-	}
-
-	v, ok := properties[common.CollectionTTLConfigKey]
-	if ok {
-		ttl, err := strconv.Atoi(v)
-		if err != nil {
-			return 0
+func GetMinHashFunctionOutputFields(collSchema *schemapb.CollectionSchema) []string {
+	fields := make([]string, 0)
+	for _, fSchema := range collSchema.Functions {
+		if fSchema.Type == schemapb.FunctionType_MinHash {
+			fields = append(fields, fSchema.OutputFieldNames...)
 		}
-		return uint64(time.Duration(ttl) * time.Second)
 	}
-
-	return 0
+	return fields
 }
 
-// reconstructStructFieldDataCommon reconstructs struct fields from flattened sub-fields
-// It works with both QueryResults and SearchResults by operating on the common data structures
-func reconstructStructFieldDataCommon(
+// getCollectionTTL returns ttl if collection's ttl is specified
+// or return global ttl if collection's ttl is not specified
+// this is a helper util wrapping common.GetCollectionTTL without returning error
+func getCollectionTTL(pairs []*commonpb.KeyValuePair) uint64 {
+	ttl, err := common.GetCollectionTTL(pairs)
+	if err != nil {
+		log.Error("failed to get collection ttl, use default ttl", zap.Error(err))
+	}
+	if ttl < 0 {
+		return 0
+	}
+	return uint64(ttl)
+}
+
+// reconstructStructFieldData regroups flattened sub-fields (named "structName[fieldName]")
+// back into StructArrayField entries, restoring original field names for the user-facing response.
+// It modifies sub-field FieldName in place; callers must not reuse the input slice afterwards.
+func reconstructStructFieldData(
 	fieldsData []*schemapb.FieldData,
 	outputFields []string,
 	schema *schemapb.CollectionSchema,
@@ -2684,40 +2910,33 @@ func reconstructStructFieldDataCommon(
 	}
 
 	for structFieldID, fields := range groupedStructFields {
-		// Create deep copies of fields to avoid modifying original data
-		// and restore original field names for user-facing response
-		copiedFields := make([]*schemapb.FieldData, len(fields))
-		for i, field := range fields {
-			copiedFields[i] = proto.Clone(field).(*schemapb.FieldData)
-			// Extract original field name from structName[fieldName] format
-			originalName, err := extractOriginalFieldName(copiedFields[i].FieldName)
+		// Restore original field names (from "structName[fieldName]" to "fieldName")
+		// for the user-facing response.
+		for _, field := range fields {
+			originalName, err := extractOriginalFieldName(field.FieldName)
 			if err != nil {
-				// This should not happen in normal operation - indicates a bug
 				log.Error("failed to extract original field name from struct field",
-					zap.String("fieldName", copiedFields[i].FieldName),
+					zap.String("fieldName", field.FieldName),
 					zap.Error(err))
-				// Keep the transformed name to avoid data corruption
 			} else {
-				copiedFields[i].FieldName = originalName
+				field.FieldName = originalName
 			}
 		}
 
-		fieldData := &schemapb.FieldData{
+		newFieldsData = append(newFieldsData, &schemapb.FieldData{
 			FieldName: structFieldNames[structFieldID],
 			FieldId:   structFieldID,
 			Type:      schemapb.DataType_ArrayOfStruct,
-			Field:     &schemapb.FieldData_StructArrays{StructArrays: &schemapb.StructArrayField{Fields: copiedFields}},
-		}
-		newFieldsData = append(newFieldsData, fieldData)
+			Field:     &schemapb.FieldData_StructArrays{StructArrays: &schemapb.StructArrayField{Fields: fields}},
+		})
 		reconstructedOutputFields = append(reconstructedOutputFields, structFieldNames[structFieldID])
 	}
 
 	return newFieldsData, reconstructedOutputFields
 }
 
-// Wrapper for QueryResults
 func reconstructStructFieldDataForQuery(results *milvuspb.QueryResults, schema *schemapb.CollectionSchema) {
-	fieldsData, outputFields := reconstructStructFieldDataCommon(
+	fieldsData, outputFields := reconstructStructFieldData(
 		results.FieldsData,
 		results.OutputFields,
 		schema,
@@ -2726,12 +2945,11 @@ func reconstructStructFieldDataForQuery(results *milvuspb.QueryResults, schema *
 	results.OutputFields = outputFields
 }
 
-// New wrapper for SearchResults
 func reconstructStructFieldDataForSearch(results *milvuspb.SearchResults, schema *schemapb.CollectionSchema) {
 	if results.Results == nil {
 		return
 	}
-	fieldsData, outputFields := reconstructStructFieldDataCommon(
+	fieldsData, outputFields := reconstructStructFieldData(
 		results.Results.FieldsData,
 		results.Results.OutputFields,
 		schema,
@@ -2787,7 +3005,7 @@ func timestamptzUTC2IsoStr(results []*schemapb.FieldData, colTimezone string) er
 			localTime := t.In(location)
 
 			// 3. Format using the optimized logic (max 6 digits, no trailing zeros)
-			isoStrings[i] = funcutil.FormatTimeMicroWithoutTrailingZeros(localTime)
+			isoStrings[i] = timestamptz.FormatTimeMicroWithoutTrailingZeros(localTime)
 		}
 
 		// Replace the TimestamptzData with the new StringData in place.
@@ -2896,10 +3114,10 @@ func genFunctionFields(ctx context.Context, insertMsg *msgstream.InsertMsg, sche
 		return err
 	}
 
-	if embedding.HasNonBM25Functions(schema.CollectionSchema.Functions, []int64{}) {
+	if embedding.HasNonBM25AndMinHashFunctions(schema.CollectionSchema.Functions, []int64{}) {
 		ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-genFunctionFields-call-function-udf")
 		defer sp.End()
-		exec, err := embedding.NewFunctionExecutor(schema.CollectionSchema, needProcessFunctions)
+		exec, err := embedding.NewFunctionExecutor(schema.CollectionSchema, needProcessFunctions, &models.ModelExtraInfo{ClusterID: paramtable.Get().CommonCfg.ClusterPrefix.GetValue(), DBName: insertMsg.GetDbName()})
 		if err != nil {
 			return err
 		}
@@ -2910,4 +3128,10 @@ func genFunctionFields(ctx context.Context, insertMsg *msgstream.InsertMsg, sche
 		sp.AddEvent("Call-function-udf")
 	}
 	return nil
+}
+
+func getBM25FunctionOfAnnsField(fieldID int64, functions []*schemapb.FunctionSchema) (*schemapb.FunctionSchema, bool) {
+	return lo.Find(functions, func(function *schemapb.FunctionSchema) bool {
+		return function.GetType() == schemapb.FunctionType_BM25 && function.OutputFieldIds[0] == fieldID
+	})
 }

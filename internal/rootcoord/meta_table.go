@@ -45,7 +45,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -113,6 +112,11 @@ type IMetaTable interface {
 	ListAliases(ctx context.Context, dbName string, collectionName string, ts Timestamp) ([]string, error)
 
 	AlterCollection(ctx context.Context, result message.BroadcastResultAlterCollectionMessageV2) error
+	// Deprecated: will be removed in the 3.0 after implementing ack sync up semantic.
+	// It will be used to forbid the compaction of current collection when truncate collection operation is in progress.
+	BeginTruncateCollection(ctx context.Context, collectionID UniqueID) error
+	// TruncateCollection is called when the truncate collection message is acknowledged.
+	TruncateCollection(ctx context.Context, result message.BroadcastResultTruncateCollectionMessageV2) error
 	CheckIfCollectionRenamable(ctx context.Context, dbName string, oldName string, newDBName string, newName string) error
 	GetGeneralCount(ctx context.Context) int
 
@@ -144,6 +148,10 @@ type IMetaTable interface {
 	ListPrivilegeGroups(ctx context.Context) ([]*milvuspb.PrivilegeGroupInfo, error)
 	OperatePrivilegeGroup(ctx context.Context, groupName string, privileges []*milvuspb.PrivilegeEntity, operateType milvuspb.OperatePrivilegeGroupType) error
 	GetPrivilegeGroupRoles(ctx context.Context, groupName string) ([]*milvuspb.RoleEntity, error)
+
+	AddFileResource(ctx context.Context, resource *internalpb.FileResourceInfo) error
+	RemoveFileResource(ctx context.Context, name string) (error, bool)
+	ListFileResource(ctx context.Context) ([]*internalpb.FileResourceInfo, uint64)
 }
 
 // MetaTable is a persistent meta set of all databases, collections and partitions.
@@ -155,6 +163,11 @@ type MetaTable struct {
 
 	dbName2Meta map[string]*model.Database              // database name ->  db meta
 	collID2Meta map[typeutil.UniqueID]*model.Collection // collection id -> collection meta
+
+	fileResourceName2Meta map[string]*internalpb.FileResourceInfo // file resource name -> file resource meta
+	fileResourceID2Meta   map[int64]*internalpb.FileResourceInfo  // file resource id -> file resource meta
+	fileResourceRefCnt    map[int64]int                           // file resource id -> reference count
+	fileResourceVersion   uint64
 
 	generalCnt int // sum of product of partition number and shard number
 
@@ -186,6 +199,7 @@ func (mt *MetaTable) reload() error {
 	record := timerecord.NewTimeRecorder("rootcoord")
 	mt.dbName2Meta = make(map[string]*model.Database)
 	mt.collID2Meta = make(map[UniqueID]*model.Collection)
+	mt.fileResourceRefCnt = make(map[int64]int)
 	mt.names = newNameDb()
 	mt.aliases = newNameDb()
 
@@ -234,12 +248,22 @@ func (mt *MetaTable) reload() error {
 			return err
 		}
 		for _, collection := range collections {
-			if collection.DBName == "" {
-				collection.DBName = dbName
+			if collection.DBName != "" && collection.DBName != dbName {
+				log.Ctx(mt.ctx).Warn(
+					"collection dbname is not correct, it will be fixed",
+					zap.Int64("collection_id", collection.CollectionID),
+					zap.String("db_name", dbName),
+					zap.String("collection_name", collection.Name),
+					zap.String("collection_dbname", collection.DBName),
+				)
 			}
+			collection.DBName = dbName // some collections may not have db name or its dbname is not correct, we should fix it here.
 			mt.collID2Meta[collection.CollectionID] = collection
 			if collection.Available() {
 				mt.names.insert(dbName, collection.Name, collection.CollectionID)
+				for _, fileResourceID := range collection.FileResourceIds {
+					mt.fileResourceRefCnt[fileResourceID]++
+				}
 				pn := collection.GetPartitionNum(true)
 				mt.generalCnt += pn * int(collection.ShardsNum)
 				collectionNum++
@@ -277,6 +301,19 @@ func (mt *MetaTable) reload() error {
 	}
 	channel.RecoverPChannelStatsManager(vchannels)
 
+	// reload file resources
+	resources, version, err := mt.catalog.ListFileResource(mt.ctx)
+	if err != nil {
+		return err
+	}
+	mt.fileResourceName2Meta = make(map[string]*internalpb.FileResourceInfo)
+	mt.fileResourceID2Meta = make(map[int64]*internalpb.FileResourceInfo)
+	for _, resource := range resources {
+		mt.fileResourceName2Meta[resource.Name] = resource
+		mt.fileResourceID2Meta[resource.Id] = resource
+	}
+	mt.fileResourceVersion = version
+
 	log.Ctx(mt.ctx).Info("RootCoord meta table reload done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
@@ -294,6 +331,9 @@ func (mt *MetaTable) reloadWithNonDatabase() error {
 		mt.collID2Meta[collection.CollectionID] = collection
 		if collection.Available() {
 			mt.names.insert(util.DefaultDBName, collection.Name, collection.CollectionID)
+			for _, fileResourceID := range collection.FileResourceIds {
+				mt.fileResourceRefCnt[fileResourceID]++
+			}
 			pn := collection.GetPartitionNum(true)
 			mt.generalCnt += pn * int(collection.ShardsNum)
 			collectionNum++
@@ -319,7 +359,9 @@ func (mt *MetaTable) reloadWithNonDatabase() error {
 }
 
 func (mt *MetaTable) createDefaultDb() error {
-	ts, err := mt.tsoAllocator.GenerateTSO(1)
+	// Generate ezID and db ts for default database
+	// Use unique ID as ezID because the default dbID(1) for each cluster is the same
+	ts, err := mt.tsoAllocator.GenerateTSO(2)
 	if err != nil {
 		return err
 	}
@@ -330,17 +372,16 @@ func (mt *MetaTable) createDefaultDb() error {
 		return err
 	}
 
-	defaultRootKey := paramtable.GetCipherParams().DefaultRootKey.GetValue()
-	if hookutil.IsClusterEncyptionEnabled() && len(defaultRootKey) > 0 {
-		// Set unique ID as ezID because the default dbID for each cluster
-		// is the same
-		ezID, err := mt.tsoAllocator.GenerateTSO(1)
-		if err != nil {
-			return err
-		}
+	// Apply same encryption logic as regular database creation
+	// This respects the defaultKey setting
+	defaultProperties, err = hookutil.TidyDBCipherProperties(int64(ts-1), defaultProperties)
+	if err != nil {
+		return err
+	}
 
-		cipherProps := hookutil.GetDBCipherProperties(ezID, defaultRootKey)
-		defaultProperties = append(defaultProperties, cipherProps...)
+	// Create EZ if encryption is enabled
+	if err := hookutil.CreateEZByDBProperties(defaultProperties); err != nil {
+		return err
 	}
 
 	return mt.createDatabasePrivate(mt.ctx, model.NewDefaultDatabase(defaultProperties), ts)
@@ -377,12 +418,7 @@ func (mt *MetaTable) CreateDatabase(ctx context.Context, db *model.Database, ts 
 
 func (mt *MetaTable) createDatabasePrivate(ctx context.Context, db *model.Database, ts typeutil.Timestamp) error {
 	dbName := db.Name
-	if err := hookutil.CreateEZByDBProperties(db.Properties); err != nil {
-		return err
-	}
-
 	if err := mt.catalog.CreateDatabase(ctx, db, ts); err != nil {
-		hookutil.RemoveEZByDBProperties(db.Properties) // ignore the error since create database failed
 		return err
 	}
 
@@ -441,11 +477,6 @@ func (mt *MetaTable) DropDatabase(ctx context.Context, dbName string, ts typeuti
 		return nil
 	}
 	if err := mt.catalog.DropDatabase(ctx, db.ID, ts); err != nil {
-		return err
-	}
-
-	// Call back cipher plugin when dropping database succeeded
-	if err := hookutil.RemoveEZByDBProperties(db.Properties); err != nil {
 		return err
 	}
 
@@ -526,6 +557,9 @@ func (mt *MetaTable) AddCollection(ctx context.Context, coll *model.Collection) 
 
 	mt.collID2Meta[coll.CollectionID] = coll.Clone()
 	mt.names.insert(coll.DBName, coll.Name, coll.CollectionID)
+	for _, fileResourceID := range coll.FileResourceIds {
+		mt.fileResourceRefCnt[fileResourceID]++
+	}
 
 	pn := coll.GetPartitionNum(true)
 	mt.generalCnt += pn * int(coll.ShardsNum)
@@ -563,6 +597,14 @@ func (mt *MetaTable) DropCollection(ctx context.Context, collectionID UniqueID, 
 		return err
 	}
 	mt.collID2Meta[collectionID] = clone
+	for _, fileResourceID := range coll.FileResourceIds {
+		mt.fileResourceRefCnt[fileResourceID]--
+	}
+
+	log.Ctx(ctx).Info("update coll state to dropping",
+		zap.Int64("collectionID", collectionID),
+		zap.String("state", clone.State.String()),
+	)
 
 	db, err := mt.getDatabaseByIDInternal(ctx, coll.DBID, typeutil.MaxTimestamp)
 	if err != nil {
@@ -578,34 +620,61 @@ func (mt *MetaTable) DropCollection(ctx context.Context, collectionID UniqueID, 
 
 	log.Ctx(ctx).Info("drop collection from meta table", zap.Int64("collection", collectionID),
 		zap.String("state", coll.State.String()), zap.Uint64("ts", ts))
+
+	// Delete all grants referencing this collection immediately so they don't
+	// linger until the tombstone sweeper runs (which can take minutes).
+	if err := mt.catalog.DeleteGrantByCollectionName(ctx1, util.DefaultTenant, db.Name, coll.Name); err != nil {
+		log.Ctx(ctx).Warn("failed to delete grants for dropped collection, skipping",
+			zap.String("dbName", db.Name), zap.String("collectionName", coll.Name), zap.Error(err))
+	}
+
 	return nil
 }
 
-func (mt *MetaTable) removeIfNameMatchedInternal(collectionID UniqueID, name string) {
+func (mt *MetaTable) removeIfNameMatchedInternal(ctx context.Context, collectionID UniqueID, name string) {
 	mt.names.removeIf(func(db string, collection string, id UniqueID) bool {
-		return collectionID == id
+		if collectionID == id {
+			log.Ctx(ctx).Info("remove from names",
+				zap.String("dbName", db),
+				zap.String("collectionName", collection),
+				zap.Int64("collectionID", id),
+			)
+			return true
+		}
+		return false
 	})
 }
 
-func (mt *MetaTable) removeIfAliasMatchedInternal(collectionID UniqueID, alias string) {
+func (mt *MetaTable) removeIfAliasMatchedInternal(ctx context.Context, collectionID UniqueID, alias string) {
 	mt.aliases.removeIf(func(db string, collection string, id UniqueID) bool {
-		return collectionID == id
+		if collectionID == id {
+			log.Ctx(ctx).Info("remove from aliases",
+				zap.String("dbName", db),
+				zap.String("alias", collection),
+				zap.Int64("collectionID", id),
+			)
+			return true
+		}
+		return false
 	})
 }
 
-func (mt *MetaTable) removeIfMatchedInternal(collectionID UniqueID, name string) {
-	mt.removeIfNameMatchedInternal(collectionID, name)
-	mt.removeIfAliasMatchedInternal(collectionID, name)
+func (mt *MetaTable) removeIfMatchedInternal(ctx context.Context, collectionID UniqueID, name string) {
+	mt.removeIfNameMatchedInternal(ctx, collectionID, name)
+	mt.removeIfAliasMatchedInternal(ctx, collectionID, name)
 }
 
-func (mt *MetaTable) removeAllNamesIfMatchedInternal(collectionID UniqueID, names []string) {
+func (mt *MetaTable) removeAllNamesIfMatchedInternal(ctx context.Context, collectionID UniqueID, names []string) {
 	for _, name := range names {
-		mt.removeIfMatchedInternal(collectionID, name)
+		mt.removeIfMatchedInternal(ctx, collectionID, name)
 	}
 }
 
-func (mt *MetaTable) removeCollectionByIDInternal(collectionID UniqueID) {
+func (mt *MetaTable) removeCollectionByIDInternal(ctx context.Context, collectionID UniqueID) {
 	delete(mt.collID2Meta, collectionID)
+	log.Ctx(ctx).Info("delete from collID2Meta",
+		zap.Int64("collectionID", collectionID),
+	)
 }
 
 func (mt *MetaTable) RemoveCollection(ctx context.Context, collectionID UniqueID, ts Timestamp) error {
@@ -637,12 +706,17 @@ func (mt *MetaTable) RemoveCollection(ctx context.Context, collectionID UniqueID
 		return err
 	}
 
+	if err := mt.catalog.DeleteGrantByCollectionName(ctx1, util.DefaultTenant, coll.DBName, coll.Name); err != nil {
+		log.Ctx(ctx).Warn("failed to delete grants for dropped collection, skipping",
+			zap.String("dbName", coll.DBName), zap.String("collectionName", coll.Name), zap.Error(err))
+	}
+
 	allNames := common.CloneStringList(aliases)
 	allNames = append(allNames, coll.Name)
 
 	// We cannot delete the name directly, since newly collection with same name may be created.
-	mt.removeAllNamesIfMatchedInternal(collectionID, allNames)
-	mt.removeCollectionByIDInternal(collectionID)
+	mt.removeAllNamesIfMatchedInternal(ctx, collectionID, allNames)
+	mt.removeCollectionByIDInternal(ctx, collectionID)
 
 	log.Ctx(ctx).Info("remove collection",
 		zap.Int64("dbID", coll.DBID),
@@ -680,7 +754,6 @@ func (mt *MetaTable) getLatestCollectionByIDInternal(ctx context.Context, collec
 		return coll.Clone(), nil
 	}
 	if !coll.Available() {
-		log.Warn("collection not available", zap.Int64("collectionID", collectionID), zap.Any("state", coll.State))
 		return nil, merr.WrapErrCollectionNotFound(collectionID)
 	}
 	return filterUnavailable(coll), nil
@@ -973,10 +1046,90 @@ func (mt *MetaTable) AlterCollection(ctx context.Context, result message.Broadca
 		}
 	}
 
+	if oldColl.Name != newColl.Name || oldColl.DBName != newColl.DBName {
+		if err := mt.catalog.MigrateGrantCollectionName(ctx1, util.DefaultTenant, oldColl.DBName, oldColl.Name, newColl.DBName, newColl.Name); err != nil {
+			log.Ctx(ctx).Warn("failed to migrate grants for renamed collection, skipping",
+				zap.String("oldDBName", oldColl.DBName), zap.String("oldName", oldColl.Name),
+				zap.String("newDBName", newColl.DBName), zap.String("newName", newColl.Name), zap.Error(err))
+		}
+	}
+
 	mt.names.remove(oldColl.DBName, oldColl.Name)
 	mt.names.insert(newColl.DBName, newColl.Name, newColl.CollectionID)
 	mt.collID2Meta[header.CollectionId] = newColl
-	log.Ctx(ctx).Info("alter collection finished", zap.Bool("dbChanged", dbChanged), zap.Int64("collectionID", oldColl.CollectionID), zap.Uint64("ts", newColl.UpdateTimestamp))
+	log.Ctx(ctx).Info("alter collection finished",
+		zap.String("oldDBName", oldColl.DBName),
+		zap.String("newDBName", newColl.DBName),
+		zap.String("oldCollectionName", oldColl.Name),
+		zap.String("newCollectionName", newColl.Name),
+		zap.Int64("headerCollectionID", header.CollectionId),
+		zap.Int64("newCollectionID", newColl.CollectionID),
+		zap.Int64("oldCollectionID", oldColl.CollectionID),
+		zap.Bool("dbChanged", dbChanged),
+		zap.Uint64("ts", newColl.UpdateTimestamp),
+	)
+	return nil
+}
+
+func (mt *MetaTable) BeginTruncateCollection(ctx context.Context, collectionID UniqueID) error {
+	mt.ddLock.Lock()
+	defer mt.ddLock.Unlock()
+
+	coll, ok := mt.collID2Meta[collectionID]
+	if !ok {
+		return errAlterCollectionNotFound
+	}
+
+	// Apply the properties to override the existing properties.
+	newProperties := common.CloneKeyValuePairs(coll.Properties).ToMap()
+	key := common.CollectionOnTruncatingKey
+	if _, ok := newProperties[key]; ok && newProperties[key] == "1" {
+		return nil
+	}
+	newProperties[key] = "1"
+	oldColl := coll.Clone()
+	newColl := coll.Clone()
+	newColl.Properties = common.NewKeyValuePairs(newProperties)
+
+	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
+	if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, newColl.UpdateTimestamp, false); err != nil {
+		return err
+	}
+	mt.collID2Meta[coll.CollectionID] = newColl
+	log.Ctx(ctx).Info("update collID2Meta for begin truncate collection",
+		zap.Int64("collectionID", coll.CollectionID),
+	)
+	return nil
+}
+
+func (mt *MetaTable) TruncateCollection(ctx context.Context, result message.BroadcastResultTruncateCollectionMessageV2) error {
+	mt.ddLock.Lock()
+	defer mt.ddLock.Unlock()
+
+	collectionID := result.Message.Header().CollectionId
+	coll, ok := mt.collID2Meta[collectionID]
+	if !ok {
+		return errAlterCollectionNotFound
+	}
+
+	oldColl := coll.Clone()
+
+	// remmove the truncating key from the properties and update the last truncate time tick of the shard infos
+	newColl := coll.Clone()
+	newProperties := common.CloneKeyValuePairs(coll.Properties).ToMap()
+	delete(newProperties, common.CollectionOnTruncatingKey)
+	newColl.Properties = common.NewKeyValuePairs(newProperties)
+	for vchannel := range newColl.ShardInfos {
+		newColl.ShardInfos[vchannel].LastTruncateTimeTick = result.Results[vchannel].TimeTick
+	}
+	ctx1 := contextutil.WithTenantID(ctx, Params.CommonCfg.ClusterName.GetValue())
+	if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, newColl.UpdateTimestamp, false); err != nil {
+		return err
+	}
+	mt.collID2Meta[coll.CollectionID] = newColl
+	log.Ctx(ctx).Info("update collID2Meta for truncate collection",
+		zap.Int64("collectionID", coll.CollectionID),
+	)
 	return nil
 }
 
@@ -1292,7 +1445,8 @@ func (mt *MetaTable) AlterAlias(ctx context.Context, result message.BroadcastRes
 	log.Ctx(ctx).Info("alter alias",
 		zap.String("db", header.DbName),
 		zap.String("alias", header.Alias),
-		zap.String("collection", header.CollectionName),
+		zap.String("collectionName", header.CollectionName),
+		zap.Int64("collectionID", header.CollectionId),
 		zap.Uint64("ts", result.GetControlChannelResult().TimeTick),
 	)
 	return nil
@@ -1530,7 +1684,7 @@ func (mt *MetaTable) AlterCredential(ctx context.Context, result message.Broadca
 	}
 	// if the credential already exists and the version is not greater than the current timetick.
 	if existsCredential != nil && existsCredential.TimeTick >= result.GetControlChannelResult().TimeTick {
-		log.Info("credential already exists and the version is not greater than the current timetick",
+		log.Ctx(ctx).Info("credential already exists and the version is not greater than the current timetick",
 			zap.String("username", body.CredentialInfo.Username),
 			zap.Uint64("incoming", result.GetControlChannelResult().TimeTick),
 			zap.Uint64("current", existsCredential.TimeTick),
@@ -1582,7 +1736,7 @@ func (mt *MetaTable) DeleteCredential(ctx context.Context, result message.Broadc
 	}
 	// if the credential already exists and the version is not greater than the current timetick.
 	if existsCredential != nil && existsCredential.TimeTick >= result.GetControlChannelResult().TimeTick {
-		log.Info("credential already exists and the version is not greater than the current timetick",
+		log.Ctx(ctx).Info("credential already exists and the version is not greater than the current timetick",
 			zap.String("username", result.Message.Header().UserName),
 			zap.Uint64("incoming", result.GetControlChannelResult().TimeTick),
 			zap.Uint64("current", existsCredential.TimeTick),
@@ -2106,4 +2260,56 @@ func (mt *MetaTable) GetPrivilegeGroupRoles(ctx context.Context, groupName strin
 		}
 	}
 	return lo.Keys(rolesMap), nil
+}
+
+func (mt *MetaTable) AddFileResource(ctx context.Context, resource *internalpb.FileResourceInfo) error {
+	mt.ddLock.Lock()
+	defer mt.ddLock.Unlock()
+
+	if old, ok := mt.fileResourceName2Meta[resource.Name]; ok {
+		if old.Path == resource.Path {
+			return nil
+		}
+		return errors.Newf("file resource %s already exists", resource.Name)
+	}
+
+	err := mt.catalog.SaveFileResource(ctx, resource, mt.fileResourceVersion+1)
+	if err != nil {
+		return err
+	}
+
+	mt.fileResourceName2Meta[resource.Name] = resource
+	mt.fileResourceID2Meta[resource.Id] = resource
+	mt.fileResourceVersion++
+	return nil
+}
+
+func (mt *MetaTable) RemoveFileResource(ctx context.Context, name string) (error, bool) {
+	mt.ddLock.Lock()
+	defer mt.ddLock.Unlock()
+
+	if resource, ok := mt.fileResourceName2Meta[name]; ok {
+		if mt.fileResourceRefCnt[resource.Id] > 0 {
+			return errors.Newf("file resource %s is still in use: %d", resource.Name, mt.fileResourceRefCnt[resource.Id]), false
+		}
+
+		err := mt.catalog.RemoveFileResource(ctx, resource.Id, mt.fileResourceVersion+1)
+		if err != nil {
+			return err, false
+		}
+
+		delete(mt.fileResourceName2Meta, resource.Name)
+		delete(mt.fileResourceID2Meta, resource.Id)
+		delete(mt.fileResourceRefCnt, resource.Id)
+		mt.fileResourceVersion++
+		return nil, true
+	}
+	return nil, false
+}
+
+func (mt *MetaTable) ListFileResource(ctx context.Context) ([]*internalpb.FileResourceInfo, uint64) {
+	mt.ddLock.RLock()
+	defer mt.ddLock.RUnlock()
+
+	return lo.Values(mt.fileResourceID2Meta), mt.fileResourceVersion
 }

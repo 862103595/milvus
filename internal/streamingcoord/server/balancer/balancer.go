@@ -32,8 +32,11 @@ type Balancer interface {
 	// GetLatestChannelAssignment returns the latest channel assignment.
 	GetLatestChannelAssignment() (*WatchChannelAssignmentsCallbackParam, error)
 
-	// GetAllStreamingNodes fetches all streaming node info.
+	// GetAllStreamingNodes fetches all streaming node info (including frozen nodes).
 	GetAllStreamingNodes(ctx context.Context) (map[int64]*types.StreamingNodeInfo, error)
+
+	// GetAvailableStreamingNodes fetches streaming node info excluding frozen nodes.
+	GetAvailableStreamingNodes(ctx context.Context) (map[int64]*types.StreamingNodeInfo, error)
 
 	// AllocVirtualChannels allocates virtual channels for a collection.
 	AllocVirtualChannels(ctx context.Context, param AllocVChannelParam) ([]string, error)
@@ -72,6 +75,13 @@ type Balancer interface {
 	// Trigger is a hint to trigger a balance.
 	Trigger(ctx context.Context) error
 
+	// SetFileResourceChecker sets the file resource checker.
+	SetFileResourceChecker(checker FileResourceChecker)
+
 	// Close close the balancer.
 	Close()
+}
+
+type FileResourceChecker interface {
+	CheckNodeSynced(nodeID int64) bool
 }

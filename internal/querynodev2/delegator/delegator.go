@@ -34,7 +34,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
@@ -42,7 +41,6 @@ import (
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator/deletebuffer"
-	"github.com/milvus-io/milvus/internal/querynodev2/pkoracle"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/function"
@@ -99,14 +97,17 @@ type ShardDelegator interface {
 	TryCleanExcludedSegments(ts uint64)
 
 	// tsafe
+	GetLatestRequiredMVCCTimeTick() uint64
 	UpdateTSafe(ts uint64)
 	GetTSafe() uint64
 
 	// analyzer
 	RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerRequest) ([]*milvuspb.AnalyzerResult, error)
+	GetHighlight(ctx context.Context, req *querypb.GetHighlightRequest) ([]*querypb.HighlightResult, error)
 
 	// control
 	Serviceable() bool
+	CatchingUpStreamingData() bool
 	Start()
 	Close()
 }
@@ -131,7 +132,6 @@ type shardDelegator struct {
 	idfOracle    IDFOracle
 
 	segmentManager segments.SegmentManager
-	pkOracle       pkoracle.PkOracle
 	// stream delete buffer
 	deleteMut    sync.RWMutex
 	deleteBuffer deletebuffer.DeleteBuffer[*deletebuffer.Item]
@@ -146,14 +146,16 @@ type shardDelegator struct {
 	chunkManager   storage.ChunkManager
 
 	excludedSegments *ExcludedSegments
-	// cause growing segment meta has been stored in segmentManager/distribution/pkOracle/excludeSegments
+	// cause growing segment meta has been stored in segmentManager/distribution/excludeSegments
 	// in order to make add/remove growing be atomic, need lock before modify these meta info
 	growingSegmentLock sync.RWMutex
 	partitionStatsMut  sync.RWMutex
 
 	// outputFieldId -> functionRunner map for search function field
 	functionRunners map[UniqueID]function.FunctionRunner
-	isBM25Field     map[UniqueID]bool
+
+	// outputFieldId -> function type map
+	functionFieldType map[UniqueID]schemapb.FunctionType
 
 	// analyzerFieldID -> analyzerRunner map for run analyzer.
 	analyzerRunners map[UniqueID]function.Analyzer
@@ -164,6 +166,13 @@ type shardDelegator struct {
 	// schema version
 	schemaChangeMutex sync.RWMutex
 	schemaVersion     uint64
+
+	// streaming data catch-up state
+	catchingUpStreamingData *atomic.Bool
+
+	// latest required mvcc timestamp for the delegator
+	// for slow down the delegator consumption and reduce the timetick dispatch frequency.
+	latestRequiredMVCCTimeTick *atomic.Uint64
 }
 
 // getLogger returns the zap logger with pre-defined shard attributes.
@@ -220,10 +229,6 @@ func (sd *shardDelegator) GetSegmentInfo(readable bool) ([]SnapshotItem, []Segme
 
 // SyncDistribution revises distribution.
 func (sd *shardDelegator) SyncDistribution(ctx context.Context, entries ...SegmentEntry) {
-	log := sd.getLogger(ctx)
-
-	log.Info("sync distribution", zap.Any("entries", entries))
-
 	sd.distribution.AddDistributions(entries...)
 }
 
@@ -292,13 +297,46 @@ func (sd *shardDelegator) modifySearchRequest(req *querypb.SearchRequest, scope 
 	return nodeReq
 }
 
+func (sd *shardDelegator) shallowCopyRetrieveRequest(req *internalpb.RetrieveRequest, targetID int64) *internalpb.RetrieveRequest {
+	// Create a new RetrieveRequest with the same fields
+	// Base must be a new object since each copy needs different TargetID
+	// Slices are shallow copied (same underlying array) since they are read-only after copy
+	return &internalpb.RetrieveRequest{
+		Base:                         &commonpb.MsgBase{TargetID: targetID},
+		ReqID:                        req.ReqID,
+		DbID:                         req.DbID,
+		CollectionID:                 req.CollectionID,
+		PartitionIDs:                 req.PartitionIDs,       // Shallow copy: Same underlying slice
+		SerializedExprPlan:           req.SerializedExprPlan, // Shallow copy: Same underlying byte slice
+		OutputFieldsId:               req.OutputFieldsId,     // Shallow copy: Same underlying slice
+		MvccTimestamp:                req.MvccTimestamp,
+		GuaranteeTimestamp:           req.GuaranteeTimestamp,
+		TimeoutTimestamp:             req.TimeoutTimestamp,
+		Limit:                        req.Limit,
+		IgnoreGrowing:                req.IgnoreGrowing,
+		IsCount:                      req.IsCount,
+		IterationExtensionReduceRate: req.IterationExtensionReduceRate,
+		Username:                     req.Username,
+		ReduceStopForBest:            req.ReduceStopForBest,
+		ReduceType:                   req.ReduceType,
+		ConsistencyLevel:             req.ConsistencyLevel,
+		IsIterator:                   req.IsIterator,
+		CollectionTtlTimestamps:      req.CollectionTtlTimestamps,
+		GroupByFieldIds:              req.GroupByFieldIds, // Shallow copy: Same underlying slice
+		Aggregates:                   req.Aggregates,      // Shallow copy: Same underlying slice of pointers
+		EntityTtlPhysicalTime:        req.EntityTtlPhysicalTime,
+		OrderByFields:                req.OrderByFields, // Shallow copy: Same underlying slice of pointers
+	}
+}
+
 func (sd *shardDelegator) modifyQueryRequest(req *querypb.QueryRequest, scope querypb.DataScope, segmentIDs []int64, targetID int64) *querypb.QueryRequest {
-	nodeReq := proto.Clone(req).(*querypb.QueryRequest)
-	nodeReq.Scope = scope
-	nodeReq.Req.Base.TargetID = targetID
-	nodeReq.SegmentIDs = segmentIDs
-	nodeReq.DmlChannels = []string{sd.vchannelName}
-	return nodeReq
+	return &querypb.QueryRequest{
+		Req:             sd.shallowCopyRetrieveRequest(req.GetReq(), targetID),
+		DmlChannels:     []string{sd.vchannelName},
+		SegmentIDs:      segmentIDs,
+		FromShardLeader: req.FromShardLeader,
+		Scope:           scope,
+	}
 }
 
 // Search preforms search operation on shard.
@@ -317,9 +355,7 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 		}()
 	}
 
-	searchAgainstBM25Field := sd.isBM25Field[req.GetReq().GetFieldId()]
-
-	if searchAgainstBM25Field {
+	if sd.functionFieldType[req.GetReq().GetFieldId()] == schemapb.FunctionType_BM25 {
 		if req.GetReq().GetMetricType() != metric.BM25 && req.GetReq().GetMetricType() != metric.EMPTY {
 			return nil, merr.WrapErrParameterInvalid("BM25", req.GetReq().GetMetricType(), "must use BM25 metric type when searching against BM25 Function output field")
 		}
@@ -332,6 +368,14 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 		if avgdl <= 0 {
 			log.Warn("search bm25 from empty data, skip search", zap.String("channel", sd.vchannelName), zap.Float64("avgdl", avgdl))
 			return []*internalpb.SearchResults{}, nil
+		}
+	} else if sd.functionFieldType[req.GetReq().GetFieldId()] == schemapb.FunctionType_MinHash {
+		if req.GetReq().GetMetricType() != metric.MHJACCARD && req.GetReq().GetMetricType() != metric.EMPTY {
+			return nil, merr.WrapErrParameterInvalid("MHJACCARD", req.GetReq().GetMetricType(), "must use MHJACCARD metric type when searching against MinHash Function output field")
+		}
+		err := sd.parseMinHash(req.GetReq())
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -400,23 +444,24 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 	var err error
 	if partialResultRequiredDataRatio >= 1.0 {
 		tSafe, err = sd.waitTSafe(ctx, req.Req.GuaranteeTimestamp)
-		if err != nil {
-			log.Warn("delegator search failed to wait tsafe", zap.Error(err))
-			return nil, err
-		}
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = tSafe
-		}
 	} else {
+		// partial search enabled, could ignore streaming data
 		tSafe = sd.GetTSafe()
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = tSafe
-		}
 	}
 
 	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
-		fmt.Sprint(paramtable.GetNodeID()), metrics.SearchLabel).
+		paramtable.GetStringNodeID(), metrics.SearchLabel).
 		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
+
+	if err != nil {
+		log.Warn("delegator search failed to wait tsafe", zap.Error(err))
+		return nil, err
+	}
+
+	// use tsafe as mvcc timestamp if request not provide it
+	if req.GetReq().GetMvccTimestamp() == 0 {
+		req.Req.MvccTimestamp = tSafe
+	}
 
 	sealed, growing, sealedRowCount, version, err := sd.distribution.PinReadableSegments(partialResultRequiredDataRatio, req.GetReq().GetPartitionIDs()...)
 	if err != nil {
@@ -499,7 +544,13 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 		}
 		return results, nil
 	}
-	return sd.search(ctx, req, sealed, growing, sealedRowCount)
+
+	results, err := sd.search(ctx, req, sealed, growing, sealedRowCount)
+	if err != nil {
+		log.Warn("delegator common search failed", zap.Error(err))
+		return nil, err
+	}
+	return results, nil
 }
 
 func (sd *shardDelegator) QueryStream(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error {
@@ -526,16 +577,18 @@ func (sd *shardDelegator) QueryStream(ctx context.Context, req *querypb.QueryReq
 	// wait tsafe
 	waitTr := timerecord.NewTimeRecorder("wait tSafe")
 	tSafe, err := sd.waitTSafe(ctx, req.Req.GetGuaranteeTimestamp())
+	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
+		paramtable.GetStringNodeID(), metrics.QueryLabel).
+		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
 	if err != nil {
 		log.Warn("delegator query failed to wait tsafe", zap.Error(err))
 		return err
 	}
+
+	// use tsafe as mvcc timestamp if request not provide it
 	if req.GetReq().GetMvccTimestamp() == 0 {
 		req.Req.MvccTimestamp = tSafe
 	}
-	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
-		fmt.Sprint(paramtable.GetNodeID()), metrics.QueryLabel).
-		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
 
 	sealed, growing, sealedRowCount, version, err := sd.distribution.PinReadableSegments(float64(1.0), req.GetReq().GetPartitionIDs()...)
 	if err != nil {
@@ -606,22 +659,24 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 	var err error
 	if partialResultRequiredDataRatio >= 1.0 {
 		tSafe, err = sd.waitTSafe(ctx, req.Req.GuaranteeTimestamp)
-		if err != nil {
-			log.Warn("delegator search failed to wait tsafe", zap.Error(err))
-			return nil, err
-		}
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = tSafe
-		}
 	} else {
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = sd.GetTSafe()
-		}
+		// partial search enabled, could ignore streaming data
+		tSafe = sd.GetTSafe()
 	}
 
 	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
-		fmt.Sprint(paramtable.GetNodeID()), metrics.QueryLabel).
+		paramtable.GetStringNodeID(), metrics.QueryLabel).
 		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
+
+	if err != nil {
+		log.Warn("delegator search failed to wait tsafe", zap.Error(err))
+		return nil, err
+	}
+
+	// use tsafe as mvcc timestamp if request not provide it
+	if req.GetReq().GetMvccTimestamp() == 0 {
+		req.Req.MvccTimestamp = tSafe
+	}
 
 	sealed, growing, sealedRowCount, version, err := sd.distribution.PinReadableSegments(partialResultRequiredDataRatio, req.GetReq().GetPartitionIDs()...)
 	if err != nil {
@@ -704,6 +759,7 @@ func (sd *shardDelegator) GetStatistics(ctx context.Context, req *querypb.GetSta
 	}
 
 	// wait tsafe
+	sd.updateLatestRequiredMVCCTimestamp(req.Req.GuaranteeTimestamp)
 	_, err := sd.waitTSafe(ctx, req.Req.GuaranteeTimestamp)
 	if err != nil {
 		log.Warn("delegator GetStatistics failed to wait tsafe", zap.Error(err))
@@ -718,12 +774,23 @@ func (sd *shardDelegator) GetStatistics(ctx context.Context, req *querypb.GetSta
 	defer sd.distribution.Unpin(version)
 
 	tasks, err := organizeSubTask(ctx, req, sealed, growing, sd, true, func(req *querypb.GetStatisticsRequest, scope querypb.DataScope, segmentIDs []int64, targetID int64) *querypb.GetStatisticsRequest {
-		nodeReq := proto.Clone(req).(*querypb.GetStatisticsRequest)
-		nodeReq.GetReq().GetBase().TargetID = targetID
-		nodeReq.Scope = scope
-		nodeReq.SegmentIDs = segmentIDs
-		nodeReq.FromShardLeader = true
-		return nodeReq
+		// Shallow copy inner request with new Base (each copy needs different TargetID)
+		innerReq := req.GetReq()
+		return &querypb.GetStatisticsRequest{
+			Req: &internalpb.GetStatisticsRequest{
+				Base:               &commonpb.MsgBase{TargetID: targetID},
+				DbID:               innerReq.GetDbID(),
+				CollectionID:       innerReq.GetCollectionID(),
+				PartitionIDs:       innerReq.GetPartitionIDs(), // Shallow copy: Same underlying slice
+				TravelTimestamp:    innerReq.GetTravelTimestamp(),
+				GuaranteeTimestamp: innerReq.GetGuaranteeTimestamp(),
+				TimeoutTimestamp:   innerReq.GetTimeoutTimestamp(),
+			},
+			DmlChannels:     req.GetDmlChannels(), // Shallow copy: Same underlying slice
+			SegmentIDs:      segmentIDs,
+			FromShardLeader: true,
+			Scope:           scope,
+		}
 	})
 	if err != nil {
 		log.Warn("Get statistics organizeSubTask failed", zap.Error(err))
@@ -925,6 +992,12 @@ func (sd *shardDelegator) speedupGuranteeTS(
 	mvccTS uint64,
 	isIterator bool,
 ) uint64 {
+	// because the mvcc speed up will make the guarantee timestamp smaller.
+	// and the update latest required mvcc timestamp and mvcc speed up are executed concurrently.
+	// so we update the latest required mvcc timestamp first, then the mvcc speed up will not affect the latest required mvcc timestamp.
+	// to make the new incoming mvcc can be seen by the timetick_slowdowner.
+	sd.updateLatestRequiredMVCCTimestamp(guaranteeTS)
+
 	// when 1. streaming service is disable,
 	// 2. consistency level is not strong,
 	// 3. cannot speed iterator, because current client of milvus doesn't support shard level mvcc.
@@ -943,6 +1016,7 @@ func (sd *shardDelegator) waitTSafe(ctx context.Context, ts uint64) (uint64, err
 	ctx, sp := otel.Tracer(typeutil.QueryNodeRole).Start(ctx, "Delegator-waitTSafe")
 	defer sp.End()
 	log := sd.getLogger(ctx)
+
 	// already safe to search
 	latestTSafe := sd.latestTsafe.Load()
 	if latestTSafe >= ts {
@@ -997,18 +1071,72 @@ func (sd *shardDelegator) waitTSafe(ctx context.Context, ts uint64) (uint64, err
 	}
 }
 
+// GetLatestRequiredMVCCTimeTick returns the latest required mvcc timestamp for the delegator.
+func (sd *shardDelegator) GetLatestRequiredMVCCTimeTick() uint64 {
+	if sd.catchingUpStreamingData.Load() {
+		// delegator need to catch up the streaming data when startup,
+		// If the empty timetick is filtered, the load operation will be blocked.
+		// We want the delegator to catch up the streaming data, and load done as soon as possible,
+		// so we always return the current time as the latest required mvcc timestamp.
+		return tsoutil.GetCurrentTime()
+	}
+	return sd.latestRequiredMVCCTimeTick.Load()
+}
+
+// updateLatestRequiredMVCCTimestamp updates the latest required mvcc timestamp for the delegator.
+func (sd *shardDelegator) updateLatestRequiredMVCCTimestamp(ts uint64) {
+	for {
+		previousTs := sd.latestRequiredMVCCTimeTick.Load()
+		if ts <= previousTs {
+			return
+		}
+		if sd.latestRequiredMVCCTimeTick.CompareAndSwap(previousTs, ts) {
+			return
+		}
+	}
+}
+
 // updateTSafe read current tsafe value from tsafeManager.
 func (sd *shardDelegator) UpdateTSafe(tsafe uint64) {
+	log := sd.getLogger(context.Background()).WithRateGroup(fmt.Sprintf("UpdateTSafe-%s", sd.vchannelName), 1, 60)
 	sd.tsCond.L.Lock()
+	log.RatedInfo(10, "update tsafe",
+		zap.Int64("collectionID", sd.collectionID),
+		zap.String("vchannel", sd.vchannelName),
+		zap.Time("tsafe", tsoutil.PhysicalTime(tsafe)),
+		zap.Time("latestTSafe", tsoutil.PhysicalTime(sd.latestTsafe.Load())))
 	if tsafe > sd.latestTsafe.Load() {
 		sd.latestTsafe.Store(tsafe)
 		sd.tsCond.Broadcast()
+
+		// Check if caught up with streaming data
+		if sd.catchingUpStreamingData.Load() {
+			lagThreshold := paramtable.Get().QueryNodeCfg.CatchUpStreamingDataTsLag.GetAsDurationByParse()
+			if lagThreshold > 0 {
+				tsafeTime := tsoutil.PhysicalTime(tsafe)
+				lag := time.Since(tsafeTime)
+				caughtUp := lag <= lagThreshold
+				log.RatedInfo(10, "delegator catching up streaming data progress",
+					zap.String("channel", sd.vchannelName),
+					zap.Duration("lag", lag),
+					zap.Duration("threshold", lagThreshold),
+					zap.Bool("caughtUp", caughtUp))
+				if caughtUp {
+					sd.catchingUpStreamingData.Store(false)
+				}
+			}
+		}
 	}
 	sd.tsCond.L.Unlock()
 }
 
 func (sd *shardDelegator) GetTSafe() uint64 {
 	return sd.latestTsafe.Load()
+}
+
+// CatchingUpStreamingData returns true if delegator is still catching up with streaming data.
+func (sd *shardDelegator) CatchingUpStreamingData() bool {
+	return sd.catchingUpStreamingData.Load()
 }
 
 func (sd *shardDelegator) UpdateSchema(ctx context.Context, schema *schemapb.CollectionSchema, schVersion uint64) error {
@@ -1078,6 +1206,9 @@ func (sd *shardDelegator) Close() {
 	sd.tsCond.Broadcast()
 	sd.lifetime.Wait()
 
+	// Refund all sealed segment candidates in distribution
+	sd.distribution.RefundAllCandidates()
+
 	// clean idf oracle
 	if sd.idfOracle != nil {
 		sd.idfOracle.Close()
@@ -1094,8 +1225,8 @@ func (sd *shardDelegator) Close() {
 	sd.deleteBuffer.Clear()
 	log.Info("unregister all l0 segments", zap.Duration("cost", time.Since(start)))
 
-	metrics.QueryNodeDeleteBufferSize.DeleteLabelValues(fmt.Sprint(paramtable.GetNodeID()), sd.vchannelName)
-	metrics.QueryNodeDeleteBufferRowNum.DeleteLabelValues(fmt.Sprint(paramtable.GetNodeID()), sd.vchannelName)
+	metrics.QueryNodeDeleteBufferSize.DeleteLabelValues(paramtable.GetStringNodeID(), sd.vchannelName)
+	metrics.QueryNodeDeleteBufferRowNum.DeleteLabelValues(paramtable.GetStringNodeID(), sd.vchannelName)
 }
 
 // As partition stats is an optimization for search/query which is not mandatory for milvus instance,
@@ -1181,20 +1312,22 @@ func NewShardDelegator(ctx context.Context, collectionID UniqueID, replicaID Uni
 		lifetime:       lifetime.NewLifetime(lifetime.Initializing),
 		distribution:   NewDistribution(channel, queryView),
 		deleteBuffer: deletebuffer.NewListDeleteBuffer[*deletebuffer.Item](startTs, sizePerBlock,
-			[]string{fmt.Sprint(paramtable.GetNodeID()), channel}),
-		pkOracle:         pkoracle.NewPkOracle(),
-		latestTsafe:      atomic.NewUint64(startTs),
-		loader:           loader,
-		queryHook:        queryHook,
-		chunkManager:     chunkManager,
-		partitionStats:   make(map[UniqueID]*storage.PartitionStatsSnapshot),
-		excludedSegments: excludedSegments,
-		functionRunners:  make(map[int64]function.FunctionRunner),
-		analyzerRunners:  make(map[UniqueID]function.Analyzer),
-		isBM25Field:      make(map[int64]bool),
-		l0ForwardPolicy:  policy,
+			[]string{paramtable.GetStringNodeID(), channel}),
+		latestTsafe:                atomic.NewUint64(startTs),
+		loader:                     loader,
+		queryHook:                  queryHook,
+		chunkManager:               chunkManager,
+		partitionStats:             make(map[UniqueID]*storage.PartitionStatsSnapshot),
+		excludedSegments:           excludedSegments,
+		functionRunners:            make(map[int64]function.FunctionRunner),
+		analyzerRunners:            make(map[UniqueID]function.Analyzer),
+		functionFieldType:          make(map[int64]schemapb.FunctionType),
+		l0ForwardPolicy:            policy,
+		catchingUpStreamingData:    atomic.NewBool(true),
+		latestRequiredMVCCTimeTick: atomic.NewUint64(0),
 	}
 
+	hasBM25Field := false
 	for _, tf := range collection.Schema().GetFunctions() {
 		if tf.GetType() == schemapb.FunctionType_BM25 {
 			functionRunner, err := function.NewFunctionRunner(collection.Schema(), tf)
@@ -1205,12 +1338,31 @@ func NewShardDelegator(ctx context.Context, collectionID UniqueID, replicaID Uni
 			// bm25 input field could use same runner between function and analyzer.
 			sd.analyzerRunners[tf.InputFieldIds[0]] = functionRunner.(function.Analyzer)
 			if tf.GetType() == schemapb.FunctionType_BM25 {
-				sd.isBM25Field[tf.OutputFieldIds[0]] = true
+				sd.functionFieldType[tf.OutputFieldIds[0]] = schemapb.FunctionType_BM25
 			}
+			hasBM25Field = true
+		} else if tf.GetType() == schemapb.FunctionType_MinHash {
+			functionRunner, err := function.NewFunctionRunner(collection.Schema(), tf)
+			if err != nil {
+				return nil, err
+			}
+			sd.functionRunners[tf.OutputFieldIds[0]] = functionRunner
+			sd.functionFieldType[tf.OutputFieldIds[0]] = schemapb.FunctionType_MinHash
 		}
 	}
 
-	if len(sd.isBM25Field) > 0 {
+	for _, field := range collection.Schema().GetFields() {
+		helper := typeutil.CreateFieldSchemaHelper(field)
+		if helper.EnableAnalyzer() && sd.analyzerRunners[field.GetFieldID()] == nil {
+			analyzerRunner, err := function.NewAnalyzerRunner(field)
+			if err != nil {
+				return nil, err
+			}
+			sd.analyzerRunners[field.GetFieldID()] = analyzerRunner
+		}
+	}
+
+	if hasBM25Field {
 		sd.idfOracle = NewIDFOracle(sd.vchannelName, collection.Schema().GetFunctions())
 		sd.distribution.SetIDFOracle(sd.idfOracle)
 		sd.idfOracle.Start()
@@ -1225,7 +1377,7 @@ func NewShardDelegator(ctx context.Context, collectionID UniqueID, replicaID Uni
 func (sd *shardDelegator) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerRequest) ([]*milvuspb.AnalyzerResult, error) {
 	analyzer, ok := sd.analyzerRunners[req.GetFieldId()]
 	if !ok {
-		return nil, fmt.Errorf("analyzer runner for field %d not exist, now only support run analyzer by field if field was bm25 input field", req.GetFieldId())
+		return nil, fmt.Errorf("analyzer runner for field %d not exist, now only support run analyzer by field if field was bm25/minhash input field", req.GetFieldId())
 	}
 
 	var result [][]*milvuspb.AnalyzerToken

@@ -14,24 +14,59 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <boost/uuid/random_generator.hpp>
-#include <boost/uuid/uuid_io.hpp>
-
 #include <nlohmann/json.hpp>
+#include <string.h>
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <initializer_list>
+#include <iosfwd>
+#include <unordered_set>
+#include <variant>
+
+#include "NamedType/named_type_impl.hpp"
+#include "NamedType/underlying_functionalities.hpp"
+#include "arrow/api.h"
+#include "boost/filesystem/operations.hpp"
+#include "bsoncxx/builder/basic/document.hpp"
+#include "bsoncxx/document/value.hpp"
+#include "bsoncxx/document/view.hpp"
+#include "cachinglayer/Manager.h"
+#include "cachinglayer/Translator.h"
+#include "common/Consts.h"
+#include "common/FieldDataInterface.h"
+#include "common/FieldMeta.h"
+#include "common/GroupChunk.h"
+#include "common/Json.h"
+#include "common/Tracer.h"
+#include "common/jsmn.h"
+#include "fmt/core.h"
+#include "index/Utils.h"
 #include "index/json_stats/JsonKeyStats.h"
 #include "index/json_stats/bson_builder.h"
-#include "index/InvertedIndexUtil.h"
-#include "index/Utils.h"
-#include "milvus-storage/filesystem/fs.h"
-#include "storage/MmapManager.h"
-#include "storage/Util.h"
-#include "common/bson_view.h"
-#include "mmap/ChunkedColumnGroup.h"
-#include "milvus-storage/format/parquet/file_reader.h"
+#include "index/json_stats/parquet_writer.h"
+#include "milvus-storage/common/config.h"
 #include "milvus-storage/common/constants.h"
-#include "segcore/storagev1translator/ChunkTranslator.h"
-#include "segcore/storagev1translator/DefaultValueChunkTranslator.h"
+#include "milvus-storage/common/metadata.h"
+#include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/format/parquet/file_reader.h"
+#include "mmap/ChunkedColumnGroup.h"
+#include "mmap/Types.h"
+#include "nlohmann/detail/iterators/iteration_proxy.hpp"
+#include "nlohmann/json_fwd.hpp"
+#include "parquet/metadata.h"
+#include "segcore/storagev1translator/BsonInvertedIndexTranslator.h"
 #include "segcore/storagev2translator/GroupChunkTranslator.h"
+#include "storage/DiskFileManagerImpl.h"
+#include "storage/FileManager.h"
+#include "storage/LocalChunkManager.h"
+#include "storage/LocalChunkManagerSingleton.h"
+#include "storage/MemFileManagerImpl.h"
+#include "storage/MmapManager.h"
+#include "storage/ThreadPools.h"
+#include "storage/Types.h"
+#include "storage/Util.h"
 
 namespace milvus::index {
 
@@ -65,8 +100,9 @@ JsonKeyStats::JsonKeyStats(const storage::FileManagerContext& ctx,
     if (is_load) {
         auto prefix = disk_file_manager_->GetLocalJsonStatsPrefix();
         path_ = prefix;
-        bson_inverted_index_ = std::make_shared<BsonInvertedIndex>(
-            path_, field_id_, true, ctx, tantivy_index_version);
+        LOG_INFO("load json key stats from local path: {} for segment {}",
+                 path_,
+                 segment_id_);
     } else {
         auto prefix = disk_file_manager_->GetLocalTempJsonStatsPrefix();
         path_ = prefix;
@@ -95,17 +131,16 @@ JsonKeyStats::JsonKeyStats(const storage::FileManagerContext& ctx,
                  shared_key_index_path,
                  segment_id_);
         boost::filesystem::create_directories(shared_key_index_path);
-        bson_inverted_index_ =
-            std::make_shared<BsonInvertedIndex>(shared_key_index_path,
-                                                field_id_,
-                                                false,
-                                                ctx,
-                                                tantivy_index_version);
+        bson_inverted_index_ = std::make_shared<BsonInvertedIndex>(
+            shared_key_index_path, field_id_, ctx, tantivy_index_version);
     }
 }
 
 JsonKeyStats::~JsonKeyStats() {
+    bson_inverted_index_.reset();
+    bson_index_cache_slot_.reset();
     boost::filesystem::remove_all(path_);
+    LOG_INFO("remove json key stats with path: {}", path_);
 }
 
 void
@@ -624,6 +659,64 @@ JsonKeyStats::GetSharedKeyIndexDir() {
     return shared_key_index_path.string();
 }
 
+std::string
+JsonKeyStats::GetMetaFilePath() {
+    std::filesystem::path json_stats_dir = path_;
+    std::filesystem::path meta_file_path =
+        json_stats_dir / JSON_STATS_META_FILE_NAME;
+    return meta_file_path.string();
+}
+
+void
+JsonKeyStats::WriteMetaFile() {
+    json_stats_meta_.SetLayoutTypeMap(key_types_);
+    json_stats_meta_.SetInt64(META_KEY_NUM_ROWS, num_rows_);
+    json_stats_meta_.SetInt64(META_KEY_NUM_SHREDDING_COLUMNS,
+                              column_keys_.size());
+
+    auto meta_content = json_stats_meta_.Serialize();
+    auto meta_file_path = GetMetaFilePath();
+
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+    local_chunk_manager->Write(
+        meta_file_path, meta_content.data(), meta_content.size());
+
+    meta_file_size_ = meta_content.size();
+    LOG_INFO("write meta file: {} with size {} for segment {} for field {}",
+             meta_file_path,
+             meta_file_size_,
+             segment_id_,
+             field_id_);
+}
+
+void
+JsonKeyStats::LoadMetaFile(const std::string& local_meta_file_path) {
+    LOG_INFO("load meta file: {} for segment {} for field {}",
+             local_meta_file_path,
+             segment_id_,
+             field_id_);
+
+    auto local_chunk_manager =
+        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+
+    auto file_size = local_chunk_manager->Size(local_meta_file_path);
+    std::string meta_content;
+    meta_content.resize(file_size);
+    local_chunk_manager->Read(
+        local_meta_file_path, meta_content.data(), file_size);
+
+    key_field_map_ = JsonStatsMeta::DeserializeToKeyFieldMap(meta_content);
+
+    LOG_INFO(
+        "loaded meta file with {} key field entries for segment {} for field "
+        "{}",
+        key_field_map_.size(),
+        segment_id_,
+        field_id_);
+}
+
 BinarySet
 JsonKeyStats::Serialize(const Config& config) {
     return BinarySet();
@@ -697,7 +790,7 @@ JsonKeyStats::BuildWithFieldData(const std::vector<FieldDataPtr>& field_datas,
 
     // for storage v2, we need to add bucket name to remote prefix
     auto remote_prefix =
-        AddBucketName(disk_file_manager_->GetRemoteJsonStatsShreddingPrefix());
+        disk_file_manager_->GetRemoteJsonStatsShreddingPrefix();
     LOG_INFO(
         "init parquet writer with shredding remote prefix: {} for segment {}",
         remote_prefix,
@@ -709,6 +802,9 @@ JsonKeyStats::BuildWithFieldData(const std::vector<FieldDataPtr>& field_datas,
     BuildKeyStats(field_datas, nullable);
     parquet_writer_->Close();
     bson_inverted_index_->BuildIndex();
+
+    // write meta file with layout type map and other metadata
+    WriteMetaFile();
 }
 
 void
@@ -716,13 +812,15 @@ JsonKeyStats::GetColumnSchemaFromParquet(int64_t column_group_id,
                                          const std::string& file) {
     auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                   .GetArrowFileSystem();
-    auto file_reader =
-        std::make_shared<milvus_storage::FileRowGroupReader>(fs, file);
+    auto result = milvus_storage::FileRowGroupReader::Make(fs, file);
+    AssertInfo(result.ok(),
+               "[StorageV2] Failed to create file row group reader: " +
+                   result.status().ToString());
+    auto file_reader = result.ValueOrDie();
     std::shared_ptr<arrow::Schema> file_schema = file_reader->schema();
     LOG_DEBUG("get column schema: [{}] for segment {}",
               file_schema->ToString(true),
               segment_id_);
-    column_group_schemas_[column_group_id] = file_schema;
 
     for (const auto& field : file_schema->fields()) {
         auto field_name = field->name();
@@ -778,9 +876,11 @@ JsonKeyStats::GetCommonMetaFromParquet(const std::string& file) {
 
     auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                   .GetArrowFileSystem();
-    auto file_reader =
-        std::make_shared<milvus_storage::FileRowGroupReader>(fs, file);
-
+    auto result = milvus_storage::FileRowGroupReader::Make(fs, file);
+    AssertInfo(result.ok(),
+               "[StorageV2] Failed to create file row group reader: " +
+                   result.status().ToString());
+    auto file_reader = result.ValueOrDie();
     // get key value metadata from parquet file
     std::shared_ptr<milvus_storage::PackedFileMetadata> metadata =
         file_reader->file_metadata();
@@ -809,8 +909,12 @@ JsonKeyStats::GetCommonMetaFromParquet(const std::string& file) {
             try {
                 auto layout_type_json = nlohmann::json::parse(value);
                 for (const auto& [k, v] : layout_type_json.items()) {
-                    field_layout_type_map_[k] = JsonKeyLayoutTypeFromString(v);
-                    key_data_type_map_[k] = GetJsonTypeFromKeyName(k);
+                    auto layout_type = JsonKeyLayoutTypeFromString(v);
+                    // Only store metadata for shredding columns (TYPED/DYNAMIC),
+                    // skip SHARED keys to save memory
+                    if (layout_type == JsonKeyLayoutType::SHARED) {
+                        continue;
+                    }
                     key_field_map_[GetKeyFromColumnName(k)].insert(k);
                 }
             } catch (const std::exception& e) {
@@ -828,19 +932,28 @@ JsonKeyStats::GetCommonMetaFromParquet(const std::string& file) {
 
 void
 JsonKeyStats::LoadShreddingMeta(
-    std::vector<std::pair<int64_t, std::vector<int64_t>>> sorted_files) {
+    std::vector<std::pair<int64_t, std::vector<int64_t>>> sorted_files,
+    const std::string& override_prefix) {
     if (sorted_files.empty()) {
         return;
     }
 
-    auto remote_prefix =
-        AddBucketName(disk_file_manager_->GetRemoteJsonStatsShreddingPrefix());
+    AssertInfo(!override_prefix.empty(),
+               "shredding prefix is required for loading json stats");
+    const auto& remote_prefix = override_prefix;
 
-    // load common meta from parquet, all parquet files have the same meta
-    // just need to read one file
-    auto file = CreateColumnGroupParquetPath(
-        remote_prefix, sorted_files[0].first, sorted_files[0].second[0]);
-    GetCommonMetaFromParquet(file);
+    // load common meta from parquet only if key_field_map_ is not already populated
+    // (for backward compatibility with old data that doesn't have separate meta file)
+    if (key_field_map_.empty()) {
+        auto file = CreateColumnGroupParquetPath(
+            remote_prefix, sorted_files[0].first, sorted_files[0].second[0]);
+        GetCommonMetaFromParquet(file);
+    } else {
+        LOG_INFO(
+            "skip loading common meta from parquet, already loaded from meta "
+            "file for segment {}",
+            segment_id_);
+    }
 
     // load distinct meta from parquet, distinct meta is different for each parquet file
     // main purpose is to get column schema
@@ -853,14 +966,15 @@ JsonKeyStats::LoadShreddingMeta(
 
 void
 JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
-                              const std::vector<int64_t>& file_ids) {
+                              const std::vector<int64_t>& file_ids,
+                              const std::string& warmup_policy,
+                              const std::string& override_prefix) {
     if (file_ids.empty()) {
         return;
     }
     int64_t num_rows = 0;
 
-    auto remote_prefix =
-        AddBucketName(disk_file_manager_->GetRemoteJsonStatsShreddingPrefix());
+    const auto& remote_prefix = override_prefix;
 
     std::vector<std::string> files;
     for (const auto& file_id : file_ids) {
@@ -870,8 +984,11 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
 
     auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                   .GetArrowFileSystem();
-    auto file_reader =
-        std::make_shared<milvus_storage::FileRowGroupReader>(fs, files[0]);
+    auto result = milvus_storage::FileRowGroupReader::Make(fs, files[0]);
+    AssertInfo(result.ok(),
+               "[StorageV2] Failed to create file row group reader: " +
+                   result.status().ToString());
+    auto file_reader = result.ValueOrDie();
     std::shared_ptr<milvus_storage::PackedFileMetadata> metadata =
         file_reader->file_metadata();
     milvus_storage::FieldIDList field_id_list =
@@ -882,8 +999,11 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
     }
 
     for (const auto& file : files) {
-        auto reader =
-            std::make_shared<milvus_storage::FileRowGroupReader>(fs, file);
+        auto result = milvus_storage::FileRowGroupReader::Make(fs, file);
+        AssertInfo(result.ok(),
+                   "[StorageV2] Failed to create file row group reader: " +
+                       result.status().ToString());
+        auto reader = result.ValueOrDie();
         auto row_group_meta_vector =
             reader->file_metadata()->GetRowGroupMetadataVector();
         num_rows += row_group_meta_vector.row_num();
@@ -898,7 +1018,7 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
 
     auto enable_mmap = !mmap_filepath_.empty();
     auto column_group_info =
-        FieldDataInfo(column_group_id, num_rows, mmap_filepath_);
+        FieldDataInfo(column_group_id, field_id_, num_rows, mmap_filepath_);
     LOG_INFO(
         "loads column group {} with num_rows {} for segment "
         "{}",
@@ -920,15 +1040,20 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
                                              std::move(field_meta)));
     }
 
+    auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
+
     auto translator = std::make_unique<
         milvus::segcore::storagev2translator::GroupChunkTranslator>(
         segment_id_,
+        GroupChunkType::JSON_KEY_STATS,
         field_meta_map,
         column_group_info,
         files,
         enable_mmap,
+        mmap_config.GetMmapPopulate(),
         milvus_field_ids.size(),
-        load_priority_);
+        load_priority_,
+        warmup_policy);
 
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
@@ -953,24 +1078,74 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
 }
 
 void
-JsonKeyStats::LoadShreddingData(const std::vector<std::string>& index_files) {
+JsonKeyStats::LoadShreddingData(const std::vector<std::string>& index_files,
+                                const std::string& warmup_policy) {
     // sort files by column group id and file id
     auto sorted_files = SortByParquetPath(index_files);
 
+    // Extract the shredding prefix from the first file path.
+    // Files are absolute paths like: basePath/shredding_data/0/0
+    // The prefix is everything up to and including "shredding_data".
+    std::string shredding_prefix;
+    if (!index_files.empty()) {
+        auto pos = index_files[0].find(JSON_STATS_SHREDDING_DATA_PATH);
+        if (pos != std::string::npos) {
+            shredding_prefix = index_files[0].substr(
+                0, pos + strlen(JSON_STATS_SHREDDING_DATA_PATH));
+        }
+    }
+
     // load shredding meta
-    LoadShreddingMeta(sorted_files);
+    LoadShreddingMeta(sorted_files, shredding_prefix);
 
     // load shredding data
     for (const auto& [column_group_id, file_ids] : sorted_files) {
-        LoadColumnGroup(column_group_id, file_ids);
+        LoadColumnGroup(
+            column_group_id, file_ids, warmup_policy, shredding_prefix);
     }
 }
 
 void
+JsonKeyStats::LoadSharedKeyIndex(
+    const std::vector<std::string>& shared_key_index_files,
+    bool enable_mmap,
+    int64_t index_size,
+    const std::string& warmup_policy) {
+    // shared_key_index_files are absolute remote paths (basePath already prepended)
+    segcore::storagev1translator::BsonInvertedIndexLoadInfo load_info;
+    load_info.enable_mmap = enable_mmap;
+    load_info.segment_id = segment_id_;
+    load_info.field_id = field_id_;
+    load_info.index_files = shared_key_index_files;
+    load_info.index_size = index_size;
+    load_info.load_priority = load_priority_;
+    load_info.warmup_policy = warmup_policy;
+    std::unique_ptr<cachinglayer::Translator<index::BsonInvertedIndex>>
+        translator = std::make_unique<
+            segcore::storagev1translator::BsonInvertedIndexTranslator>(
+            load_info, disk_file_manager_);
+
+    bson_index_cache_slot_ =
+        cachinglayer::Manager::GetInstance().CreateCacheSlot(
+            std::move(translator));
+
+    LOG_INFO(
+        "loaded bson inverted index using translator for field:{} of "
+        "segment:{}, enable_mmap:{}",
+        field_id_,
+        segment_id_,
+        enable_mmap);
+}
+
+void
 JsonKeyStats::Load(milvus::tracer::TraceContext ctx, const Config& config) {
-    if (config.contains(MMAP_FILE_PATH)) {
-        mmap_filepath_ = GetValueFromConfig<std::string>(config, MMAP_FILE_PATH)
-                             .value_or("");
+    auto enable_mmap =
+        GetValueFromConfig<bool>(config, ENABLE_MMAP).value_or(false);
+    if (enable_mmap) {
+        mmap_filepath_ =
+            milvus::storage::LocalChunkManagerSingleton::GetInstance()
+                .GetChunkManager()
+                ->GetRootPath();
         LOG_INFO("load json stats for segment {} with mmap local file path: {}",
                  segment_id_,
                  mmap_filepath_);
@@ -978,22 +1153,37 @@ JsonKeyStats::Load(milvus::tracer::TraceContext ctx, const Config& config) {
     load_priority_ = config[milvus::LOAD_PRIORITY];
     LOG_INFO("load json stats for segment {} with load priority: {}",
              segment_id_,
-             load_priority_);
+             static_cast<int>(load_priority_));
 
     auto index_files =
         GetValueFromConfig<std::vector<std::string>>(config, "index_files");
     AssertInfo(index_files.has_value(),
                "index file paths is empty when load json stats for segment {}",
                segment_id_);
-    // split index_files into shared_key_index and shredding_data
+
+    auto base_path =
+        GetValueFromConfig<std::string>(config, STATS_BASE_PATH_KEY)
+            .value_or("");
+    AssertInfo(!base_path.empty(),
+               "stats_base_path is required for loading json stats, segment {}",
+               segment_id_);
+
+    // Split index_files into meta, shared_key_index, and shredding_data.
+    // Files are relative paths; prepend base_path to get absolute remote paths.
+    // Note: Check directory paths (shared_key_index, shredding_data) BEFORE meta.json,
+    // because shared_key_index/meta.json_0 contains "meta.json" but is not the meta file.
+    std::vector<std::string> meta_files;
     std::vector<std::string> shared_key_index_files;
     std::vector<std::string> shredding_data_files;
     for (const auto& file : index_files.value()) {
+        auto abs_path = base_path + "/" + file;
         if (file.find(JSON_STATS_SHARED_INDEX_PATH) != std::string::npos) {
-            shared_key_index_files.emplace_back(file);
+            shared_key_index_files.emplace_back(abs_path);
         } else if (file.find(JSON_STATS_SHREDDING_DATA_PATH) !=
                    std::string::npos) {
-            shredding_data_files.emplace_back(file);
+            shredding_data_files.emplace_back(abs_path);
+        } else if (file.find(JSON_STATS_META_FILE_NAME) != std::string::npos) {
+            meta_files.emplace_back(abs_path);
         } else {
             ThrowInfo(ErrorCode::UnexpectedError,
                       "unknown file path: {} for segment {}",
@@ -1002,11 +1192,31 @@ JsonKeyStats::Load(milvus::tracer::TraceContext ctx, const Config& config) {
         }
     }
 
-    // load shredding data
-    LoadShreddingData(shredding_data_files);
+    // load meta file first (contains layout type map)
+    if (!meta_files.empty()) {
+        AssertInfo(
+            meta_files.size() == 1,
+            "expected exactly one meta file, got {} for segment {}, field {}",
+            meta_files.size(),
+            segment_id_,
+            field_id_);
+        auto local_meta_file = disk_file_manager_->CacheJsonStatsMetaToDisk(
+            meta_files[0], load_priority_);
+        LoadMetaFile(local_meta_file);
+    }
 
-    // load shared key index
-    bson_inverted_index_->LoadIndex(shared_key_index_files, load_priority_);
+    // load shredding data (files are already absolute paths)
+    LoadShreddingData(shredding_data_files,
+                      config.contains(WARMUP) ? config.at(WARMUP) : "");
+
+    auto index_size =
+        GetValueFromConfig<int64_t>(config, milvus::index::INDEX_SIZE)
+            .value_or(0);
+    // load shared key index (files are already absolute paths)
+    LoadSharedKeyIndex(shared_key_index_files,
+                       enable_mmap,
+                       index_size,
+                       config.contains(WARMUP) ? config.at(WARMUP) : "");
 }
 
 IndexStatsPtr
@@ -1014,15 +1224,35 @@ JsonKeyStats::Upload(const Config& config) {
     // upload inverted index
     auto bson_index_stats = bson_inverted_index_->UploadIndex();
 
+    // upload meta file
+    auto meta_file_path = GetMetaFilePath();
+    AssertInfo(disk_file_manager_->AddJsonStatsMetaLog(meta_file_path),
+               "failed to upload meta file: {} for segment {}",
+               meta_file_path,
+               segment_id_);
+
     // upload parquet file, parquet writer has already upload file to remote
     auto shredding_remote_paths_to_size = parquet_writer_->GetPathsToSize();
     auto shared_key_index_remote_paths_to_size =
         bson_index_stats->GetSerializedIndexFileInfo();
+    auto meta_remote_paths_to_size =
+        disk_file_manager_->GetRemotePathsToFileSize();
 
     // get all index files for meta
     std::vector<SerializedIndexFileInfo> index_files;
     index_files.reserve(shredding_remote_paths_to_size.size() +
-                        shared_key_index_remote_paths_to_size.size());
+                        shared_key_index_remote_paths_to_size.size() + 1);
+
+    // add meta file
+    for (const auto& [path, size] : meta_remote_paths_to_size) {
+        if (path.find(JSON_STATS_META_FILE_NAME) != std::string::npos) {
+            auto file_path = path.substr(path.find(JSON_STATS_META_FILE_NAME));
+            index_files.emplace_back(file_path, size);
+            LOG_INFO(
+                "upload meta file: {} for segment {}", file_path, segment_id_);
+        }
+    }
+
     // only store shared_key_index/... and shredding_data/... to meta
     // for saving meta space
     for (const auto& file_info : shared_key_index_remote_paths_to_size) {
@@ -1045,16 +1275,18 @@ JsonKeyStats::Upload(const Config& config) {
 
     LOG_INFO(
         "upload json key stats for segment {} with bson mem size: {} "
-        "and "
-        "shredding data mem size: {} and index files size: {}",
+        "and shredding data mem size: {} and meta file size: {} "
+        "and index files size: {}",
         segment_id_,
         bson_index_stats->GetMemSize(),
         parquet_writer_->GetTotalSize(),
+        meta_file_size_,
         index_files.size());
 
-    return IndexStats::New(
-        bson_index_stats->GetMemSize() + parquet_writer_->GetTotalSize(),
-        std::move(index_files));
+    return IndexStats::New(bson_index_stats->GetMemSize() +
+                               parquet_writer_->GetTotalSize() +
+                               meta_file_size_,
+                           std::move(index_files));
 }
 
 }  // namespace milvus::index

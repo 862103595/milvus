@@ -118,7 +118,9 @@ func values2FieldData[T any](values []T, fieldType entity.FieldType, dim int) *s
 		entity.FieldTypeVarChar,
 		entity.FieldTypeString,
 		entity.FieldTypeJSON,
-		entity.FieldTypeGeometry:
+		entity.FieldTypeGeometry,
+		entity.FieldTypeMol,
+		entity.FieldTypeTimestamptz:
 		fd.Field = &schemapb.FieldData_Scalars{
 			Scalars: values2Scalars(values, fieldType), // scalars,
 		}
@@ -174,7 +176,7 @@ func values2Scalars[T any](values []T, fieldType entity.FieldType) *schemapb.Sca
 		scalars.Data = &schemapb.ScalarField_LongData{
 			LongData: &schemapb.LongArray{Data: int64s},
 		}
-	case entity.FieldTypeVarChar, entity.FieldTypeString:
+	case entity.FieldTypeVarChar, entity.FieldTypeString, entity.FieldTypeTimestamptz:
 		var strVals []string
 		strVals, ok = any(values).([]string)
 		scalars.Data = &schemapb.ScalarField_StringData{
@@ -205,6 +207,12 @@ func values2Scalars[T any](values []T, fieldType entity.FieldType) *schemapb.Sca
 		strVals, ok = any(values).([]string)
 		scalars.Data = &schemapb.ScalarField_GeometryWktData{
 			GeometryWktData: &schemapb.GeometryWktArray{Data: strVals},
+		}
+	case entity.FieldTypeMol:
+		var strVals []string
+		strVals, ok = any(values).([]string)
+		scalars.Data = &schemapb.ScalarField_MolSmilesData{
+			MolSmilesData: &schemapb.MolSmilesArray{Data: strVals},
 		}
 	}
 	// shall not be accessed

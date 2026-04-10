@@ -11,18 +11,6 @@
 
 #pragma once
 
-#include <prometheus/collectable.h>
-#include <prometheus/counter.h>
-#include <prometheus/gauge.h>
-#include <prometheus/histogram.h>
-#include <prometheus/registry.h>
-#include <prometheus/summary.h>
-#include <prometheus/text_serializer.h>
-
-#include <memory>
-#include <sstream>
-#include <string>
-
 #include "common/PrometheusClient.h"
 
 namespace milvus::monitor {
@@ -88,6 +76,8 @@ DECLARE_PROMETHEUS_HISTOGRAM_FAMILY(internal_cgo_execute_duration_seconds);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_cgo_execute_duration_seconds_all);
 DECLARE_PROMETHEUS_COUNTER_FAMILY(internal_cgo_cancel_before_execute_total)
 DECLARE_PROMETHEUS_COUNTER(internal_cgo_cancel_before_execute_total_all);
+DECLARE_PROMETHEUS_COUNTER_FAMILY(internal_cgo_cancel_during_execute_total);
+DECLARE_PROMETHEUS_COUNTER(internal_cgo_cancel_during_execute_total_all);
 DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cgo_pool_size);
 DECLARE_PROMETHEUS_GAUGE(internal_cgo_pool_size_all);
 DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cgo_inflight_task_total);
@@ -101,5 +91,10 @@ DECLARE_PROMETHEUS_HISTOGRAM(internal_json_stats_latency_term_query);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_json_stats_latency_shredding);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_json_stats_latency_shared);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_json_stats_latency_load);
+
+// json filter performance metrics
+DECLARE_PROMETHEUS_HISTOGRAM_FAMILY(internal_json_filter_latency);
+DECLARE_PROMETHEUS_HISTOGRAM(internal_json_filter_latency_bruteforce);
+DECLARE_PROMETHEUS_HISTOGRAM(internal_json_filter_latency_json_stats);
 
 }  // namespace milvus::monitor

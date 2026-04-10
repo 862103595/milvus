@@ -15,10 +15,23 @@
 // limitations under the License.
 
 #include "FilterBitsNode.h"
-#include "common/Tracer.h"
-#include "fmt/format.h"
 
+#include <algorithm>
+#include <chrono>
+#include <ratio>
+#include <utility>
+#include <vector>
+
+#include "common/EasyAssert.h"
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "exec/QueryContext.h"
+#include "exec/expression/EvalCtx.h"
+#include "expr/ITypeExpr.h"
+#include "fmt/core.h"
 #include "monitor/Monitor.h"
+#include "plan/PlanNode.h"
+#include "prometheus/histogram.h"
 
 namespace milvus {
 namespace exec {
@@ -61,6 +74,8 @@ PhyFilterBitsNode::IsFinished() {
 
 RowVectorPtr
 PhyFilterBitsNode::GetOutput() {
+    milvus::exec::checkCancellation(query_context_);
+
     if (AllInputProcessed()) {
         return nullptr;
     }
@@ -72,10 +87,50 @@ PhyFilterBitsNode::GetOutput() {
     std::chrono::high_resolution_clock::time_point scalar_start =
         std::chrono::high_resolution_clock::now();
 
-    EvalCtx eval_ctx(operator_context_->get_exec_context(), exprs_.get());
+    EvalCtx eval_ctx(operator_context_->get_exec_context());
 
     TargetBitmap bitset;
     TargetBitmap valid_bitset;
+
+    // optimization: if all expressions can be executed at once,
+    // execute in a single pass and flip in-place to avoid bitmap copies.
+    if (exprs_->CanExecuteAllAtOnce()) {
+        tracer::AddEvent("expr_execute_all_at_once");
+        exprs_->SetExecuteAllAtOnce();
+
+        exprs_->Eval(0, 1, true, eval_ctx, results_);
+        AssertInfo(results_.size() == 1 && results_[0] != nullptr,
+                   "PhyFilterBitsNode result size should be size one and not "
+                   "be nullptr");
+        auto col_vec = std::dynamic_pointer_cast<ColumnVector>(results_[0]);
+        AssertInfo(col_vec && col_vec->IsBitmap(),
+                   "PhyFilterBitsNode result should be bitmap ColumnVector");
+
+        auto col_vec_size = col_vec->size();
+        // flip in-place on the result bitmap, no extra copy
+        TargetBitmapView view(col_vec->GetRawData(), col_vec_size);
+        view.flip();
+        num_processed_rows_ = col_vec_size;
+
+        AssertInfo(col_vec_size == need_process_rows_,
+                   "bitset size: {}, need_process_rows_: {}",
+                   col_vec_size,
+                   need_process_rows_);
+
+        std::vector<VectorPtr> col_res;
+        col_res.push_back(std::move(results_[0]));
+
+        std::chrono::high_resolution_clock::time_point scalar_end =
+            std::chrono::high_resolution_clock::now();
+        double scalar_cost =
+            std::chrono::duration<double, std::micro>(scalar_end - scalar_start)
+                .count();
+        milvus::monitor::internal_core_search_latency_scalar.Observe(
+            scalar_cost / 1000);
+
+        return std::make_shared<RowVector>(col_res);
+    }
+
     while (num_processed_rows_ < need_process_rows_) {
         exprs_->Eval(0, 1, true, eval_ctx, results_);
 
@@ -103,16 +158,13 @@ PhyFilterBitsNode::GetOutput() {
         }
     }
     bitset.flip();
+
     AssertInfo(bitset.size() == need_process_rows_,
                "bitset size: {}, need_process_rows_: {}",
                bitset.size(),
                need_process_rows_);
     Assert(valid_bitset.size() == need_process_rows_);
 
-    auto filtered_count = bitset.count();
-    auto filter_ratio =
-        bitset.size() != 0 ? 1 - float(filtered_count) / bitset.size() : 0;
-    milvus::monitor::internal_core_expr_filter_ratio.Observe(filter_ratio);
     // num_processed_rows_ = need_process_rows_;
     std::vector<VectorPtr> col_res;
     col_res.push_back(std::make_shared<ColumnVector>(std::move(bitset),
@@ -124,10 +176,6 @@ PhyFilterBitsNode::GetOutput() {
             .count();
     milvus::monitor::internal_core_search_latency_scalar.Observe(scalar_cost /
                                                                  1000);
-
-    tracer::AddEvent(fmt::format("output_rows: {}, filtered: {}",
-                                 need_process_rows_ - filtered_count,
-                                 filtered_count));
 
     return std::make_shared<RowVector>(col_res);
 }

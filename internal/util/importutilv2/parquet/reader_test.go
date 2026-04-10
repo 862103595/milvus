@@ -32,9 +32,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
-	"github.com/twpayne/go-geom/encoding/wkb"
-	"github.com/twpayne/go-geom/encoding/wkbcommon"
-	"github.com/twpayne/go-geom/encoding/wkt"
 	"golang.org/x/exp/slices"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -46,13 +43,15 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-const (
-	testOutputPath = "/tmp/milvus_test/test_parquet_reader"
-)
+var testOutputPath string
+
+func init() {
+	dir, _ := os.MkdirTemp("", "milvus_test_parquet_reader_*")
+	testOutputPath = dir
+}
 
 type ReaderSuite struct {
 	suite.Suite
@@ -60,10 +59,6 @@ type ReaderSuite struct {
 	numRows     int
 	pkDataType  schemapb.DataType
 	vecDataType schemapb.DataType
-}
-
-func (s *ReaderSuite) SetupSuite() {
-	paramtable.Get().Init(paramtable.NewBaseTable())
 }
 
 func (s *ReaderSuite) SetupTest() {
@@ -238,11 +233,7 @@ func (s *ReaderSuite) run(dataType schemapb.DataType, elemType schemapb.DataType
 					}
 				} else if fieldDataType == schemapb.DataType_Geometry && expect != nil {
 					expectData := expect.([]byte)
-					geomT, err := wkt.Unmarshal(string(expectData))
-					if err != nil {
-						s.Fail("unmarshal wkt failed")
-					}
-					wkbValue, err := wkb.Marshal(geomT, wkb.NDR, wkbcommon.WKBOptionEmptyPointHandling(wkbcommon.EmptyPointHandlingNaN))
+					wkbValue, err := common.ConvertWKTToWKB(string(expectData))
 					if err != nil {
 						s.Fail("marshal wkb failed")
 					}
@@ -455,8 +446,10 @@ func (s *ReaderSuite) runWithSparseVector(indicesType arrow.DataType, valuesType
 		builder.AppendValues(int64Data, validData)
 		arrowColumns = append(arrowColumns, builder.NewInt64Array())
 
-		contents := insertData.Data[schema.Fields[1].FieldID].(*storage.SparseFloatVectorFieldData).GetContents()
-		arr, err := testutil.BuildSparseVectorData(mem, contents, arrowFields[1].Type)
+		sparseFieldData := insertData.Data[schema.Fields[1].FieldID].(*storage.SparseFloatVectorFieldData)
+		contents := sparseFieldData.GetContents()
+		sparseValidData := sparseFieldData.ValidData
+		arr, err := testutil.BuildSparseVectorData(mem, contents, arrowFields[1].Type, sparseValidData)
 		assert.NoError(s.T(), err)
 		arrowColumns = append(arrowColumns, arr)
 
@@ -550,65 +543,34 @@ func (s *ReaderSuite) TestReadScalarFieldsWithDefaultValue() {
 }
 
 func (s *ReaderSuite) TestReadScalarFields() {
-	s.run(schemapb.DataType_Bool, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Int8, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Int16, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Int64, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Float, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Double, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_String, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_VarChar, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_JSON, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Geometry, schemapb.DataType_None, false, 0)
+	elementTypes := []schemapb.DataType{
+		schemapb.DataType_Bool,
+		schemapb.DataType_Int8,
+		schemapb.DataType_Int16,
+		schemapb.DataType_Int32,
+		schemapb.DataType_Int64,
+		schemapb.DataType_Float,
+		schemapb.DataType_Double,
+		schemapb.DataType_String,
+	}
 
-	s.run(schemapb.DataType_Array, schemapb.DataType_Bool, false, 0)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int8, false, 0)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int16, false, 0)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int32, false, 0)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int64, false, 0)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Float, false, 0)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Double, false, 0)
-	s.run(schemapb.DataType_Array, schemapb.DataType_String, false, 0)
+	scalarTypes := append(elementTypes, []schemapb.DataType{schemapb.DataType_VarChar, schemapb.DataType_JSON, schemapb.DataType_Geometry, schemapb.DataType_Array}...)
 
-	s.run(schemapb.DataType_Bool, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_Int8, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_Int16, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_Int64, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_Float, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_String, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_VarChar, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_JSON, schemapb.DataType_None, true, 50)
-
-	s.run(schemapb.DataType_Array, schemapb.DataType_Bool, true, 50)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int8, true, 50)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int16, true, 50)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int32, true, 50)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int64, true, 50)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Float, true, 50)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Double, true, 50)
-	s.run(schemapb.DataType_Array, schemapb.DataType_String, true, 50)
-
-	s.run(schemapb.DataType_Bool, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_Int8, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_Int16, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_Int64, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_Float, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_String, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_VarChar, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_JSON, schemapb.DataType_None, true, 100)
-	s.run(schemapb.DataType_Geometry, schemapb.DataType_None, true, 100)
-
-	s.run(schemapb.DataType_Array, schemapb.DataType_Bool, true, 100)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int8, true, 100)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int16, true, 100)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int32, true, 100)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Int64, true, 100)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Float, true, 100)
-	s.run(schemapb.DataType_Array, schemapb.DataType_Double, true, 100)
-	s.run(schemapb.DataType_Array, schemapb.DataType_String, true, 100)
+	for _, dataType := range scalarTypes {
+		if dataType == schemapb.DataType_Array {
+			for _, elementType := range elementTypes {
+				s.run(dataType, elementType, false, 0)
+				for _, nullPercent := range []int{0, 50, 100} {
+					s.run(dataType, elementType, true, nullPercent)
+				}
+			}
+		} else {
+			s.run(dataType, schemapb.DataType_None, false, 0)
+			for _, nullPercent := range []int{0, 50, 100} {
+				s.run(dataType, schemapb.DataType_None, true, nullPercent)
+			}
+		}
+	}
 
 	s.failRun(schemapb.DataType_JSON, true)
 }
@@ -616,24 +578,28 @@ func (s *ReaderSuite) TestReadScalarFields() {
 func (s *ReaderSuite) TestStringPK() {
 	s.pkDataType = schemapb.DataType_VarChar
 	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, true, 50)
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, true, 100)
+	for _, nullPercent := range []int{0, 50, 100} {
+		s.run(schemapb.DataType_Int32, schemapb.DataType_None, true, nullPercent)
+	}
 }
 
 func (s *ReaderSuite) TestVector() {
-	s.vecDataType = schemapb.DataType_BinaryVector
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
-	s.vecDataType = schemapb.DataType_FloatVector
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
-	s.vecDataType = schemapb.DataType_Float16Vector
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
-	s.vecDataType = schemapb.DataType_BFloat16Vector
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
-	// this test case only test parsing sparse vector from JSON-format string
-	s.vecDataType = schemapb.DataType_SparseFloatVector
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
-	s.vecDataType = schemapb.DataType_Int8Vector
-	s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
+	dataTypes := []schemapb.DataType{
+		schemapb.DataType_BinaryVector,
+		schemapb.DataType_FloatVector,
+		schemapb.DataType_Float16Vector,
+		schemapb.DataType_BFloat16Vector,
+		schemapb.DataType_SparseFloatVector,
+		schemapb.DataType_Int8Vector,
+	}
+
+	for _, dataType := range dataTypes {
+		s.vecDataType = dataType
+		s.run(schemapb.DataType_Int32, schemapb.DataType_None, false, 0)
+		for _, nullPercent := range []int{0, 50, 100} {
+			s.run(schemapb.DataType_Int32, schemapb.DataType_None, true, nullPercent)
+		}
+	}
 }
 
 func (s *ReaderSuite) TestSparseVector() {
@@ -654,115 +620,129 @@ func TestParquetReader(t *testing.T) {
 func TestParquetReaderWithStructArray(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("test struct array field reading", func(t *testing.T) {
-		// Create schema with StructArrayField
-		schema := &schemapb.CollectionSchema{
-			Name: "test_struct_array",
-			Fields: []*schemapb.FieldSchema{
-				{
-					FieldID:      100,
-					Name:         "id",
-					IsPrimaryKey: true,
-					DataType:     schemapb.DataType_Int64,
-				},
-				{
-					FieldID:  101,
-					Name:     "varchar_field",
-					DataType: schemapb.DataType_VarChar,
-					TypeParams: []*commonpb.KeyValuePair{
-						{Key: common.MaxLengthKey, Value: "100"},
+	vectorTypeTests := []struct {
+		name        string
+		elementType schemapb.DataType
+		dim         string
+	}{
+		{"FloatVector", schemapb.DataType_FloatVector, "4"},
+		{"Float16Vector", schemapb.DataType_Float16Vector, "4"},
+		{"BFloat16Vector", schemapb.DataType_BFloat16Vector, "4"},
+		{"Int8Vector", schemapb.DataType_Int8Vector, "4"},
+		{"BinaryVector", schemapb.DataType_BinaryVector, "32"},
+	}
+
+	for _, vt := range vectorTypeTests {
+		t.Run("test struct array with "+vt.name, func(t *testing.T) {
+			// Create schema with StructArrayField
+			schema := &schemapb.CollectionSchema{
+				Name: "test_struct_array_" + vt.name,
+				Fields: []*schemapb.FieldSchema{
+					{
+						FieldID:      100,
+						Name:         "id",
+						IsPrimaryKey: true,
+						DataType:     schemapb.DataType_Int64,
 					},
-				},
-			},
-			StructArrayFields: []*schemapb.StructArrayFieldSchema{
-				{
-					FieldID: 200,
-					Name:    "struct_array",
-					Fields: []*schemapb.FieldSchema{
-						{
-							FieldID:     201,
-							Name:        "struct_array[int_array]",
-							DataType:    schemapb.DataType_Array,
-							ElementType: schemapb.DataType_Int32,
-							TypeParams: []*commonpb.KeyValuePair{
-								{Key: common.MaxCapacityKey, Value: "20"},
-							},
-						},
-						{
-							FieldID:     202,
-							Name:        "struct_array[float_array]",
-							DataType:    schemapb.DataType_Array,
-							ElementType: schemapb.DataType_Float,
-							TypeParams: []*commonpb.KeyValuePair{
-								{Key: common.MaxCapacityKey, Value: "20"},
-							},
-						},
-						{
-							FieldID:     203,
-							Name:        "struct_array[vector_array]",
-							DataType:    schemapb.DataType_ArrayOfVector,
-							ElementType: schemapb.DataType_FloatVector,
-							TypeParams: []*commonpb.KeyValuePair{
-								{Key: common.DimKey, Value: "4"},
-								{Key: common.MaxCapacityKey, Value: "20"},
-							},
+					{
+						FieldID:  101,
+						Name:     "varchar_field",
+						DataType: schemapb.DataType_VarChar,
+						TypeParams: []*commonpb.KeyValuePair{
+							{Key: common.MaxLengthKey, Value: "100"},
 						},
 					},
 				},
-			},
-		}
+				StructArrayFields: []*schemapb.StructArrayFieldSchema{
+					{
+						FieldID: 200,
+						Name:    "struct_array",
+						Fields: []*schemapb.FieldSchema{
+							{
+								FieldID:     201,
+								Name:        "struct_array[int_array]",
+								DataType:    schemapb.DataType_Array,
+								ElementType: schemapb.DataType_Int32,
+								TypeParams: []*commonpb.KeyValuePair{
+									{Key: common.MaxCapacityKey, Value: "20"},
+								},
+							},
+							{
+								FieldID:     202,
+								Name:        "struct_array[float_array]",
+								DataType:    schemapb.DataType_Array,
+								ElementType: schemapb.DataType_Float,
+								TypeParams: []*commonpb.KeyValuePair{
+									{Key: common.MaxCapacityKey, Value: "20"},
+								},
+							},
+							{
+								FieldID:     203,
+								Name:        "struct_array[vector_array]",
+								DataType:    schemapb.DataType_ArrayOfVector,
+								ElementType: vt.elementType,
+								TypeParams: []*commonpb.KeyValuePair{
+									{Key: common.DimKey, Value: vt.dim},
+									{Key: common.MaxCapacityKey, Value: "20"},
+								},
+							},
+						},
+					},
+				},
+			}
 
-		// Create test data file
-		filePath := fmt.Sprintf("/tmp/test_struct_array_%d.parquet", rand.Int())
-		defer os.Remove(filePath)
+			// Create test data file
+			filePath := fmt.Sprintf("/tmp/test_struct_array_%s_%d.parquet", vt.name, rand.Int())
+			defer os.Remove(filePath)
 
-		numRows := 50
-		f, err := os.Create(filePath)
-		assert.NoError(t, err)
+			numRows := 50
+			f, err := os.Create(filePath)
+			assert.NoError(t, err)
 
-		// Use writeParquet to create test file
-		insertData, err := writeParquet(f, schema, numRows, 0)
-		assert.NoError(t, err)
-		f.Close()
+			// Use writeParquet to create test file
+			insertData, err := writeParquet(f, schema, numRows, 0)
+			assert.NoError(t, err)
+			f.Close()
 
-		// Verify the insert data contains struct fields
-		assert.Contains(t, insertData.Data, int64(201)) // int_array field
-		assert.Contains(t, insertData.Data, int64(202)) // float_array field
-		assert.Contains(t, insertData.Data, int64(203)) // vector_array field
+			// Verify the insert data contains struct fields
+			assert.Contains(t, insertData.Data, int64(201)) // int_array field
+			assert.Contains(t, insertData.Data, int64(202)) // float_array field
+			assert.Contains(t, insertData.Data, int64(203)) // vector_array field
 
-		// Now test reading the file using ChunkManager
-		factory := storage.NewChunkManagerFactory("local", objectstorage.RootPath("/tmp"))
-		cm, err := factory.NewPersistentStorageChunkManager(ctx)
-		assert.NoError(t, err)
+			// Now test reading the file using ChunkManager
+			factory := storage.NewChunkManagerFactory("local", objectstorage.RootPath("/tmp"))
+			cm, err := factory.NewPersistentStorageChunkManager(ctx)
+			assert.NoError(t, err)
 
-		reader, err := NewReader(ctx, cm, schema, filePath, 64*1024*1024)
-		assert.NoError(t, err)
-		defer reader.Close()
+			reader, err := NewReader(ctx, cm, schema, filePath, 64*1024*1024)
+			assert.NoError(t, err)
+			defer reader.Close()
 
-		// Read data
-		readData, err := reader.Read()
-		assert.NoError(t, err)
-		assert.NotNil(t, readData)
+			// Read data
+			readData, err := reader.Read()
+			assert.NoError(t, err)
+			assert.NotNil(t, readData)
 
-		// Verify the data includes struct fields
-		assert.Contains(t, readData.Data, int64(201)) // int_array field ID
-		assert.Contains(t, readData.Data, int64(202)) // float_array field ID
-		assert.Contains(t, readData.Data, int64(203)) // vector_array field ID
+			// Verify the data includes struct fields
+			assert.Contains(t, readData.Data, int64(201)) // int_array field ID
+			assert.Contains(t, readData.Data, int64(202)) // float_array field ID
+			assert.Contains(t, readData.Data, int64(203)) // vector_array field ID
 
-		// Check row count matches
-		assert.Equal(t, numRows, readData.Data[100].RowNum()) // id field
-		assert.Equal(t, numRows, readData.Data[101].RowNum()) // varchar_field
-		assert.Equal(t, numRows, readData.Data[201].RowNum()) // int_array
-		assert.Equal(t, numRows, readData.Data[202].RowNum()) // float_array
-		assert.Equal(t, numRows, readData.Data[203].RowNum()) // vector_array
+			// Check row count matches
+			assert.Equal(t, numRows, readData.Data[100].RowNum()) // id field
+			assert.Equal(t, numRows, readData.Data[101].RowNum()) // varchar_field
+			assert.Equal(t, numRows, readData.Data[201].RowNum()) // int_array
+			assert.Equal(t, numRows, readData.Data[202].RowNum()) // float_array
+			assert.Equal(t, numRows, readData.Data[203].RowNum()) // vector_array
 
-		// Verify data content matches
-		for fieldID, originalData := range insertData.Data {
-			readFieldData, ok := readData.Data[fieldID]
-			assert.True(t, ok, "field %d not found in read data", fieldID)
-			assert.Equal(t, originalData.RowNum(), readFieldData.RowNum(), "row count mismatch for field %d", fieldID)
-		}
-	})
+			// Verify data content matches
+			for fieldID, originalData := range insertData.Data {
+				readFieldData, ok := readData.Data[fieldID]
+				assert.True(t, ok, "field %d not found in read data", fieldID)
+				assert.Equal(t, originalData.RowNum(), readFieldData.RowNum(), "row count mismatch for field %d", fieldID)
+			}
+		})
+	}
 }
 
 func TestParquetReaderError(t *testing.T) {
@@ -847,7 +827,7 @@ func TestParquetReaderError(t *testing.T) {
 	schema.Properties = nil
 
 	// now set the vec to be FunctionOutput
-	// NewReader will return error "the field is output by function, no need to provide"
+	// rejected when allowInsertNonBM25FunctionOutputs is not enabled
 	schema.Fields[0].AutoID = false
 	schema.Fields[1].IsFunctionOutput = true
 	checkFunc(schema, filePath, false)

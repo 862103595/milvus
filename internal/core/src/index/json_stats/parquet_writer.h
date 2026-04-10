@@ -16,16 +16,26 @@
 
 #pragma once
 
+#include <stdint.h>
+#include <cstddef>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
-#include <map>
+
 #include "arrow/api.h"
-#include "arrow/io/api.h"
-#include "parquet/arrow/writer.h"
+#include "arrow/array/array_base.h"
+#include "arrow/array/builder_base.h"
+#include "arrow/filesystem/filesystem.h"
+#include "common/EasyAssert.h"
+#include "common/protobuf_utils.h"
+#include "glog/logging.h"
 #include "index/json_stats/utils.h"
-#include "milvus-storage/packed/writer.h"
+#include "log/Log.h"
 #include "milvus-storage/common/config.h"
+#include "milvus-storage/packed/writer.h"
+#include "parquet/properties.h"
 
 namespace milvus::index {
 
@@ -105,7 +115,9 @@ class DefaultColumnGroupingStrategy : public ColumnGroupingStrategy {
     CreateGroups(const TableStatsInfo& table_info) const override {
         // put all columns into one group
         std::vector<std::vector<int>> column_groups;
+        column_groups.reserve(1);
         std::vector<int> group;
+        group.reserve(table_info.schema->num_fields());
         for (size_t i = 0; i < table_info.schema->num_fields(); ++i) {
             group.push_back(i);
         }
@@ -142,15 +154,14 @@ struct ParquetWriterFactory {
         context.builders = std::move(builders.first);
         context.builders_map = std::move(builders.second);
         context.kv_metadata = CreateParquetKVMetadata(column_map);
-        context.column_groups =
-            std::move(ColumnGroupingStrategyFactory::CreateStrategy(
-                          ColumnGroupingStrategyType::DEFAULT)
-                          ->CreateGroups(TableStatsInfo{
-                              context.schema,
-                              column_map,
-                          }));
+        context.column_groups = ColumnGroupingStrategyFactory::CreateStrategy(
+                                    ColumnGroupingStrategyType::DEFAULT)
+                                    ->CreateGroups(TableStatsInfo{
+                                        context.schema,
+                                        column_map,
+                                    });
         auto column_group_id = 0;
-        for (const auto& group : context.column_groups) {
+        for ([[maybe_unused]] const auto& group : context.column_groups) {
             auto file_log_id = 0;
             context.file_paths.push_back(CreateColumnGroupParquetPath(
                 path_prefix, column_group_id, file_log_id));
@@ -230,7 +241,7 @@ class JsonStatsParquetWriter {
     size_t batch_size_;
     std::shared_ptr<arrow::fs::FileSystem> fs_;
     milvus_storage::StorageConfig storage_config_;
-    std::unique_ptr<milvus_storage::PackedRecordBatchWriter> packed_writer_;
+    std::shared_ptr<milvus_storage::PackedRecordBatchWriter> packed_writer_;
     std::vector<std::pair<std::string, std::string>> kv_metadata_;
 
     // cache for builders
@@ -238,7 +249,7 @@ class JsonStatsParquetWriter {
     std::map<std::string, std::shared_ptr<arrow::ArrayBuilder>> builders_map_;
     size_t unflushed_row_count_{0};
     size_t all_row_count_{0};
-    size_t current_row_count_{0};
+    [[maybe_unused]] size_t current_row_count_{0};
 };
 
 }  // namespace milvus::index

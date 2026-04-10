@@ -21,10 +21,6 @@ import (
 	"fmt"
 	"path"
 
-	"github.com/apache/arrow/go/v17/arrow"
-	"github.com/apache/arrow/go/v17/arrow/array"
-	"github.com/apache/arrow/go/v17/arrow/memory"
-	"github.com/samber/lo"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
@@ -34,8 +30,10 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 type PackWriter interface {
@@ -52,7 +50,6 @@ type BulkPackWriter struct {
 	writeRetryOpts []retry.Option
 
 	// prefetched log ids
-	ids         []int64
 	sizeWritten int64
 }
 
@@ -78,12 +75,6 @@ func (bw *BulkPackWriter) Write(ctx context.Context, pack *SyncPack) (
 	size int64,
 	err error,
 ) {
-	err = bw.prefetchIDs(pack)
-	if err != nil {
-		log.Warn("failed allocate ids for sync task", zap.Error(err))
-		return
-	}
-
 	if inserts, err = bw.writeInserts(ctx, pack); err != nil {
 		log.Error("failed to write insert data", zap.Error(err))
 		return
@@ -106,51 +97,20 @@ func (bw *BulkPackWriter) Write(ctx context.Context, pack *SyncPack) (
 	return
 }
 
-// prefetchIDs pre-allcates ids depending on the number of blobs current task contains.
-func (bw *BulkPackWriter) prefetchIDs(pack *SyncPack) error {
-	totalIDCount := 0
-	if len(pack.insertData) > 0 {
-		totalIDCount += len(pack.insertData[0].Data) * 2 // binlogs and statslogs
-	}
-	if pack.isFlush {
-		totalIDCount++ // merged stats log
-	}
-	if pack.deltaData != nil {
-		totalIDCount++
-	}
-	if pack.bm25Stats != nil {
-		totalIDCount += len(pack.bm25Stats)
-		if pack.isFlush {
-			totalIDCount++ // merged bm25 stats
-		}
-	}
-
-	if totalIDCount == 0 {
-		return nil
-	}
-	start, _, err := bw.allocator.Alloc(uint32(totalIDCount))
-	if err != nil {
-		return err
-	}
-	bw.ids = lo.RangeFrom(start, totalIDCount)
-	return nil
-}
-
-func (bw *BulkPackWriter) nextID() int64 {
-	if len(bw.ids) == 0 {
-		panic("pre-fetched ids exhausted")
-	}
-	r := bw.ids[0]
-	bw.ids = bw.ids[1:]
-	return r
-}
-
 func (bw *BulkPackWriter) writeLog(ctx context.Context, blob *storage.Blob,
 	root, p string, pack *SyncPack,
 ) (*datapb.Binlog, error) {
 	key := path.Join(bw.chunkManager.RootPath(), root, p)
-	err := retry.Do(ctx, func() error {
-		return bw.chunkManager.Write(ctx, key, blob.Value)
+	err := retry.Handle(ctx, func() (bool, error) {
+		err := bw.chunkManager.Write(ctx, key, blob.Value)
+		if err == nil {
+			return false, nil
+		}
+		err = storage.ToMilvusIoError(key, err)
+		if merr.IsNonRetryableErr(err) {
+			return false, err
+		}
+		return true, err
 	}, bw.writeRetryOpts...)
 	if err != nil {
 		return nil, err
@@ -184,7 +144,11 @@ func (bw *BulkPackWriter) writeInserts(ctx context.Context, pack *SyncPack) (map
 
 	logs := make(map[int64]*datapb.FieldBinlog)
 	for fieldID, blob := range binlogBlobs {
-		k := metautil.JoinIDPath(pack.collectionID, pack.partitionID, pack.segmentID, fieldID, bw.nextID())
+		id, err := bw.allocator.AllocOne()
+		if err != nil {
+			return nil, err
+		}
+		k := metautil.JoinIDPath(pack.collectionID, pack.partitionID, pack.segmentID, fieldID, id)
 		binlog, err := bw.writeLog(ctx, blob, common.SegmentInsertLogPath, k, pack)
 		if err != nil {
 			return nil, err
@@ -217,7 +181,11 @@ func (bw *BulkPackWriter) writeStats(ctx context.Context, pack *SyncPack) (map[i
 
 	pkFieldID := serializer.pkField.GetFieldID()
 	binlogs := make([]*datapb.Binlog, 0)
-	k := metautil.JoinIDPath(pack.collectionID, pack.partitionID, pack.segmentID, pkFieldID, bw.nextID())
+	id, err := bw.allocator.AllocOne()
+	if err != nil {
+		return nil, err
+	}
+	k := metautil.JoinIDPath(pack.collectionID, pack.partitionID, pack.segmentID, pkFieldID, id)
 	if binlog, err := bw.writeLog(ctx, batchStatsBlob, common.SegmentStatslogPath, k, pack); err != nil {
 		return nil, err
 	} else {
@@ -264,7 +232,11 @@ func (bw *BulkPackWriter) writeBM25Stasts(ctx context.Context, pack *SyncPack) (
 
 	logs := make(map[int64]*datapb.FieldBinlog)
 	for fieldID, blob := range bm25Blobs {
-		k := metautil.JoinIDPath(pack.collectionID, pack.partitionID, pack.segmentID, fieldID, bw.nextID())
+		id, err := bw.allocator.AllocOne()
+		if err != nil {
+			return nil, err
+		}
+		k := metautil.JoinIDPath(pack.collectionID, pack.partitionID, pack.segmentID, fieldID, id)
 		binlog, err := bw.writeLog(ctx, blob, common.SegmentBm25LogPath, k, pack)
 		if err != nil {
 			return nil, err
@@ -307,34 +279,29 @@ func (bw *BulkPackWriter) writeBM25Stasts(ctx context.Context, pack *SyncPack) (
 }
 
 func (bw *BulkPackWriter) writeDelta(ctx context.Context, pack *SyncPack) (*datapb.FieldBinlog, error) {
-	if pack.deltaData == nil {
+	if pack.deltaData == nil || pack.deltaData.RowCount == 0 {
 		return &datapb.FieldBinlog{}, nil
 	}
 
-	pkField := func() *schemapb.FieldSchema {
-		for _, field := range bw.schema.Fields {
-			if field.IsPrimaryKey {
-				return field
-			}
-		}
-		return nil
-	}()
-	if pkField == nil {
-		return nil, fmt.Errorf("primary key field not found")
+	pkField, err := typeutil.GetPrimaryFieldSchema(bw.schema)
+	if err != nil {
+		return nil, fmt.Errorf("primary key field not found: %w", err)
 	}
 
-	logID := bw.nextID()
+	logID, err := bw.allocator.AllocOne()
+	if err != nil {
+		return nil, err
+	}
+
 	k := metautil.JoinIDPath(pack.collectionID, pack.partitionID, pack.segmentID, logID)
-	path := path.Join(bw.chunkManager.RootPath(), common.SegmentDeltaLogPath, k)
+	deltaPath := path.Join(bw.chunkManager.RootPath(), common.SegmentDeltaLogPath, k)
+
 	writer, err := storage.NewDeltalogWriter(
-		ctx, pack.collectionID, pack.partitionID, pack.segmentID, logID, pkField.DataType, path,
+		ctx, pack.collectionID, pack.partitionID, pack.segmentID, logID, pkField.DataType, deltaPath,
+		storage.WithVersion(storage.StorageV1),
 		storage.WithUploader(func(ctx context.Context, kvs map[string][]byte) error {
-			// Get the only blob in the map
-			if len(kvs) != 1 {
-				return fmt.Errorf("expected 1 blob, got %d", len(kvs))
-			}
-			for _, blob := range kvs {
-				return bw.chunkManager.Write(ctx, path, blob)
+			for k, blob := range kvs {
+				return bw.chunkManager.Write(ctx, k, blob)
 			}
 			return nil
 		}),
@@ -343,61 +310,26 @@ func (bw *BulkPackWriter) writeDelta(ctx context.Context, pack *SyncPack) (*data
 		return nil, err
 	}
 
-	pkType := func() arrow.DataType {
-		switch pkField.DataType {
-		case schemapb.DataType_Int64:
-			return arrow.PrimitiveTypes.Int64
-		case schemapb.DataType_VarChar:
-			return arrow.BinaryTypes.String
-		default:
-			return nil
-		}
-	}()
-	if pkType == nil {
-		return nil, fmt.Errorf("unexpected pk type %v", pkField.DataType)
-	}
-
-	pkBuilder := array.NewBuilder(memory.DefaultAllocator, pkType)
-	tsBuilder := array.NewBuilder(memory.DefaultAllocator, arrow.PrimitiveTypes.Int64)
-	defer pkBuilder.Release()
-	defer tsBuilder.Release()
-
-	for i := int64(0); i < pack.deltaData.RowCount; i++ {
-		switch pkField.DataType {
-		case schemapb.DataType_Int64:
-			pkBuilder.(*array.Int64Builder).Append(pack.deltaData.Pks[i].GetValue().(int64))
-		case schemapb.DataType_VarChar:
-			pkBuilder.(*array.StringBuilder).Append(pack.deltaData.Pks[i].GetValue().(string))
-		default:
-			return nil, fmt.Errorf("unexpected pk type %v", pkField.DataType)
-		}
-		tsBuilder.(*array.Int64Builder).Append(int64(pack.deltaData.Tss[i]))
-	}
-
-	pkArray := pkBuilder.NewArray()
-	tsArray := tsBuilder.NewArray()
-	record := storage.NewSimpleArrowRecord(array.NewRecord(arrow.NewSchema([]arrow.Field{
-		{Name: "pk", Type: pkType},
-		{Name: "ts", Type: arrow.PrimitiveTypes.Int64},
-	}, nil), []arrow.Array{pkArray, tsArray}, pack.deltaData.RowCount), map[storage.FieldID]int{
-		common.RowIDField:     0,
-		common.TimeStampField: 1,
-	})
-	err = writer.Write(record)
+	// Use existing utility to build delete record
+	record, tsFrom, tsTo, err := storage.BuildDeleteRecord(pack.deltaData.Pks, pack.deltaData.Tss)
 	if err != nil {
 		return nil, err
 	}
-	err = writer.Close()
-	if err != nil {
+	defer record.Release()
+
+	if err = writer.Write(record); err != nil {
+		return nil, err
+	}
+	if err = writer.Close(); err != nil {
 		return nil, err
 	}
 
 	deltalog := &datapb.Binlog{
 		EntriesNum:    pack.deltaData.RowCount,
-		TimestampFrom: pack.tsFrom,
-		TimestampTo:   pack.tsTo,
-		LogPath:       path,
-		LogSize:       pack.deltaData.Size() / 4, // Not used
+		TimestampFrom: tsFrom,
+		TimestampTo:   tsTo,
+		LogPath:       deltaPath,
+		LogSize:       pack.deltaData.Size() / 4,
 		MemorySize:    pack.deltaData.Size(),
 	}
 	bw.sizeWritten += deltalog.LogSize

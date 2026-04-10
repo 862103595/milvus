@@ -31,12 +31,10 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
@@ -68,12 +66,14 @@ type Executor struct {
 	cluster   session.Cluster
 	nodeMgr   *session.NodeManager
 
-	executingTasks   *typeutil.ConcurrentSet[string] // task index
-	executingTaskNum atomic.Int32
-	executedFlag     chan struct{}
+	executingTasks    *typeutil.ConcurrentSet[string] // task index
+	channelTaskNum    atomic.Int32                    // channel task pool counter
+	nonChannelTaskNum atomic.Int32                    // non-channel task pool counter
+	executedFlag      chan struct{}
 }
 
-func NewExecutor(meta *meta.Meta,
+func NewExecutor(nodeID int64,
+	meta *meta.Meta,
 	dist *meta.DistributionManager,
 	broker meta.Broker,
 	targetMgr meta.TargetManagerInterface,
@@ -81,6 +81,7 @@ func NewExecutor(meta *meta.Meta,
 	nodeMgr *session.NodeManager,
 ) *Executor {
 	return &Executor{
+		nodeID:    nodeID,
 		doneCh:    make(chan struct{}),
 		meta:      meta,
 		dist:      dist,
@@ -101,7 +102,7 @@ func (ex *Executor) Stop() {
 	ex.wg.Wait()
 }
 
-func (ex *Executor) GetTaskExecutionCap() int32 {
+func (ex *Executor) GetTotalTaskExecutionCap() int32 {
 	nodeInfo := ex.nodeMgr.Get(ex.nodeID)
 	if nodeInfo == nil || nodeInfo.CPUNum() == 0 {
 		return Params.QueryCoordCfg.TaskExecutionCap.GetAsInt32()
@@ -112,6 +113,36 @@ func (ex *Executor) GetTaskExecutionCap() int32 {
 	return ret
 }
 
+// GetChannelTaskCap returns the capacity reserved for channel tasks.
+func (ex *Executor) GetChannelTaskCap() int32 {
+	total := ex.GetTotalTaskExecutionCap()
+	fraction := Params.QueryCoordCfg.ChannelTaskCapFraction.GetAsFloat()
+	if fraction < 0 {
+		fraction = 0
+	}
+	if fraction > 1 {
+		fraction = 1
+	}
+	cap := int32(math.Ceil(float64(total) * fraction))
+	if cap < 1 {
+		cap = 1
+	}
+	return cap
+}
+
+// GetNonChannelTaskCap returns the capacity for segment/leader/other tasks.
+// NOTE: when channelTaskCapFraction is 1.0, both pools get min-cap=1,
+// so the sum of channel + non-channel caps may exceed total. This is
+// intentional to guarantee liveness for both task types.
+func (ex *Executor) GetNonChannelTaskCap() int32 {
+	total := ex.GetTotalTaskExecutionCap()
+	nonChannelCap := total - ex.GetChannelTaskCap()
+	if nonChannelCap < 1 {
+		nonChannelCap = 1
+	}
+	return nonChannelCap
+}
+
 // Execute executes the given action,
 // does nothing and returns false if the action is already committed,
 // returns true otherwise.
@@ -120,10 +151,28 @@ func (ex *Executor) Execute(task Task, step int) bool {
 	if exist {
 		return false
 	}
-	if ex.executingTaskNum.Inc() > ex.GetTaskExecutionCap() {
-		ex.executingTasks.Remove(task.Index())
-		ex.executingTaskNum.Dec()
-		return false
+
+	_, isChannel := task.Actions()[step].(*ChannelAction)
+	if isChannel {
+		cur := ex.channelTaskNum.Inc()
+		if cur > ex.GetChannelTaskCap() {
+			ex.channelTaskNum.Dec()
+			ex.executingTasks.Remove(task.Index())
+			log.Debug("channel task rejected: pool full",
+				zap.Int32("current", cur),
+				zap.Int32("cap", ex.GetChannelTaskCap()))
+			return false
+		}
+	} else {
+		cur := ex.nonChannelTaskNum.Inc()
+		if cur > ex.GetNonChannelTaskCap() {
+			ex.nonChannelTaskNum.Dec()
+			ex.executingTasks.Remove(task.Index())
+			log.Debug("non-channel task rejected: pool full",
+				zap.Int32("current", cur),
+				zap.Int32("cap", ex.GetNonChannelTaskCap()))
+			return false
+		}
 	}
 
 	log := log.With(
@@ -172,12 +221,16 @@ func (ex *Executor) removeTask(task Task, step int) {
 	}
 
 	ex.executingTasks.Remove(task.Index())
-	ex.executingTaskNum.Dec()
+	if _, isChannel := task.Actions()[step].(*ChannelAction); isChannel {
+		ex.channelTaskNum.Dec()
+	} else {
+		ex.nonChannelTaskNum.Dec()
+	}
 }
 
 func (ex *Executor) executeSegmentAction(task *SegmentTask, step int) {
 	switch task.Actions()[step].Type() {
-	case ActionTypeGrow, ActionTypeUpdate, ActionTypeStatsUpdate:
+	case ActionTypeGrow, ActionTypeUpdate, ActionTypeStatsUpdate, ActionTypeReopen:
 		ex.loadSegment(task, step)
 
 	case ActionTypeReduce:
@@ -228,7 +281,7 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 	)
 
 	// get segment's replica first, then get shard leader by replica
-	replica := ex.meta.ReplicaManager.GetByCollectionAndNode(ctx, task.CollectionID(), action.Node())
+	replica := ex.meta.ReplicaManager.Get(ctx, task.ReplicaID())
 	if replica == nil {
 		msg := "node doesn't belong to any replica"
 		err := merr.WrapErrNodeNotAvailable(action.Node())
@@ -240,11 +293,6 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 		msg := "no shard leader for the segment to execute loading"
 		err = merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
 		log.Warn(msg, zap.Error(err))
-		return err
-	}
-
-	if err := ex.checkIfShardLeaderIsStreamingNode(view); err != nil {
-		log.Warn("shard leader is not a streamingnode, skip load segment", zap.Error(err))
 		return err
 	}
 
@@ -270,25 +318,29 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 	return nil
 }
 
-// checkIfShardLeaderIsStreamingNode checks if the shard leader is a streamingnode.
+// If we enable following checking when loading segments,
+// 1. all segment should always be loaded by streamingnode but not 2.5 querynode, make some search and query failure when upgrading.
+// Otherwise, some search and query result will be wrong when upgrading.
+// We choose to disable this checking for now to promise available search and query when upgrading.
+//
 // Because the L0 management at 2.6 and 2.5 is different, so when upgrading mixcoord,
 // the new mixcoord will make a wrong plan when balancing a segment from one query node to another by 2.5 delegator.
 // We need to balance the 2.5 delegator to 2.6 delegator before balancing any segment by 2.6 mixcoord.
-func (ex *Executor) checkIfShardLeaderIsStreamingNode(view *meta.DmChannel) error {
-	if !streamingutil.IsStreamingServiceEnabled() {
-		return nil
-	}
-
-	node := ex.nodeMgr.Get(view.Node)
-	if node == nil {
-		return merr.WrapErrServiceInternal(fmt.Sprintf("node %d is not found", view.Node))
-	}
-	nodes := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs()
-	if !nodes.Contain(view.Node) {
-		return merr.WrapErrServiceInternal(fmt.Sprintf("channel %s at node %d is not working at streamingnode, skip load segment", view.GetChannelName(), view.Node))
-	}
-	return nil
-}
+// func (ex *Executor) checkIfShardLeaderIsStreamingNode(view *meta.DmChannel) error {
+// 	if !streamingutil.IsStreamingServiceEnabled() {
+// 		return nil
+// 	}
+//
+// 	node := ex.nodeMgr.Get(view.Node)
+// 	if node == nil {
+// 		return merr.WrapErrServiceInternal(fmt.Sprintf("node %d is not found", view.Node))
+// 	}
+// 	nodes := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs()
+// 	if !nodes.Contain(view.Node) {
+// 		return merr.WrapErrServiceInternal(fmt.Sprintf("channel %s at node %d is not working at streamingnode, skip load segment", view.GetChannelName(), view.Node))
+// 	}
+// 	return nil
+// }
 
 func (ex *Executor) releaseSegment(task *SegmentTask, step int) {
 	defer ex.removeTask(task, step)
@@ -331,7 +383,7 @@ func (ex *Executor) releaseSegment(task *SegmentTask, step int) {
 
 		if ex.meta.CollectionManager.Exist(ctx, task.CollectionID()) {
 			// get segment's replica first, then get shard leader by replica
-			replica := ex.meta.ReplicaManager.GetByCollectionAndNode(ctx, task.CollectionID(), action.Node())
+			replica := ex.meta.ReplicaManager.Get(ctx, task.ReplicaID())
 			if replica == nil {
 				msg := "node doesn't belong to any replica, try to send release to worker"
 				err := merr.WrapErrNodeNotAvailable(action.Node())
@@ -447,6 +499,7 @@ func (ex *Executor) subscribeChannel(task *ChannelTask, step int) error {
 	}
 
 	version := ex.targetMgr.GetCollectionTargetVersion(ctx, task.CollectionID(), meta.NextTargetFirst)
+
 	req := packSubChannelRequest(
 		task,
 		action,
@@ -577,7 +630,13 @@ func (ex *Executor) executeDropIndexAction(task *DropIndexTask, step int) {
 		ex.removeTask(task, step)
 	}()
 
-	view := ex.dist.ChannelDistManager.GetShardLeader(task.Shard(), task.replica)
+	replica := ex.meta.ReplicaManager.Get(ctx, task.ReplicaID())
+	if replica == nil {
+		err = merr.WrapErrNodeNotAvailable(action.Node())
+		log.Warn("node doesn't belong to any replica", zap.Error(err))
+		return
+	}
+	view := ex.dist.ChannelDistManager.GetShardLeader(task.Shard(), replica)
 	if view == nil {
 		err = merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
 		log.Warn("failed to get shard leader", zap.Error(err))

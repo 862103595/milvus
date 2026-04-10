@@ -130,10 +130,11 @@ func (r *channelReplicator) init() error {
 		}
 		ch := make(adaptor.ChanMessageHandler)
 		scanner := streaming.WAL().Read(r.asyncNotifier.Context(), streaming.ReadOption{
-			PChannel:       r.channel.Value.GetSourceChannelName(),
-			DeliverPolicy:  options.DeliverPolicyStartFrom(cp.MessageID),
-			DeliverFilters: []options.DeliverFilter{options.DeliverFilterTimeTickGT(cp.TimeTick)},
-			MessageHandler: ch,
+			PChannel:               r.channel.Value.GetSourceChannelName(),
+			DeliverPolicy:          options.DeliverPolicyStartFrom(cp.MessageID),
+			DeliverFilters:         []options.DeliverFilter{options.DeliverFilterTimeTickGT(cp.TimeTick)},
+			MessageHandler:         ch,
+			IgnorePauseConsumption: true,
 		})
 		r.msgScanner = scanner
 		r.msgChan = ch
@@ -179,6 +180,17 @@ func (r *channelReplicator) startConsumeLoop() {
 
 func (r *channelReplicator) getReplicateCheckpoint() (*utility.ReplicateCheckpoint, error) {
 	logger := log.With(zap.String("key", r.channel.Key), zap.Int64("modRevision", r.channel.ModRevision))
+
+	// For pchannel-increasing tasks, the secondary WAL for new pchannels hasn't received the
+	// AlterReplicateConfig yet, so GetReplicateInfo would fail. Use InitializedCheckpoint directly.
+	if r.channel.Value.GetSkipGetReplicateCheckpoint() {
+		initializedCheckpoint := utility.NewReplicateCheckpointFromProto(r.channel.Value.InitializedCheckpoint)
+		logger.Info("skip get replicate checkpoint for pchannel-increasing task, use initialized checkpoint",
+			zap.Stringer("messageID", initializedCheckpoint.MessageID),
+			zap.Uint64("timeTick", initializedCheckpoint.TimeTick),
+		)
+		return initializedCheckpoint, nil
+	}
 
 	ctx, cancel := context.WithTimeout(r.asyncNotifier.Context(), 30*time.Second)
 	defer cancel()

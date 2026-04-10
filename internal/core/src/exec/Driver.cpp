@@ -15,24 +15,41 @@
 // limitations under the License.
 
 #include "Driver.h"
-#include "common/Tracer.h"
-#include "fmt/format.h"
 
+#include <folly/ExceptionWrapper.h>
+#include <folly/Try.h>
+#include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <exception>
 #include <memory>
+#include <string>
 
 #include "common/EasyAssert.h"
+#include "common/Exception.h"
+#include "common/Tracer.h"
+#include "common/protobuf_utils.h"
+#include "exec/QueryContext.h"
+#include "exec/Task.h"
+#include "exec/operator/AggregationNode.h"
 #include "exec/operator/CallbackSink.h"
-#include "exec/operator/CountNode.h"
+#include "exec/operator/ElementFilterBitsNode.h"
+#include "exec/operator/ElementFilterNode.h"
 #include "exec/operator/FilterBitsNode.h"
 #include "exec/operator/IterativeFilterNode.h"
 #include "exec/operator/MvccNode.h"
 #include "exec/operator/Operator.h"
-#include "exec/operator/RescoresNode.h"
-#include "exec/operator/VectorSearchNode.h"
+#include "exec/operator/ProjectNode.h"
 #include "exec/operator/RandomSampleNode.h"
-#include "exec/operator/GroupByNode.h"
-#include "exec/Task.h"
+#include "exec/operator/RescoresNode.h"
+#include "exec/operator/SearchGroupByNode.h"
+#include "exec/operator/VectorSearchNode.h"
+#include "exec/operator/QueryOrderByNode.h"
+#include "fmt/core.h"
+#include "folly/Executor.h"
+#include "folly/Unit.h"
+#include "glog/logging.h"
+#include "log/Log.h"
 #include "plan/PlanNode.h"
 
 namespace milvus {
@@ -46,8 +63,9 @@ DriverContext::GetQueryConfig() {
 }
 
 std::shared_ptr<Driver>
-DriverFactory::CreateDriver(std::unique_ptr<DriverContext> ctx,
-                            std::function<int(int pipelineid)> num_drivers) {
+DriverFactory::CreateDriver(
+    std::unique_ptr<DriverContext> ctx,
+    const std::function<int(int pipelineid)>& num_drivers) {
     auto driver = std::shared_ptr<Driver>(new Driver());
     ctx->driver_ = driver.get();
     std::vector<std::unique_ptr<Operator>> operators;
@@ -74,24 +92,36 @@ DriverFactory::CreateDriver(std::unique_ptr<DriverContext> ctx,
             tracer::AddEvent("create_operator: MvccNode");
             operators.push_back(
                 std::make_unique<PhyMvccNode>(id, ctx.get(), mvccnode));
-        } else if (auto countnode =
-                       std::dynamic_pointer_cast<const plan::CountNode>(
-                           plannode)) {
-            tracer::AddEvent("create_operator: CountNode");
-            operators.push_back(
-                std::make_unique<PhyCountNode>(id, ctx.get(), countnode));
         } else if (auto vectorsearchnode =
                        std::dynamic_pointer_cast<const plan::VectorSearchNode>(
                            plannode)) {
             tracer::AddEvent("create_operator: VectorSearchNode");
             operators.push_back(std::make_unique<PhyVectorSearchNode>(
                 id, ctx.get(), vectorsearchnode));
-        } else if (auto groupbynode =
-                       std::dynamic_pointer_cast<const plan::GroupByNode>(
+        } else if (auto searchGroupByNode =
+                       std::dynamic_pointer_cast<const plan::SearchGroupByNode>(
                            plannode)) {
-            tracer::AddEvent("create_operator: GroupByNode");
+            tracer::AddEvent("create_operator: SearchGroupByNode");
+            operators.push_back(std::make_unique<PhySearchGroupByNode>(
+                id, ctx.get(), searchGroupByNode));
+        } else if (auto queryGroupByNode =
+                       std::dynamic_pointer_cast<const plan::AggregationNode>(
+                           plannode)) {
+            tracer::AddEvent("create_operator: AggregationNode");
+            operators.push_back(std::make_unique<PhyAggregationNode>(
+                id, ctx.get(), queryGroupByNode));
+        } else if (auto projectNode =
+                       std::dynamic_pointer_cast<const plan::ProjectNode>(
+                           plannode)) {
+            tracer::AddEvent("create_operator: ProjectNode");
             operators.push_back(
-                std::make_unique<PhyGroupByNode>(id, ctx.get(), groupbynode));
+                std::make_unique<PhyProjectNode>(id, ctx.get(), projectNode));
+        } else if (auto orderByNode =
+                       std::dynamic_pointer_cast<const plan::OrderByNode>(
+                           plannode)) {
+            tracer::AddEvent("create_operator: QueryOrderByNode");
+            operators.push_back(std::make_unique<PhyQueryOrderByNode>(
+                id, ctx.get(), orderByNode));
         } else if (auto samplenode =
                        std::dynamic_pointer_cast<const plan::RandomSampleNode>(
                            plannode)) {
@@ -104,6 +134,19 @@ DriverFactory::CreateDriver(std::unique_ptr<DriverContext> ctx,
             tracer::AddEvent("create_operator: RescoresNode");
             operators.push_back(
                 std::make_unique<PhyRescoresNode>(id, ctx.get(), rescoresnode));
+        } else if (auto node =
+                       std::dynamic_pointer_cast<const plan::ElementFilterNode>(
+                           plannode)) {
+            tracer::AddEvent("create_operator: ElementFilterNode");
+            operators.push_back(
+                std::make_unique<PhyElementFilterNode>(id, ctx.get(), node));
+        } else if (auto node = std::dynamic_pointer_cast<
+                       const plan::ElementFilterBitsNode>(plannode)) {
+            tracer::AddEvent("create_operator: ElementFilterBitsNode");
+            operators.push_back(std::make_unique<PhyElementFilterBitsNode>(
+                id, ctx.get(), node));
+        } else {
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown plan node type");
         }
         // TODO: add more operators
     }
@@ -157,6 +200,31 @@ Driver::Run(std::shared_ptr<Driver> self) {
 }
 
 void
+Driver::initializeOperators() {
+    // Atomically check and set: only the first thread to call this will
+    // get false (the previous value) and proceed with initialization.
+    // Other threads will get true and skip initialization.
+    // Use memory barriers to ensure initialization writes are visible
+    // before the flag is seen by other threads.
+    if (!operatorsInitialized_.exchange(true, std::memory_order_acq_rel)) {
+        // This thread won the initialization race. Perform initialization.
+        for (auto& op : operators_) {
+            op->initialize();
+        }
+        // Use release semantics to ensure all initialization writes are
+        // visible to other threads before they see the flag as true.
+        // The flag was already set to true by exchange above, but this
+        // barrier ensures all writes from initialization are visible.
+        std::atomic_thread_fence(std::memory_order_release);
+    } else {
+        // Another thread is initializing or has completed initialization.
+        // Use acquire semantics to ensure we see all initialization writes
+        // after the flag becomes true.
+        operatorsInitialized_.load(std::memory_order_acquire);
+    }
+}
+
+void
 Driver::Init(std::unique_ptr<DriverContext> ctx,
              std::vector<std::unique_ptr<Operator>> operators) {
     assert(ctx != nullptr);
@@ -206,7 +274,7 @@ Driver::Next(std::shared_ptr<BlockingState>& blocking_state) {
             operator->get_plannode_id(),                           \
             e.what(),                                              \
             stack_trace);                                          \
-        LOG_ERROR(err_msg);                                        \
+        LOG_ERROR("{}", err_msg);                                  \
         throw ExecOperatorException(err_msg);                      \
     }
 
@@ -215,13 +283,13 @@ Driver::RunInternal(std::shared_ptr<Driver>& self,
                     std::shared_ptr<BlockingState>& blocking_state,
                     RowVectorPtr& result) {
     try {
+        initializeOperators();
         int num_operators = operators_.size();
         ContinueFuture future;
 
         for (;;) {
             for (int32_t i = num_operators - 1; i >= 0; --i) {
                 auto op = operators_[i].get();
-
                 current_operator_index_ = i;
                 CALL_OPERATOR(
                     blocking_reason_ = op->IsBlocked(&future), op, "IsBlocked");

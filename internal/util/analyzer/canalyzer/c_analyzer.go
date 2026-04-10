@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/milvus-io/milvus/internal/util/analyzer/interfaces"
+	_ "github.com/milvus-io/milvus/internal/util/cgo"
 )
 
 var _ interfaces.Analyzer = (*CAnalyzer)(nil)
@@ -44,4 +45,10 @@ func (impl *CAnalyzer) Clone() (interfaces.Analyzer, error) {
 
 func (impl *CAnalyzer) Destroy() {
 	C.free_tokenizer(impl.ptr)
+}
+
+// GetCPtr returns the underlying C tokenizer pointer
+// This is used for optimizations that need direct C API access
+func (impl *CAnalyzer) GetCPtr() unsafe.Pointer {
+	return unsafe.Pointer(impl.ptr)
 }

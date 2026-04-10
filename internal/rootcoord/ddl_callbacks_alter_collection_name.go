@@ -36,10 +36,8 @@ func (c *Core) broadcastAlterCollectionForRenameCollection(ctx context.Context, 
 
 	// StartBroadcastWithResourceKeys will deduplicate the resource keys itself, so it's safe to add all the resource keys here.
 	rks := []message.ResourceKey{
-		message.NewSharedDBNameResourceKey(req.GetNewDBName()),
-		message.NewSharedDBNameResourceKey(req.GetDbName()),
-		message.NewExclusiveCollectionNameResourceKey(req.GetDbName(), req.GetOldName()),
-		message.NewExclusiveCollectionNameResourceKey(req.GetNewDBName(), req.GetNewName()),
+		message.NewExclusiveDBNameResourceKey(req.GetNewDBName()),
+		message.NewExclusiveDBNameResourceKey(req.GetDbName()),
 	}
 	broadcaster, err := broadcast.StartBroadcastWithResourceKeys(ctx, rks...)
 	if err != nil {
@@ -121,7 +119,7 @@ func (c *Core) validateEncryption(ctx context.Context, oldDBName string, newDBNa
 	}
 
 	// Check if either database has encryption enabled
-	if hookutil.IsDBEncryptionEnabled(originalDB.Properties) || hookutil.IsDBEncryptionEnabled(targetDB.Properties) {
+	if hookutil.IsDBEncrypted(originalDB.Properties) || hookutil.IsDBEncrypted(targetDB.Properties) {
 		return fmt.Errorf("deny to change collection databases due to at least one database enabled encryption, original DB: %s, target DB: %s", oldDBName, newDBName)
 	}
 

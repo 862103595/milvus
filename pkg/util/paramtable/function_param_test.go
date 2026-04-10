@@ -59,6 +59,9 @@ func TestFunctionConfig(t *testing.T) {
 		"vertexai.url",
 		"vertexai.credential",
 		"vertexai.enable",
+		"yc.credential",
+		"yc.url",
+		"yc.enable",
 	}
 	for _, key := range keys {
 		assert.True(t, cfg.TextEmbeddingProviders.GetDoc(key) != "")
@@ -84,4 +87,6 @@ func TestFunctionConfig(t *testing.T) {
 		assert.True(t, cfg.RerankModelProviders.GetDoc(key) != "")
 	}
 	assert.True(t, cfg.RerankModelProviders.GetDoc("Unknow") == "")
+
+	assert.Equal(t, 5, cfg.GetBatchFactor())
 }

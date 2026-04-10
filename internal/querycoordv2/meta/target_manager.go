@@ -102,8 +102,6 @@ func NewTargetManager(broker Broker, meta *Meta) *TargetManager {
 func (mgr *TargetManager) UpdateCollectionCurrentTarget(ctx context.Context, collectionID int64) bool {
 	log := log.With(zap.Int64("collectionID", collectionID))
 
-	log.Debug("start to update current target for collection")
-
 	newTarget := mgr.next.getCollectionTarget(collectionID)
 	if newTarget == nil || newTarget.IsEmpty() {
 		log.Info("next target does not exist, skip it")
@@ -116,7 +114,7 @@ func (mgr *TargetManager) UpdateCollectionCurrentTarget(ctx context.Context, col
 	for channelName, dmlChannel := range newTarget.dmChannels {
 		ts, _ := tsoutil.ParseTS(dmlChannel.GetSeekPosition().GetTimestamp())
 		metrics.QueryCoordCurrentTargetCheckpointUnixSeconds.WithLabelValues(
-			fmt.Sprint(paramtable.GetNodeID()),
+			paramtable.GetStringNodeID(),
 			channelName,
 		).Set(float64(ts.Unix()))
 		partStatsVersionInfo += fmt.Sprintf("%s:[", channelName)
@@ -218,7 +216,11 @@ func (mgr *TargetManager) RemoveCollection(ctx context.Context, collectionID int
 	if current != nil {
 		for channelName := range current.GetAllDmChannels() {
 			metrics.QueryCoordCurrentTargetCheckpointUnixSeconds.DeleteLabelValues(
-				fmt.Sprint(paramtable.GetNodeID()),
+				paramtable.GetStringNodeID(),
+				channelName,
+			)
+			metrics.QueryCoordCurrentTargetAllReplicasCheckpointUnixSeconds.DeleteLabelValues(
+				paramtable.GetStringNodeID(),
 				channelName,
 			)
 		}
@@ -573,11 +575,13 @@ func (mgr *TargetManager) Recover(ctx context.Context, catalog metastore.QueryCo
 			zap.Int("segmentNum", len(newTarget.GetAllSegmentIDs())),
 			zap.Int64("version", newTarget.GetTargetVersion()),
 		)
+	}
 
-		// clear target info in meta store
-		err := catalog.RemoveCollectionTarget(ctx, t.GetCollectionID())
-		if err != nil {
-			log.Warn("failed to clear collection target from etcd", zap.Error(err))
+	// Remove all target keys from etcd after in-memory recovery is done.
+	// Uses RemoveWithPrefix which is a single etcd call.
+	if len(targets) > 0 {
+		if err := catalog.RemoveCollectionTargets(ctx); err != nil {
+			log.Warn("failed to remove collection targets from etcd", zap.Error(err))
 		}
 	}
 

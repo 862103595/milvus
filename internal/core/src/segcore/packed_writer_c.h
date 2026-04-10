@@ -14,14 +14,19 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #include "common/common_type_c.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include "common/type_c.h"
-#include <arrow/c/abi.h>
 #include "segcore/column_groups_c.h"
+
+// Forward declarations for Arrow C Data Interface structs
+struct ArrowSchema;
+struct ArrowArray;
 
 typedef void* CPackedWriter;
 
@@ -31,7 +36,7 @@ NewPackedWriterWithStorageConfig(struct ArrowSchema* schema,
                                  char** paths,
                                  int64_t num_paths,
                                  int64_t part_upload_size,
-                                 CColumnGroups column_groups,
+                                 CColumnSplits column_splits,
                                  CStorageConfig c_storage_config,
                                  CPackedWriter* c_packed_writer,
                                  CPluginContext* c_plugin_context);
@@ -42,7 +47,7 @@ NewPackedWriter(struct ArrowSchema* schema,
                 char** paths,
                 int64_t num_paths,
                 int64_t part_upload_size,
-                CColumnGroups column_groups,
+                CColumnSplits column_splits,
                 CPackedWriter* c_packed_writer,
                 CPluginContext* c_plugin_context);
 

@@ -16,17 +16,21 @@
 
 #pragma once
 
+#include <stdint.h>
+#include <algorithm>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
-#include "common/Types.h"
-#include "common/Vector.h"
-#include "expr/ITypeExpr.h"
 #include "common/EasyAssert.h"
+#include "common/Types.h"
+#include "common/Utils.h"
+#include "common/protobuf_utils.h"
+#include "expr/ITypeExpr.h"
+#include "fmt/core.h"
 #include "pb/plan.pb.h"
-#include "segcore/SegmentInterface.h"
-#include "plan/PlanNodeIdGenerator.h"
 #include "rescores/Scorer.h"
 
 namespace milvus {
@@ -49,7 +53,7 @@ class PlanNode {
         return id_;
     }
 
-    virtual DataType
+    virtual RowTypePtr
     output_type() const = 0;
 
     virtual std::vector<std::shared_ptr<PlanNode>>
@@ -85,7 +89,6 @@ class PlanNode {
 };
 
 using PlanNodePtr = std::shared_ptr<PlanNode>;
-
 class FilterNode : public PlanNode {
  public:
     FilterNode(const PlanNodeId& id,
@@ -100,9 +103,9 @@ class FilterNode : public PlanNode {
                         filter_->type()));
     }
 
-    DataType
+    RowTypePtr
     output_type() const override {
-        return sources_[0]->output_type();
+        return RowType::None;
     }
 
     std::vector<PlanNodePtr>
@@ -145,9 +148,9 @@ class FilterBitsNode : public PlanNode {
                         filter_->type()));
     }
 
-    DataType
+    RowTypePtr
     output_type() const override {
-        return DataType::BOOL;
+        return RowType::None;
     }
 
     std::vector<PlanNodePtr>
@@ -167,7 +170,7 @@ class FilterBitsNode : public PlanNode {
 
     std::string
     ToString() const override {
-        return fmt::format("FilterBitsNode:\n\t[filter_expr:{}]",
+        return fmt::format("FilterBitsNode:[filter_expr:{}]",
                            filter_->ToString());
     }
 
@@ -183,6 +186,182 @@ class FilterBitsNode : public PlanNode {
     const expr::TypedExprPtr filter_;
 };
 
+class ElementFilterNode : public PlanNode {
+ public:
+    ElementFilterNode(const PlanNodeId& id,
+                      expr::TypedExprPtr element_filter,
+                      std::string struct_name,
+                      std::vector<PlanNodePtr> sources,
+                      bool has_doc_predicate = true)
+        : PlanNode(id),
+          sources_{std::move(sources)},
+          element_filter_(std::move(element_filter)),
+          struct_name_(std::move(struct_name)),
+          has_doc_predicate_(has_doc_predicate) {
+        AssertInfo(
+            element_filter_->type() == DataType::BOOL,
+            fmt::format(
+                "Element filter expression must be of type BOOLEAN, Got {}",
+                element_filter_->type()));
+    }
+
+    RowTypePtr
+    output_type() const override {
+        return RowType::None;
+    }
+
+    std::vector<PlanNodePtr>
+    sources() const override {
+        return sources_;
+    }
+
+    const expr::TypedExprPtr&
+    element_filter() const {
+        return element_filter_;
+    }
+
+    const std::string&
+    struct_name() const {
+        return struct_name_;
+    }
+
+    bool
+    has_doc_predicate() const {
+        return has_doc_predicate_;
+    }
+
+    std::string_view
+    name() const override {
+        return "ElementFilter";
+    }
+
+    std::string
+    ToString() const override {
+        return fmt::format(
+            "ElementFilterNode:[struct_name:{}, element_filter:{}, "
+            "has_doc_predicate:{}]",
+            struct_name_,
+            element_filter_->ToString(),
+            has_doc_predicate_);
+    }
+
+ private:
+    const std::vector<PlanNodePtr> sources_;
+    const expr::TypedExprPtr element_filter_;
+    const std::string struct_name_;
+    const bool has_doc_predicate_;
+};
+
+class ElementFilterBitsNode : public PlanNode {
+ public:
+    ElementFilterBitsNode(
+        const PlanNodeId& id,
+        expr::TypedExprPtr element_filter,
+        std::string struct_name,
+        std::vector<PlanNodePtr> sources = std::vector<PlanNodePtr>{})
+        : PlanNode(id),
+          sources_{std::move(sources)},
+          element_filter_(std::move(element_filter)),
+          struct_name_(std::move(struct_name)) {
+        AssertInfo(
+            element_filter_->type() == DataType::BOOL,
+            fmt::format(
+                "Element filter expression must be of type BOOLEAN, Got {}",
+                element_filter_->type()));
+    }
+
+    RowTypePtr
+    output_type() const override {
+        return RowType::None;
+    }
+
+    std::vector<PlanNodePtr>
+    sources() const override {
+        return sources_;
+    }
+
+    const expr::TypedExprPtr&
+    element_filter() const {
+        return element_filter_;
+    }
+
+    const std::string&
+    struct_name() const {
+        return struct_name_;
+    }
+
+    std::string_view
+    name() const override {
+        return "ElementFilterBits";
+    }
+
+    std::string
+    ToString() const override {
+        return fmt::format(
+            "ElementFilterBitsNode:[struct_name:{}, element_filter:{}]",
+            struct_name_,
+            element_filter_->ToString());
+    }
+
+    expr::ExprInfo
+    GatherInfo() const override {
+        expr::ExprInfo info;
+        element_filter_->GatherInfo(info);
+        return info;
+    }
+
+ private:
+    const std::vector<PlanNodePtr> sources_;
+    const expr::TypedExprPtr element_filter_;
+    const std::string struct_name_;
+};
+
+class ProjectNode : public PlanNode {
+ public:
+    ProjectNode(const PlanNodeId& id,
+                std::vector<FieldId>&& field_ids,
+                std::vector<std::string>&& field_names,
+                std::vector<milvus::DataType>&& field_types,
+                std::vector<PlanNodePtr> sources = std::vector<PlanNodePtr>{})
+        : PlanNode(id),
+          sources_(std::move(sources)),
+          field_ids_(std::move(field_ids)),
+          output_type_(std::make_shared<RowType>(std::move(field_names),
+                                                 std::move(field_types))) {
+    }
+
+    std::vector<PlanNodePtr>
+    sources() const override {
+        return sources_;
+    }
+
+    RowTypePtr
+    output_type() const override {
+        return output_type_;
+    }
+
+    std::string_view
+    name() const override {
+        return "ProjectNode";
+    }
+
+    std::string
+    ToString() const override {
+        return fmt::format("ProjectNode:\n\t[source node:{}]",
+                           SourceToString());
+    }
+
+    const std::vector<FieldId>&
+    FieldsToProject() const {
+        return field_ids_;
+    }
+
+ private:
+    const std::vector<PlanNodePtr> sources_;
+    const std::vector<FieldId> field_ids_;
+    const RowTypePtr output_type_;
+};
+
 class MvccNode : public PlanNode {
  public:
     MvccNode(const PlanNodeId& id,
@@ -190,9 +369,9 @@ class MvccNode : public PlanNode {
         : PlanNode(id), sources_{std::move(sources)} {
     }
 
-    DataType
+    RowTypePtr
     output_type() const override {
-        return DataType::BOOL;
+        return RowType::None;
     }
 
     std::vector<PlanNodePtr>
@@ -207,7 +386,7 @@ class MvccNode : public PlanNode {
 
     std::string
     ToString() const override {
-        return fmt::format("MvccNode:\n\t[source node:{}]", SourceToString());
+        return fmt::format("MvccNode:[source_node:{}]", SourceToString());
     }
 
  private:
@@ -223,9 +402,9 @@ class RandomSampleNode : public PlanNode {
         : PlanNode(id), factor_(factor), sources_(std::move(sources)) {
     }
 
-    DataType
+    RowTypePtr
     output_type() const override {
-        return DataType::BOOL;
+        return RowType::None;
     }
 
     std::vector<PlanNodePtr>
@@ -240,7 +419,7 @@ class RandomSampleNode : public PlanNode {
 
     std::string
     ToString() const override {
-        return fmt::format("RandomSampleNode:\n\t[factor:{}]", factor_);
+        return fmt::format("RandomSampleNode:[factor:{}]", factor_);
     }
 
     float
@@ -261,9 +440,9 @@ class VectorSearchNode : public PlanNode {
         : PlanNode(id), sources_{std::move(sources)} {
     }
 
-    DataType
+    RowTypePtr
     output_type() const override {
-        return DataType::BOOL;
+        return RowType::None;
     }
 
     std::vector<PlanNodePtr>
@@ -278,7 +457,7 @@ class VectorSearchNode : public PlanNode {
 
     std::string
     ToString() const override {
-        return fmt::format("VectorSearchNode:\n\t[source node:{}]",
+        return fmt::format("VectorSearchNode:[source_node:{}]",
                            SourceToString());
     }
 
@@ -286,49 +465,17 @@ class VectorSearchNode : public PlanNode {
     const std::vector<PlanNodePtr> sources_;
 };
 
-class GroupByNode : public PlanNode {
+class SearchGroupByNode : public PlanNode {
  public:
-    GroupByNode(const PlanNodeId& id,
-                std::vector<PlanNodePtr> sources = std::vector<PlanNodePtr>{})
-        : PlanNode(id), sources_{std::move(sources)} {
-    }
-
-    DataType
-    output_type() const override {
-        return DataType::BOOL;
-    }
-
-    std::vector<PlanNodePtr>
-    sources() const override {
-        return sources_;
-    }
-
-    std::string_view
-    name() const override {
-        return "GroupByNode";
-    }
-
-    std::string
-    ToString() const override {
-        return fmt::format("GroupByNode:\n\t[source node:{}]",
-                           SourceToString());
-    }
-
- private:
-    const std::vector<PlanNodePtr> sources_;
-};
-
-class CountNode : public PlanNode {
- public:
-    CountNode(
+    SearchGroupByNode(
         const PlanNodeId& id,
-        const std::vector<PlanNodePtr>& sources = std::vector<PlanNodePtr>{})
+        std::vector<PlanNodePtr> sources = std::vector<PlanNodePtr>{})
         : PlanNode(id), sources_{std::move(sources)} {
     }
 
-    DataType
+    RowTypePtr
     output_type() const override {
-        return DataType::INT64;
+        return RowType::None;
     }
 
     std::vector<PlanNodePtr>
@@ -338,12 +485,13 @@ class CountNode : public PlanNode {
 
     std::string_view
     name() const override {
-        return "CountNode";
+        return "SearchGroupByNode";
     }
 
     std::string
     ToString() const override {
-        return fmt::format("CountNode:\n\t[source node:{}]", SourceToString());
+        return fmt::format("SearchGroupByNode:\n\t[source node:{}]",
+                           SourceToString());
     }
 
  private:
@@ -363,9 +511,11 @@ class RescoresNode : public PlanNode {
           sources_{std::move(sources)} {
     }
 
-    DataType
+    RowTypePtr
     output_type() const override {
-        return DataType::INT64;
+        return std::make_shared<const RowType>(
+            std::vector<std::string>{"scores"},
+            std::vector<milvus::DataType>{DataType::INT64});
     }
 
     std::vector<PlanNodePtr>
@@ -390,14 +540,208 @@ class RescoresNode : public PlanNode {
 
     std::string
     ToString() const override {
-        return fmt::format("RescoresNode:\n\t[source node:{}]",
-                           SourceToString());
+        return fmt::format("RescoresNode:[source_node:{}]", SourceToString());
     }
 
  private:
     const proto::plan::ScoreOption option_;
     const std::vector<PlanNodePtr> sources_;
     const std::vector<std::shared_ptr<rescores::Scorer>> scorers_;
+};
+
+class AggregationNode : public PlanNode {
+ public:
+    struct Aggregate {
+        /// Function name and input column names.
+        expr::CallExprPtr call_;
+
+        /// Raw input types used to properly identify aggregate function.
+        std::vector<DataType> rawInputTypes_;
+
+        DataType resultType_;
+
+     public:
+        Aggregate(expr::CallExprPtr call) : call_(call) {
+        }
+    };
+
+    AggregationNode(
+        const PlanNodeId& id,
+        std::vector<expr::FieldAccessTypeExprPtr>&& groupingKeys,
+        std::vector<std::string>&& aggNames,
+        std::vector<Aggregate>&& aggregates,
+        std::vector<PlanNodePtr> sources = std::vector<PlanNodePtr>{});
+
+    RowTypePtr
+    output_type() const override {
+        return output_type_;
+    }
+
+    std::vector<PlanNodePtr>
+    sources() const override {
+        return sources_;
+    }
+
+    std::string
+    ToString() const override {
+        return "";
+    }
+
+    std::string_view
+    name() const override {
+        return "agg";
+    }
+
+    const std::vector<expr::FieldAccessTypeExprPtr>&
+    GroupingKeys() const {
+        return groupingKeys_;
+    }
+
+    const std::vector<Aggregate>&
+    aggregates() const {
+        return aggregates_;
+    }
+
+ private:
+    const std::vector<expr::FieldAccessTypeExprPtr> groupingKeys_;
+    const std::vector<std::string> aggregateNames_;
+    const std::vector<Aggregate> aggregates_;
+    const std::vector<PlanNodePtr> sources_;
+    const RowTypePtr output_type_;
+};
+
+/// Sort order specification for ORDER BY
+struct SortOrder {
+    bool ascending;    // true = ASC (default), false = DESC
+    bool nulls_first;  // true = NULLS FIRST, false = NULLS LAST (default)
+
+    SortOrder(bool asc = true, bool nulls_first_val = false)
+        : ascending(asc), nulls_first(nulls_first_val) {
+    }
+
+    /// Standard sort orders
+    static SortOrder
+    kAscNullsFirst() {
+        return SortOrder(true, true);
+    }
+    static SortOrder
+    kAscNullsLast() {
+        return SortOrder(true, false);
+    }
+    static SortOrder
+    kDescNullsFirst() {
+        return SortOrder(false, true);
+    }
+    static SortOrder
+    kDescNullsLast() {
+        return SortOrder(false, false);
+    }
+};
+
+/**
+ * @brief Plan node for ORDER BY operations
+ *
+ * Represents the logical plan for sorting query results by one or more fields.
+ * The physical operator (PhyQueryOrderByNode) uses SortBuffer for execution.
+ *
+ * Pipeline position:
+ *   FilterBitsNode → ProjectNode → OrderByNode
+ *   FilterBitsNode → ProjectNode → AggregationNode → OrderByNode
+ */
+class OrderByNode : public PlanNode {
+ public:
+    /**
+     * @brief Construct an OrderByNode
+     *
+     * @param id Plan node ID
+     * @param sorting_keys Fields to sort by (in order of priority)
+     * @param sorting_orders Sort direction and null handling per key
+     * @param limit Maximum rows to return (-1 for unlimited)
+     * @param sources Source plan nodes
+     *
+     * @note Offset is NOT supported at segment level. In distributed queries,
+     *       offset must be applied at the proxy reduce level after k-way merge.
+     *       Segments should use (offset + limit) as the limit parameter.
+     */
+    OrderByNode(const PlanNodeId& id,
+                std::vector<expr::FieldAccessTypeExprPtr>&& sorting_keys,
+                std::vector<SortOrder>&& sorting_orders,
+                int64_t limit,
+                std::vector<PlanNodePtr> sources)
+        : PlanNode(id),
+          sorting_keys_(std::move(sorting_keys)),
+          sorting_orders_(std::move(sorting_orders)),
+          limit_(limit),
+          sources_(std::move(sources)) {
+        AssertInfo(
+            sorting_keys_.size() == sorting_orders_.size(),
+            "Number of sorting keys ({}) must match number of sort orders ({})",
+            sorting_keys_.size(),
+            sorting_orders_.size());
+        AssertInfo(!sorting_keys_.empty(),
+                   "OrderByNode requires at least one sorting key");
+
+        // OrderByNode always requires a source node that produces data to sort.
+        AssertInfo(!sources_.empty() && sources_[0]->output_type(),
+                   "OrderByNode requires a source node with valid output type");
+        output_type_ = sources_[0]->output_type();
+    }
+
+    RowTypePtr
+    output_type() const override {
+        return output_type_;
+    }
+
+    std::vector<PlanNodePtr>
+    sources() const override {
+        return sources_;
+    }
+
+    std::string_view
+    name() const override {
+        return "OrderBy";
+    }
+
+    std::string
+    ToString() const override {
+        std::vector<std::string> key_strs;
+        key_strs.reserve(sorting_keys_.size());
+        for (size_t i = 0; i < sorting_keys_.size(); ++i) {
+            key_strs.push_back(fmt::format(
+                "{} {} {}",
+                sorting_keys_[i]->name(),
+                sorting_orders_[i].ascending ? "ASC" : "DESC",
+                sorting_orders_[i].nulls_first ? "NULLS FIRST" : "NULLS LAST"));
+        }
+        return fmt::format("OrderByNode:[keys=[{}], limit={}]",
+                           fmt::join(key_strs, ", "),
+                           limit_);
+    }
+
+    /// Get the sorting key expressions
+    const std::vector<expr::FieldAccessTypeExprPtr>&
+    SortingKeys() const {
+        return sorting_keys_;
+    }
+
+    /// Get the sort orders (one per key)
+    const std::vector<SortOrder>&
+    SortingOrders() const {
+        return sorting_orders_;
+    }
+
+    /// Get the limit (-1 means unlimited)
+    int64_t
+    Limit() const {
+        return limit_;
+    }
+
+ private:
+    const std::vector<expr::FieldAccessTypeExprPtr> sorting_keys_;
+    const std::vector<SortOrder> sorting_orders_;
+    const int64_t limit_;
+    const std::vector<PlanNodePtr> sources_;
+    RowTypePtr output_type_;
 };
 
 enum class ExecutionStrategy {

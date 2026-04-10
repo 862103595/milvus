@@ -18,6 +18,7 @@
 package datacoord
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -29,6 +30,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 	"golang.org/x/exp/maps"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -36,13 +38,14 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
 	"github.com/milvus-io/milvus/internal/metastore"
-	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/segmentutil"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
@@ -52,6 +55,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -78,6 +82,7 @@ type CompactionMeta interface {
 	GetAnalyzeMeta() *analyzeMeta
 	GetPartitionStatsMeta() *partitionStatsMeta
 	GetCompactionTaskMeta() *compactionTaskMeta
+	GetFileResources(ctx context.Context, resourceIDs ...int64) ([]*internalpb.FileResourceInfo, error)
 }
 
 var _ CompactionMeta = (*meta)(nil)
@@ -94,15 +99,19 @@ type meta struct {
 	channelCPs   *channelCPs // vChannel -> channel checkpoint/see position
 	chunkManager storage.ChunkManager
 
-	indexMeta          *indexMeta
-	analyzeMeta        *analyzeMeta
-	partitionStatsMeta *partitionStatsMeta
-	compactionTaskMeta *compactionTaskMeta
-	statsTaskMeta      *statsTaskMeta
+	indexMeta                     *indexMeta
+	analyzeMeta                   *analyzeMeta
+	partitionStatsMeta            *partitionStatsMeta
+	compactionTaskMeta            *compactionTaskMeta
+	statsTaskMeta                 *statsTaskMeta
+	externalCollectionRefreshMeta *externalCollectionRefreshMeta
 
 	// File Resource Meta
-	resourceMeta map[string]*model.FileResource
-	resourceLock lock.RWMutex
+	resourceIDMap   map[int64]*internalpb.FileResourceInfo // id -> info
+	resourceVersion uint64
+	resourceLock    lock.RWMutex
+	// Snapshot Meta
+	snapshotMeta *snapshotMeta
 }
 
 func (m *meta) GetIndexMeta() *indexMeta {
@@ -121,22 +130,30 @@ func (m *meta) GetCompactionTaskMeta() *compactionTaskMeta {
 	return m.compactionTaskMeta
 }
 
+func (m *meta) GetSnapshotMeta() *snapshotMeta {
+	return m.snapshotMeta
+}
+
 type channelCPs struct {
 	lock.RWMutex
 	checkpoints map[string]*msgpb.MsgPosition
+	cond        *syncutil.ContextCond
 }
 
 func newChannelCps() *channelCPs {
-	return &channelCPs{
+	cp := &channelCPs{
 		checkpoints: make(map[string]*msgpb.MsgPosition),
 	}
+	// use the same lock as channelCPs
+	cp.cond = syncutil.NewContextCond(&cp.RWMutex)
+	return cp
 }
 
 // A local cache of segment metric update. Must call commit() to take effect.
 type segMetricMutation struct {
-	stateChange       map[string]map[string]map[string]int // segment state, seg level -> state -> isSorted change count (to increase or decrease).
-	rowCountChange    int64                                // Change in # of rows.
-	rowCountAccChange int64                                // Total # of historical added rows, accumulated.
+	stateChange       map[string]map[string]map[string]map[string]int // segment state, seg level -> state -> isSorted -> storageVersion change count (to increase or decrease).
+	rowCountChange    int64                                           // Change in # of rows.
+	rowCountAccChange int64                                           // Total # of historical added rows, accumulated.
 }
 
 type collectionInfo struct {
@@ -151,84 +168,148 @@ type collectionInfo struct {
 	VChannelNames  []string
 }
 
+// IsExternal returns true when the collection schema references an external source or spec.
+func (c *collectionInfo) IsExternal() bool {
+	if c == nil {
+		return false
+	}
+	if c.Schema == nil {
+		return false
+	}
+	return typeutil.IsExternalCollection(c.Schema)
+}
+
 type dbInfo struct {
 	ID         int64
 	Name       string
 	Properties []*commonpb.KeyValuePair
 }
 
-// NewMeta creates meta from provided `kv.TxnKV`
-func newMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, broker broker.Broker) (*meta, error) {
-	im, err := newIndexMeta(ctx, catalog)
-	if err != nil {
-		return nil, err
-	}
-
-	am, err := newAnalyzeMeta(ctx, catalog)
-	if err != nil {
-		return nil, err
-	}
-
-	psm, err := newPartitionStatsMeta(ctx, catalog)
-	if err != nil {
-		return nil, err
-	}
-
-	ctm, err := newCompactionTaskMeta(ctx, catalog)
-	if err != nil {
-		return nil, err
-	}
-
-	stm, err := newStatsTaskMeta(ctx, catalog)
-	if err != nil {
-		return nil, err
-	}
-	mt := &meta{
-		ctx:                ctx,
-		catalog:            catalog,
-		collections:        typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-		segments:           NewSegmentsInfo(),
-		channelCPs:         newChannelCps(),
-		indexMeta:          im,
-		analyzeMeta:        am,
-		chunkManager:       chunkManager,
-		partitionStatsMeta: psm,
-		compactionTaskMeta: ctm,
-		statsTaskMeta:      stm,
-		resourceMeta:       make(map[string]*model.FileResource),
-	}
-	err = mt.reloadFromKV(ctx, broker)
-	if err != nil {
-		return nil, err
-	}
-	return mt, nil
-}
-
-// reloadFromKV loads meta from KV storage
-func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
-	record := timerecord.NewTimeRecorder("datacoord")
-
+// showCollectionIDs retrieves all collection IDs from RootCoord with retry on ErrServiceUnimplemented.
+func showCollectionIDs(ctx context.Context, broker broker.Broker) ([]int64, error) {
 	var (
 		err  error
 		resp *rootcoordpb.ShowCollectionIDsResponse
 	)
-	// retry on un implemented for compatibility
 	retryErr := retry.Handle(ctx, func() (bool, error) {
-		resp, err = broker.ShowCollectionIDs(m.ctx)
+		resp, err = broker.ShowCollectionIDs(ctx)
 		if errors.Is(err, merr.ErrServiceUnimplemented) {
 			return true, err
 		}
 		return false, err
 	})
 	if retryErr != nil {
-		return retryErr
+		return nil, retryErr
 	}
-	log.Ctx(ctx).Info("datacoord show collections done", zap.Duration("dur", record.RecordSpan()))
 
 	collectionIDs := make([]int64, 0, 4096)
 	for _, collections := range resp.GetDbCollections() {
 		collectionIDs = append(collectionIDs, collections.GetCollectionIDs()...)
 	}
+	return collectionIDs, nil
+}
+
+// NewMeta creates meta from provided `kv.TxnKV`
+func newMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, broker broker.Broker) (*meta, error) {
+	// Fetch collection IDs first so both reloadFromKV and indexMeta can use them for per-collection loading.
+	collectionIDs, err := showCollectionIDs(ctx, broker)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		im   *indexMeta
+		am   *analyzeMeta
+		psm  *partitionStatsMeta
+		ctm  *compactionTaskMeta
+		stm  *statsTaskMeta
+		ecrm *externalCollectionRefreshMeta
+		spm  *snapshotMeta
+	)
+
+	// Construct meta struct first so reloadFromKV can run in parallel with sub-meta loading.
+	// reloadFromKV uses m.catalog/m.segments/m.channelCPs which are independent of sub-metas.
+	mt := &meta{
+		ctx:             ctx,
+		catalog:         catalog,
+		collections:     typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
+		segments:        NewSegmentsInfo(),
+		channelCPs:      newChannelCps(),
+		chunkManager:    chunkManager,
+		resourceIDMap:   make(map[int64]*internalpb.FileResourceInfo),
+		resourceVersion: 0,
+		resourceLock:    lock.RWMutex{},
+	}
+
+	g, _ := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		var err error
+		im, err = newIndexMeta(ctx, catalog, collectionIDs)
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		am, err = newAnalyzeMeta(ctx, catalog)
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		psm, err = newPartitionStatsMeta(ctx, catalog)
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		ctm, err = newCompactionTaskMeta(ctx, catalog)
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		stm, err = newStatsTaskMeta(ctx, catalog)
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		ecrm, err = newExternalCollectionRefreshMeta(ctx, catalog)
+		return err
+	})
+
+	g.Go(func() error {
+		var err error
+		spm, err = newSnapshotMeta(ctx, catalog, chunkManager)
+		return err
+	})
+
+	// reloadFromKV (ListSegments, ListChannelCheckpoint) runs in parallel with sub-meta loading.
+	// It only uses mt.catalog/mt.segments/mt.channelCPs, which are independent of sub-metas.
+	g.Go(func() error {
+		return mt.reloadFromKV(ctx, collectionIDs)
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Assign sub-metas after all goroutines complete
+	mt.indexMeta = im
+	mt.analyzeMeta = am
+	mt.partitionStatsMeta = psm
+	mt.compactionTaskMeta = ctm
+	mt.statsTaskMeta = stm
+	mt.externalCollectionRefreshMeta = ecrm
+	mt.snapshotMeta = spm
+
+	return mt, nil
+}
+
+// reloadFromKV loads meta from KV storage
+func (m *meta) reloadFromKV(ctx context.Context, collectionIDs []int64) error {
+	record := timerecord.NewTimeRecorder("datacoord")
 
 	pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
 	defer pool.Release()
@@ -246,8 +327,7 @@ func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
 			return nil, nil
 		}))
 	}
-	err = conc.AwaitAll(futures...)
-	if err != nil {
+	if err := conc.AwaitAll(futures...); err != nil {
 		return err
 	}
 
@@ -262,7 +342,7 @@ func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
 		for _, segment := range segments {
 			// segments from catalog.ListSegments will not have logPath
 			m.segments.SetSegment(segment.ID, NewSegmentInfo(segment))
-			metrics.DataCoordNumSegments.WithLabelValues(segment.GetState().String(), segment.GetLevel().String(), getSortStatus(segment.GetIsSorted())).Inc()
+			metrics.DataCoordNumSegments.WithLabelValues(segment.GetState().String(), segment.GetLevel().String(), getSortStatus(segment.GetIsSorted()), fmt.Sprint(segment.GetStorageVersion())).Inc()
 			if segment.State == commonpb.SegmentState_Flushed {
 				numStoredRows += segment.NumOfRows
 
@@ -298,14 +378,9 @@ func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
 		if pos.Timestamp != math.MaxUint64 {
 			// Should not be set as metric since it's a tombstone value.
 			ts, _ := tsoutil.ParseTS(pos.Timestamp)
-			metrics.DataCoordCheckpointUnixSeconds.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), vChannel).
+			metrics.DataCoordCheckpointUnixSeconds.WithLabelValues(paramtable.GetStringNodeID(), vChannel).
 				Set(float64(ts.Unix()))
 		}
-	}
-
-	// Load FileResource meta
-	if err := m.reloadFileResourceMeta(ctx); err != nil {
-		return err
 	}
 
 	log.Ctx(ctx).Info("DataCoord meta reloadFromKV done", zap.Int("numSegments", numSegments), zap.Duration("duration", record.ElapseSpan()))
@@ -432,7 +507,6 @@ func GetSegmentsChanPart(m *meta, collectionID int64, filters ...SegmentFilter) 
 	for _, entry := range mDimEntry {
 		result = append(result, entry)
 	}
-	log.Ctx(context.TODO()).Debug("GetSegmentsChanPart", zap.Int("length", len(result)))
 	return result
 }
 
@@ -495,7 +569,7 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 
 			coll, ok := m.collections.Get(segment.GetCollectionID())
 			if ok {
-				collIDStr := fmt.Sprint(segment.GetCollectionID())
+				collIDStr := strconv.FormatInt(segment.GetCollectionID(), 10)
 				coll2DbName[collIDStr] = coll.DatabaseName
 				if _, ok := storedBinlogSize[collIDStr]; !ok {
 					storedBinlogSize[collIDStr] = make(map[string]int64)
@@ -536,7 +610,7 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 		coll, ok := m.collections.Get(collectionID)
 		if ok {
 			for state, rows := range statesRows {
-				metrics.DataCoordNumStoredRows.WithLabelValues(coll.DatabaseName, fmt.Sprint(collectionID), coll.Schema.GetName(), state.String()).Set(float64(rows))
+				metrics.DataCoordNumStoredRows.WithLabelValues(coll.DatabaseName, strconv.FormatInt(collectionID, 10), coll.Schema.GetName(), state.String()).Set(float64(rows))
 			}
 		}
 	}
@@ -545,7 +619,7 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 	for collectionID, entriesNum := range collectionL0RowCounts {
 		coll, ok := m.collections.Get(collectionID)
 		if ok {
-			metrics.DataCoordL0DeleteEntriesNum.WithLabelValues(coll.DatabaseName, fmt.Sprint(collectionID)).Set(float64(entriesNum))
+			metrics.DataCoordL0DeleteEntriesNum.WithLabelValues(coll.DatabaseName, strconv.FormatInt(collectionID, 10)).Set(float64(entriesNum))
 		}
 	}
 
@@ -588,7 +662,7 @@ func (m *meta) AddSegment(ctx context.Context, segment *SegmentInfo) error {
 	}
 	m.segments.SetSegment(segment.GetID(), segment)
 
-	metrics.DataCoordNumSegments.WithLabelValues(segment.GetState().String(), segment.GetLevel().String(), getSortStatus(segment.GetIsSorted())).Inc()
+	metrics.DataCoordNumSegments.WithLabelValues(segment.GetState().String(), segment.GetLevel().String(), getSortStatus(segment.GetIsSorted()), fmt.Sprint(segment.GetStorageVersion())).Inc()
 	log.Info("meta update: adding segment - complete", zap.Int64("segmentID", segment.GetID()))
 	return nil
 }
@@ -611,7 +685,7 @@ func (m *meta) DropSegment(ctx context.Context, segmentID UniqueID) error {
 			zap.Error(err))
 		return err
 	}
-	metrics.DataCoordNumSegments.WithLabelValues(segment.GetState().String(), segment.GetLevel().String(), getSortStatus(segment.GetIsSorted())).Dec()
+	metrics.DataCoordNumSegments.WithLabelValues(segment.GetState().String(), segment.GetLevel().String(), getSortStatus(segment.GetIsSorted()), fmt.Sprint(segment.GetStorageVersion())).Dec()
 
 	m.segments.DropSegment(segmentID)
 	log.Info("meta update: dropping segment - complete",
@@ -725,7 +799,7 @@ func (m *meta) SetState(ctx context.Context, segmentID UniqueID, targetState com
 	// Persist segment updates first.
 	clonedSegment := curSegInfo.Clone()
 	metricMutation := &segMetricMutation{
-		stateChange: make(map[string]map[string]map[string]int),
+		stateChange: make(map[string]map[string]map[string]map[string]int),
 	}
 	if clonedSegment != nil && isSegmentHealthy(clonedSegment) {
 		// Update segment state and prepare segment metric update.
@@ -864,7 +938,7 @@ func CreateL0Operator(collectionID, partitionID, segmentID int64, channel string
 				State:         commonpb.SegmentState_Flushed,
 				Level:         datapb.SegmentLevel_L0,
 			})
-			modPack.metricMutation.addNewSeg(commonpb.SegmentState_Flushed, datapb.SegmentLevel_L0, false, 0)
+			modPack.metricMutation.addNewSeg(commonpb.SegmentState_Flushed, datapb.SegmentLevel_L0, false, 0, 0)
 		}
 		return true
 	}
@@ -1042,6 +1116,12 @@ func AddBinlogsOperator(segmentID int64, binlogs, statslogs, deltalogs, bm25logs
 		segment.Bm25Statslogs = mergeFieldBinlogs(segment.GetBm25Statslogs(), bm25logs)
 		modPack.increments[segmentID] = metastore.BinlogsIncrement{
 			Segment: segment.SegmentInfo,
+			UpdateMask: metastore.BinlogsUpdateMask{
+				WithoutBinlogs:       len(binlogs) == 0,
+				WithoutDeltalogs:     len(deltalogs) == 0,
+				WithoutStatslogs:     len(statslogs) == 0,
+				WithoutBm25Statslogs: len(bm25logs) == 0,
+			},
 		}
 		return true
 	}
@@ -1194,6 +1274,33 @@ func UpdateManifest(segmentID int64, manifestPath string) UpdateOperator {
 	}
 }
 
+func UpdateManifestVersion(segmentID int64, manifestVersion int64) UpdateOperator {
+	return func(modPack *updateSegmentPack) bool {
+		segment := modPack.Get(segmentID)
+		if segment == nil {
+			log.Ctx(context.TODO()).Warn("meta update: update manifest version failed - segment not found",
+				zap.Int64("segmentID", segmentID))
+			return false
+		}
+		if segment.ManifestPath == "" {
+			log.Ctx(context.TODO()).Warn("meta update: update manifest version failed - no manifest path",
+				zap.Int64("segmentID", segmentID))
+			return false
+		}
+		basePath, currentVer, err := packed.UnmarshalManifestPath(segment.ManifestPath)
+		if err != nil {
+			log.Ctx(context.TODO()).Warn("meta update: update manifest version failed - unmarshal error",
+				zap.Int64("segmentID", segmentID), zap.Error(err))
+			return false
+		}
+		if currentVer == manifestVersion {
+			return false
+		}
+		segment.ManifestPath = packed.MarshalManifestPath(basePath, manifestVersion)
+		return true
+	}
+}
+
 func UpdateImportedRows(segmentID int64, rows int64) UpdateOperator {
 	return func(modPack *updateSegmentPack) bool {
 		segment := modPack.Get(segmentID)
@@ -1217,6 +1324,35 @@ func UpdateIsImporting(segmentID int64, isImporting bool) UpdateOperator {
 			return false
 		}
 		segment.IsImporting = isImporting
+		return true
+	}
+}
+
+// UpdateImportSegmentPosition updates the segment's StartPosition and DmlPosition
+// for import segments using actual timestamps from the imported data.
+// Unlike UpdateStartPosition/UpdateDmlPosition, this operator allows nil MsgID
+// since import segments don't have message queue positions.
+func UpdateImportSegmentPosition(segmentID int64, minTs, maxTs uint64) UpdateOperator {
+	return func(modPack *updateSegmentPack) bool {
+		segment := modPack.Get(segmentID)
+		if segment == nil {
+			log.Ctx(context.TODO()).Warn("meta update: update import segment position failed - segment not found",
+				zap.Int64("segmentID", segmentID))
+			return false
+		}
+		channelName := segment.GetInsertChannel()
+		// Use actual min timestamp for StartPosition
+		segment.StartPosition = &msgpb.MsgPosition{
+			ChannelName: channelName,
+			MsgID:       nil,
+			Timestamp:   minTs,
+		}
+		// Use actual max timestamp for DmlPosition
+		segment.DmlPosition = &msgpb.MsgPosition{
+			ChannelName: channelName,
+			MsgID:       nil,
+			Timestamp:   maxTs,
+		}
 		return true
 	}
 }
@@ -1249,7 +1385,7 @@ func (m *meta) UpdateSegmentsInfo(ctx context.Context, operators ...UpdateOperat
 		segments:   make(map[int64]*SegmentInfo),
 		increments: make(map[int64]metastore.BinlogsIncrement),
 		metricMutation: &segMetricMutation{
-			stateChange: make(map[string]map[string]map[string]int),
+			stateChange: make(map[string]map[string]map[string]map[string]int),
 		},
 	}
 
@@ -1296,7 +1432,7 @@ func (m *meta) UpdateDropChannelSegmentInfo(ctx context.Context, channel string,
 
 	// Prepare segment metric mutation.
 	metricMutation := &segMetricMutation{
-		stateChange: make(map[string]map[string]map[string]int),
+		stateChange: make(map[string]map[string]map[string]map[string]int),
 	}
 	modSegments := make(map[UniqueID]*SegmentInfo)
 	// save new segments flushed from buffer data
@@ -1337,7 +1473,7 @@ func (m *meta) UpdateDropChannelSegmentInfo(ctx context.Context, channel string,
 // mergeDropSegment merges drop segment information with meta segments
 func (m *meta) mergeDropSegment(seg2Drop *SegmentInfo) (*SegmentInfo, *segMetricMutation) {
 	metricMutation := &segMetricMutation{
-		stateChange: make(map[string]map[string]map[string]int),
+		stateChange: make(map[string]map[string]map[string]map[string]int),
 	}
 
 	segment := m.segments.GetSegment(seg2Drop.ID)
@@ -1596,6 +1732,17 @@ func (m *meta) SetSegmentCompacting(segmentID UniqueID, compacting bool) {
 	m.segments.SetIsCompacting(segmentID, compacting)
 }
 
+// IsSegmentCompacting check if segment is compacting
+func (m *meta) IsSegmentCompacting(segmentID UniqueID) bool {
+	m.segMu.RLock()
+	defer m.segMu.RUnlock()
+	seg := m.segments.GetSegment(segmentID)
+	if seg == nil {
+		return false
+	}
+	return seg.isCompacting
+}
+
 // CheckAndSetSegmentsCompacting check all segments are not compacting
 // if true, set them compacting and return true
 // if false, skip setting and
@@ -1658,7 +1805,7 @@ func (m *meta) completeClusterCompactionMutation(t *datapb.CompactionTask, resul
 		zap.Int64("partitionID", t.PartitionID),
 		zap.String("channel", t.GetChannel()))
 
-	metricMutation := &segMetricMutation{stateChange: make(map[string]map[string]map[string]int)}
+	metricMutation := &segMetricMutation{stateChange: make(map[string]map[string]map[string]map[string]int)}
 	compactFromSegIDs := make([]int64, 0)
 	compactToSegIDs := make([]int64, 0)
 	compactFromSegInfos := make([]*SegmentInfo, 0)
@@ -1668,6 +1815,16 @@ func (m *meta) completeClusterCompactionMutation(t *datapb.CompactionTask, resul
 		segment := m.segments.GetSegment(segmentID)
 		if segment == nil {
 			return nil, nil, merr.WrapErrSegmentNotFound(segmentID)
+		}
+
+		// Re-validate segment health to prevent race condition with drop collection
+		// between ValidateSegmentStateBeforeCompleteCompactionMutation and here
+		if !isSegmentHealthy(segment) {
+			log.Warn("input segment was dropped during compaction mutation",
+				zap.Int64("planID", t.GetPlanID()),
+				zap.Int64("segmentID", segmentID),
+				zap.String("state", segment.GetState().String()))
+			return nil, nil, merr.WrapErrSegmentNotFound(segmentID, "input segment was dropped")
 		}
 
 		cloned := segment.Clone()
@@ -1700,11 +1857,13 @@ func (m *meta) completeClusterCompactionMutation(t *datapb.CompactionTask, resul
 			// visible after stats and index
 			IsInvisible:    true,
 			StorageVersion: seg.GetStorageVersion(),
+			ManifestPath:   seg.GetManifest(),
+			ExpirQuantiles: seg.GetExpirQuantiles(),
 		}
 		segment := NewSegmentInfo(segmentInfo)
 		compactToSegInfos = append(compactToSegInfos, segment)
 		compactToSegIDs = append(compactToSegIDs, segment.GetID())
-		metricMutation.addNewSeg(segment.GetState(), segment.GetLevel(), segment.GetIsSorted(), segment.GetNumOfRows())
+		metricMutation.addNewSeg(segment.GetState(), segment.GetLevel(), segment.GetIsSorted(), segment.GetStorageVersion(), segment.GetNumOfRows())
 	}
 
 	log = log.With(zap.Int64s("compact from", compactFromSegIDs), zap.Int64s("compact to", compactToSegIDs))
@@ -1738,15 +1897,27 @@ func (m *meta) completeMixCompactionMutation(
 		zap.String("type", t.GetType().String()),
 		zap.Int64("collectionID", t.CollectionID),
 		zap.Int64("partitionID", t.PartitionID),
-		zap.String("channel", t.GetChannel()))
+		zap.String("channel", t.GetChannel()),
+		zap.Int64("planID", t.GetPlanID()),
+	)
 
-	metricMutation := &segMetricMutation{stateChange: make(map[string]map[string]map[string]int)}
+	metricMutation := &segMetricMutation{stateChange: make(map[string]map[string]map[string]map[string]int)}
 	var compactFromSegIDs []int64
 	var compactFromSegInfos []*SegmentInfo
 	for _, segmentID := range t.GetInputSegments() {
 		segment := m.segments.GetSegment(segmentID)
 		if segment == nil {
 			return nil, nil, merr.WrapErrSegmentNotFound(segmentID)
+		}
+
+		// Re-validate segment health to prevent race condition with drop collection
+		// between ValidateSegmentStateBeforeCompleteCompactionMutation and here
+		if !isSegmentHealthy(segment) {
+			log.Warn("input segment was dropped during compaction mutation",
+				zap.Int64("planID", t.GetPlanID()),
+				zap.Int64("segmentID", segmentID),
+				zap.String("state", segment.GetState().String()))
+			return nil, nil, merr.WrapErrSegmentNotFound(segmentID, "input segment was dropped")
 		}
 
 		cloned := segment.Clone()
@@ -1758,6 +1929,12 @@ func (m *meta) completeMixCompactionMutation(
 
 		// metrics mutation for compaction from segments
 		updateSegStateAndPrepareMetrics(cloned, commonpb.SegmentState_Dropped, metricMutation)
+
+		log.Info("compact from segment",
+			zap.Int64("segmentID", cloned.GetID()),
+			zap.Int64("segment size", cloned.getSegmentSize()),
+			zap.Int64("num rows", cloned.GetNumOfRows()),
+		)
 	}
 
 	log = log.With(zap.Int64s("compactFrom", compactFromSegIDs))
@@ -1790,7 +1967,10 @@ func (m *meta) completeMixCompactionMutation(
 				DmlPosition: getMinPosition(lo.Map(compactFromSegInfos, func(info *SegmentInfo, _ int) *msgpb.MsgPosition {
 					return info.GetDmlPosition()
 				})),
-				IsSorted: compactToSegment.GetIsSorted(),
+				IsSorted:            compactToSegment.GetIsSorted(),
+				ManifestPath:        compactToSegment.GetManifest(),
+				IsSortedByNamespace: compactToSegment.GetIsSortedByNamespace(),
+				ExpirQuantiles:      compactToSegment.GetExpirQuantiles(),
 			})
 
 		if compactToSegmentInfo.GetNumOfRows() == 0 {
@@ -1798,7 +1978,7 @@ func (m *meta) completeMixCompactionMutation(
 		}
 
 		// metrics mutation for compactTo segments
-		metricMutation.addNewSeg(compactToSegmentInfo.GetState(), compactToSegmentInfo.GetLevel(), compactToSegmentInfo.GetIsSorted(), compactToSegmentInfo.GetNumOfRows())
+		metricMutation.addNewSeg(compactToSegmentInfo.GetState(), compactToSegmentInfo.GetLevel(), compactToSegmentInfo.GetIsSorted(), compactToSegmentInfo.GetStorageVersion(), compactToSegmentInfo.GetNumOfRows())
 
 		log.Info("Add a new compactTo segment",
 			zap.Int64("compactTo", compactToSegmentInfo.GetID()),
@@ -1806,6 +1986,8 @@ func (m *meta) completeMixCompactionMutation(
 			zap.Int("binlog count", len(compactToSegmentInfo.GetBinlogs())),
 			zap.Int("statslog count", len(compactToSegmentInfo.GetStatslogs())),
 			zap.Int("deltalog count", len(compactToSegmentInfo.GetDeltalogs())),
+			zap.Int64("segment size", compactToSegmentInfo.getSegmentSize()),
+			zap.Int64s("expirQuantiles", compactToSegmentInfo.GetExpirQuantiles()),
 		)
 		compactToSegments = append(compactToSegments, compactToSegmentInfo)
 	}
@@ -1931,7 +2113,7 @@ func (m *meta) UpdateChannelCheckpoint(ctx context.Context, vChannel string, pos
 	defer m.channelCPs.Unlock()
 
 	oldPosition, ok := m.channelCPs.checkpoints[vChannel]
-	if !ok || oldPosition.Timestamp < pos.Timestamp {
+	if !ok || oldPosition.Timestamp < pos.Timestamp || (oldPosition.Timestamp == pos.Timestamp && !bytes.Equal(oldPosition.MsgID, pos.MsgID)) {
 		err := m.catalog.SaveChannelCheckpoint(ctx, vChannel, pos)
 		if err != nil {
 			return err
@@ -1942,8 +2124,9 @@ func (m *meta) UpdateChannelCheckpoint(ctx context.Context, vChannel string, pos
 			zap.String("vChannel", vChannel),
 			zap.Uint64("ts", pos.GetTimestamp()),
 			zap.ByteString("msgID", pos.GetMsgID()),
+			zap.Stringer("walName", pos.WALName),
 			zap.Time("time", ts))
-		metrics.DataCoordCheckpointUnixSeconds.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), vChannel).
+		metrics.DataCoordCheckpointUnixSeconds.WithLabelValues(paramtable.GetStringNodeID(), vChannel).
 			Set(float64(ts.Unix()))
 	}
 	return nil
@@ -1967,7 +2150,7 @@ func (m *meta) MarkChannelCheckpointDropped(ctx context.Context, channel string)
 
 	m.channelCPs.checkpoints[channel] = cp
 
-	metrics.DataCoordCheckpointUnixSeconds.DeleteLabelValues(fmt.Sprint(paramtable.GetNodeID()), channel)
+	metrics.DataCoordCheckpointUnixSeconds.DeleteLabelValues(paramtable.GetStringNodeID(), channel)
 	return nil
 }
 
@@ -1977,13 +2160,13 @@ func (m *meta) UpdateChannelCheckpoints(ctx context.Context, positions []*msgpb.
 	m.channelCPs.Lock()
 	defer m.channelCPs.Unlock()
 	toUpdates := lo.Filter(positions, func(pos *msgpb.MsgPosition, _ int) bool {
-		if pos == nil || pos.GetMsgID() == nil || pos.GetChannelName() == "" {
+		if pos == nil || (pos.GetMsgID() == nil && pos.GetWALName() != commonpb.WALName_WoodPecker) || pos.GetChannelName() == "" {
 			log.Warn("illegal channel cp", zap.Any("pos", pos))
 			return false
 		}
 		vChannel := pos.GetChannelName()
 		oldPosition, ok := m.channelCPs.checkpoints[vChannel]
-		return !ok || oldPosition.Timestamp < pos.Timestamp
+		return !ok || oldPosition.Timestamp < pos.Timestamp || (oldPosition.Timestamp == pos.Timestamp && !bytes.Equal(oldPosition.MsgID, pos.MsgID))
 	})
 	err := m.catalog.SaveChannelCheckpoints(ctx, toUpdates)
 	if err != nil {
@@ -1993,11 +2176,14 @@ func (m *meta) UpdateChannelCheckpoints(ctx context.Context, positions []*msgpb.
 		channel := pos.GetChannelName()
 		m.channelCPs.checkpoints[channel] = pos
 		log.Info("UpdateChannelCheckpoint done", zap.String("channel", channel),
+			zap.Stringer("walName", pos.WALName),
 			zap.Uint64("ts", pos.GetTimestamp()),
 			zap.Time("time", tsoutil.PhysicalTime(pos.GetTimestamp())))
 		ts, _ := tsoutil.ParseTS(pos.Timestamp)
-		metrics.DataCoordCheckpointUnixSeconds.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), channel).Set(float64(ts.Unix()))
+		metrics.DataCoordCheckpointUnixSeconds.WithLabelValues(paramtable.GetStringNodeID(), channel).Set(float64(ts.Unix()))
 	}
+	// broadcast the change of channel checkpoint for TruncateCollection op to drop segments
+	m.channelCPs.cond.UnsafeBroadcast()
 	return nil
 }
 
@@ -2019,7 +2205,7 @@ func (m *meta) DropChannelCheckpoint(vChannel string) error {
 		return err
 	}
 	delete(m.channelCPs.checkpoints, vChannel)
-	metrics.DataCoordCheckpointUnixSeconds.DeleteLabelValues(fmt.Sprint(paramtable.GetNodeID()), vChannel)
+	metrics.DataCoordCheckpointUnixSeconds.DeleteLabelValues(paramtable.GetStringNodeID(), vChannel)
 	log.Ctx(context.TODO()).Info("DropChannelCheckpoint done", zap.String("vChannel", vChannel))
 	return nil
 }
@@ -2075,15 +2261,26 @@ func (m *meta) GetEarliestStartPositionOfGrowingSegments(label *CompactionGroupL
 	return earliest
 }
 
+// initStateChangeEntry initializes the nested map structure for the given keys and returns the innermost map.
+func (s *segMetricMutation) initStateChangeEntry(level, state, sortedStatus string) map[string]int {
+	if _, ok := s.stateChange[level]; !ok {
+		s.stateChange[level] = make(map[string]map[string]map[string]int)
+	}
+	if _, ok := s.stateChange[level][state]; !ok {
+		s.stateChange[level][state] = make(map[string]map[string]int)
+	}
+	if _, ok := s.stateChange[level][state][sortedStatus]; !ok {
+		s.stateChange[level][state][sortedStatus] = make(map[string]int)
+	}
+	return s.stateChange[level][state][sortedStatus]
+}
+
 // addNewSeg update metrics update for a new segment.
-func (s *segMetricMutation) addNewSeg(state commonpb.SegmentState, level datapb.SegmentLevel, isSorted bool, rowCount int64) {
-	if _, ok := s.stateChange[level.String()]; !ok {
-		s.stateChange[level.String()] = make(map[string]map[string]int)
-	}
-	if _, ok := s.stateChange[level.String()][state.String()]; !ok {
-		s.stateChange[level.String()][state.String()] = make(map[string]int)
-	}
-	s.stateChange[level.String()][state.String()][getSortStatus(isSorted)] += 1
+func (s *segMetricMutation) addNewSeg(state commonpb.SegmentState, level datapb.SegmentLevel, isSorted bool, storageVersion int64, rowCount int64) {
+	storageVersionStr := fmt.Sprint(storageVersion)
+	sortedStatus := getSortStatus(isSorted)
+	entry := s.initStateChangeEntry(level.String(), state.String(), sortedStatus)
+	entry[storageVersionStr] += 1
 
 	s.rowCountChange += rowCount
 	s.rowCountAccChange += rowCount
@@ -2094,27 +2291,25 @@ func (s *segMetricMutation) addNewSeg(state commonpb.SegmentState, level datapb.
 func (s *segMetricMutation) commit() {
 	for level, submap := range s.stateChange {
 		for state, sortedMap := range submap {
-			for sortedLabel, change := range sortedMap {
-				metrics.DataCoordNumSegments.WithLabelValues(state, level, sortedLabel).Add(float64(change))
+			for sortedLabel, versionMap := range sortedMap {
+				for storageVersion, change := range versionMap {
+					metrics.DataCoordNumSegments.WithLabelValues(state, level, sortedLabel, storageVersion).Add(float64(change))
+				}
 			}
 		}
 	}
 }
 
 // append updates current segMetricMutation when segment state change happens.
-func (s *segMetricMutation) append(oldState, newState commonpb.SegmentState, level datapb.SegmentLevel, isSorted bool, rowCountUpdate int64) {
+func (s *segMetricMutation) append(oldState, newState commonpb.SegmentState, level datapb.SegmentLevel, isSorted bool, storageVersion int64, rowCountUpdate int64) {
 	if oldState != newState {
-		if _, ok := s.stateChange[level.String()]; !ok {
-			s.stateChange[level.String()] = make(map[string]map[string]int)
-		}
-		if _, ok := s.stateChange[level.String()][oldState.String()]; !ok {
-			s.stateChange[level.String()][oldState.String()] = make(map[string]int)
-		}
-		if _, ok := s.stateChange[level.String()][newState.String()]; !ok {
-			s.stateChange[level.String()][newState.String()] = make(map[string]int)
-		}
-		s.stateChange[level.String()][oldState.String()][getSortStatus(isSorted)] -= 1
-		s.stateChange[level.String()][newState.String()][getSortStatus(isSorted)] += 1
+		storageVersionStr := fmt.Sprint(storageVersion)
+		sortedStatus := getSortStatus(isSorted)
+		levelStr := level.String()
+		oldEntry := s.initStateChangeEntry(levelStr, oldState.String(), sortedStatus)
+		newEntry := s.initStateChangeEntry(levelStr, newState.String(), sortedStatus)
+		oldEntry[storageVersionStr] -= 1
+		newEntry[storageVersionStr] += 1
 	}
 	// Update # of rows on new flush operations and drop operations.
 	if isFlushState(newState) && !isFlushState(oldState) {
@@ -2138,7 +2333,7 @@ func updateSegStateAndPrepareMetrics(segToUpdate *SegmentInfo, targetState commo
 		zap.String("old state", segToUpdate.GetState().String()),
 		zap.String("new state", targetState.String()),
 		zap.Int64("# of rows", segToUpdate.GetNumOfRows()))
-	metricMutation.append(segToUpdate.GetState(), targetState, segToUpdate.GetLevel(), segToUpdate.GetIsSorted(), segToUpdate.GetNumOfRows())
+	metricMutation.append(segToUpdate.GetState(), targetState, segToUpdate.GetLevel(), segToUpdate.GetIsSorted(), segToUpdate.GetStorageVersion(), segToUpdate.GetNumOfRows())
 	segToUpdate.State = targetState
 	if targetState == commonpb.SegmentState_Dropped {
 		segToUpdate.DroppedAt = uint64(time.Now().UnixNano())
@@ -2230,11 +2425,21 @@ func (m *meta) completeSortCompactionMutation(
 		zap.Int64("partitionID", t.PartitionID),
 		zap.String("channel", t.GetChannel()))
 
-	metricMutation := &segMetricMutation{stateChange: make(map[string]map[string]map[string]int)}
+	metricMutation := &segMetricMutation{stateChange: make(map[string]map[string]map[string]map[string]int)}
 	compactFromSegID := t.GetInputSegments()[0]
 	oldSegment := m.segments.GetSegment(compactFromSegID)
 	if oldSegment == nil {
 		return nil, nil, merr.WrapErrSegmentNotFound(compactFromSegID)
+	}
+
+	// Re-validate segment health to prevent race condition with drop collection
+	// between ValidateSegmentStateBeforeCompleteCompactionMutation and here
+	if !isSegmentHealthy(oldSegment) {
+		log.Warn("input segment was dropped during compaction mutation",
+			zap.Int64("planID", t.GetPlanID()),
+			zap.Int64("segmentID", compactFromSegID),
+			zap.String("state", oldSegment.GetState().String()))
+		return nil, nil, merr.WrapErrSegmentNotFound(compactFromSegID, "input segment was dropped")
 	}
 
 	resultInvisible := oldSegment.GetIsInvisible()
@@ -2269,12 +2474,15 @@ func (m *meta) completeSortCompactionMutation(
 		Bm25Statslogs:             resultSegment.GetBm25Logs(),
 		Deltalogs:                 resultSegment.GetDeltalogs(),
 		CompactionFrom:            []int64{compactFromSegID},
-		IsSorted:                  true,
+		IsSorted:                  resultSegment.GetIsSorted(),
+		ManifestPath:              resultSegment.GetManifest(),
+		ExpirQuantiles:            resultSegment.GetExpirQuantiles(),
+		IsSortedByNamespace:       resultSegment.GetIsSortedByNamespace(),
 	}
 
 	segment := NewSegmentInfo(segmentInfo)
 	if segment.GetNumOfRows() > 0 {
-		metricMutation.addNewSeg(segment.GetState(), segment.GetLevel(), segment.GetIsSorted(), segment.GetNumOfRows())
+		metricMutation.addNewSeg(segment.GetState(), segment.GetLevel(), segment.GetIsSorted(), segment.GetStorageVersion(), segment.GetNumOfRows())
 	} else {
 		segment.State = commonpb.SegmentState_Dropped
 		segment.DroppedAt = uint64(time.Now().UnixNano())
@@ -2289,7 +2497,10 @@ func (m *meta) completeSortCompactionMutation(
 
 	log = log.With(zap.Int64s("compactFrom", []int64{oldSegment.GetID()}), zap.Int64("compactTo", segment.GetID()))
 
-	log.Info("meta update: prepare for complete stats mutation - complete", zap.Int64("num rows", segment.GetNumOfRows()))
+	log.Info("meta update: prepare for complete stats mutation - complete",
+		zap.Int64("num rows", segment.GetNumOfRows()),
+		zap.Int64("segment size", segment.getSegmentSize()),
+		zap.Int64s("expirQuantiles", segment.GetExpirQuantiles()))
 	if err := m.catalog.AlterSegments(m.ctx, []*datapb.SegmentInfo{cloned.SegmentInfo, segment.SegmentInfo}, metastore.BinlogsIncrement{Segment: segment.SegmentInfo}); err != nil {
 		log.Warn("fail to alter segments and new segment", zap.Error(err))
 		return nil, nil, err
@@ -2334,7 +2545,7 @@ func (m *meta) DropSegmentsOfPartition(ctx context.Context, partitionIDs []int64
 
 	// Filter out the segments of the partition to be dropped.
 	metricMutation := &segMetricMutation{
-		stateChange: make(map[string]map[string]map[string]int),
+		stateChange: make(map[string]map[string]map[string]map[string]int),
 	}
 	modSegments := make([]*SegmentInfo, 0)
 	segments := make([]*datapb.SegmentInfo, 0)
@@ -2370,62 +2581,96 @@ func contains(arr []int64, target int64) bool {
 	return false
 }
 
-// reloadFileResourceMeta load file resource meta from catalog
-func (m *meta) reloadFileResourceMeta(ctx context.Context) error {
+func (m *meta) UpdateFileResources(ctx context.Context, resources []*internalpb.FileResourceInfo, version uint64) error {
 	m.resourceLock.Lock()
 	defer m.resourceLock.Unlock()
-
-	resources, err := m.catalog.ListFileResource(ctx)
-	if err != nil {
-		return err
-	}
-
-	m.resourceMeta = make(map[string]*model.FileResource)
+	m.resourceIDMap = make(map[int64]*internalpb.FileResourceInfo)
 	for _, resource := range resources {
-		m.resourceMeta[resource.Name] = resource
+		m.resourceIDMap[resource.Id] = resource
 	}
-	return nil
-}
-
-// AddFileResource add file resource to meta
-func (m *meta) AddFileResource(ctx context.Context, resource *model.FileResource) error {
-	m.resourceLock.Lock()
-	defer m.resourceLock.Unlock()
-
-	if _, ok := m.resourceMeta[resource.Name]; ok {
-		return merr.WrapErrAsInputError(fmt.Errorf("create resource failed: resource name exist"))
-	}
-
-	err := m.catalog.SaveFileResource(ctx, resource)
-	if err != nil {
-		return err
-	}
-
-	m.resourceMeta[resource.Name] = resource
-	return nil
-}
-
-// RemoveFileResource remove file resource from meta
-func (m *meta) RemoveFileResource(ctx context.Context, name string) error {
-	m.resourceLock.Lock()
-	defer m.resourceLock.Unlock()
-
-	if resource, ok := m.resourceMeta[name]; ok {
-		err := m.catalog.RemoveFileResource(ctx, resource.ID)
-		if err != nil {
-			return err
-		}
-
-		delete(m.resourceMeta, name)
-	}
+	m.resourceVersion = version
 
 	return nil
 }
 
-// ListFileResource list file resources from meta
-func (m *meta) ListFileResource(ctx context.Context) []*model.FileResource {
+func (m *meta) ListFileResources(ctx context.Context) ([]*internalpb.FileResourceInfo, uint64) {
+	m.resourceLock.RLock()
+	defer m.resourceLock.RUnlock()
+	return lo.Values(m.resourceIDMap), m.resourceVersion
+}
+
+func (m *meta) GetFileResources(ctx context.Context, resourceIDs ...int64) ([]*internalpb.FileResourceInfo, error) {
 	m.resourceLock.RLock()
 	defer m.resourceLock.RUnlock()
 
-	return lo.Values(m.resourceMeta)
+	resources := make([]*internalpb.FileResourceInfo, 0)
+	for _, id := range resourceIDs {
+		if resource, ok := m.resourceIDMap[id]; ok {
+			resources = append(resources, resource)
+		} else {
+			return nil, errors.Errorf("file resource %d not found", id)
+		}
+	}
+	return resources, nil
+}
+
+// TruncateChannelByTime drops segments of a channel that were updated before the flush timestamp
+func (m *meta) TruncateChannelByTime(ctx context.Context, vChannel string, flushTs uint64) error {
+	m.segMu.Lock()
+	defer m.segMu.Unlock()
+
+	segments := m.segments.GetSegmentsBySelector(SegmentFilterFunc(isSegmentHealthy), WithChannel(vChannel))
+	segmentsToDrop := make([]*SegmentInfo, 0)
+	metricMutation := &segMetricMutation{
+		stateChange: make(map[string]map[string]map[string]map[string]int),
+	}
+
+	for _, segment := range segments {
+		if segment.GetDmlPosition().GetTimestamp() <= flushTs && segment.GetState() != commonpb.SegmentState_Dropped {
+			cloned := segment.Clone()
+			updateSegStateAndPrepareMetrics(cloned, commonpb.SegmentState_Dropped, metricMutation)
+			segmentsToDrop = append(segmentsToDrop, cloned)
+		}
+	}
+
+	if len(segmentsToDrop) == 0 {
+		return nil
+	}
+
+	// Persist to etcd
+	segmentsProto := lo.Map(segmentsToDrop, func(seg *SegmentInfo, _ int) *datapb.SegmentInfo {
+		return seg.SegmentInfo
+	})
+	if err := m.catalog.AlterSegments(ctx, segmentsProto); err != nil {
+		log.Ctx(ctx).Warn("Failed to batch set segments state to dropped", zap.Error(err))
+		return err
+	}
+
+	// Update metrics
+	metricMutation.commit()
+
+	// Update memory
+	for _, seg := range segmentsToDrop {
+		m.segments.SetSegment(seg.GetID(), seg)
+	}
+
+	return nil
+}
+
+// WatchChannelCheckpoint waits until the checkpoint of the specified channel
+// reaches or exceeds the target timestamp. Used for TruncateCollection.
+func (m *meta) WatchChannelCheckpoint(ctx context.Context, vChannel string, targetTs uint64) error {
+	m.channelCPs.cond.L.Lock()
+
+	for {
+		cp, ok := m.channelCPs.checkpoints[vChannel]
+		if ok && cp != nil && cp.GetTimestamp() >= targetTs {
+			m.channelCPs.cond.L.Unlock()
+			return nil
+		}
+
+		if err := m.channelCPs.cond.Wait(ctx); err != nil {
+			return err
+		}
+	}
 }

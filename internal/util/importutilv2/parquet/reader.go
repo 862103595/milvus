@@ -59,6 +59,7 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	if err != nil {
 		return nil, err
 	}
+	retryableReader := common.NewRetryableReader(ctx, path, cmReader)
 
 	allFields := typeutil.GetAllFieldSchemas(schema)
 	// Each ColumnReader consumes ReaderProperties.BufferSize memory independently.
@@ -66,11 +67,12 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	// to ensure total memory usage stays within the intended limit.
 	columnReaderBufferSize := totalReadBufferSize / int64(len(allFields))
 
-	r, err := file.NewParquetReader(cmReader, file.WithReadProps(&parquet.ReaderProperties{
+	r, err := file.NewParquetReader(retryableReader, file.WithReadProps(&parquet.ReaderProperties{
 		BufferSize:            columnReaderBufferSize,
 		BufferedStreamEnabled: true,
 	}))
 	if err != nil {
+		retryableReader.Close()
 		return nil, merr.WrapErrImportFailed(fmt.Sprintf("new parquet reader failed, err=%v", err))
 	}
 	log.Info("parquet file info", zap.Int("row group num", r.NumRowGroups()),
@@ -78,6 +80,7 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 
 	count, err := common.EstimateReadCountPerBatch(bufferSize, schema)
 	if err != nil {
+		r.Close()
 		return nil, err
 	}
 
@@ -86,17 +89,19 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 	}
 	fileReader, err := pqarrow.NewFileReader(r, readProps, memory.DefaultAllocator)
 	if err != nil {
+		r.Close()
 		return nil, merr.WrapErrImportFailed(fmt.Sprintf("new parquet file reader failed, err=%v", err))
 	}
 
 	crs, err := CreateFieldReaders(ctx, fileReader, schema)
 	if err != nil {
+		r.Close()
 		return nil, err
 	}
 	return &reader{
 		ctx:        ctx,
 		cm:         cm,
-		cmr:        cmReader,
+		cmr:        retryableReader,
 		schema:     schema,
 		fileSize:   atomic.NewInt64(0),
 		path:       path,
@@ -108,7 +113,7 @@ func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.Co
 }
 
 func (r *reader) Read() (*storage.InsertData, error) {
-	insertData, err := storage.NewInsertData(r.schema)
+	insertData, err := storage.NewInsertDataWithFunctionOutputField(r.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +141,7 @@ OUTER:
 			return nil, io.EOF
 		}
 	}
+	common.RemoveUnpopulatedFunctionOutputFields(r.schema, insertData)
 	return insertData, nil
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/options"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/util/ratelimit"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/tracer"
 	"github.com/milvus-io/milvus/pkg/v2/util/interceptor"
@@ -43,6 +44,9 @@ type (
 type ProducerOptions struct {
 	// PChannel is the pchannel of the producer.
 	PChannel string
+
+	// RateLimitObserver is the observer of the rate limit.
+	RateLimitObserver ratelimit.RateLimitObserver
 }
 
 // ConsumerOptions is the options for creating a consumer.
@@ -61,6 +65,9 @@ type ConsumerOptions struct {
 
 	// Handler is the message handler used to handle message after recv from consumer.
 	MessageHandler message.Handler
+
+	// IgnorePauseConsumption is the flag to ignore the consumption pause of the consumer.
+	IgnorePauseConsumption bool
 }
 
 // HandlerClient is the interface that wraps streamingpb.StreamingNodeHandlerServiceClient.
@@ -73,6 +80,10 @@ type HandlerClient interface {
 
 	// GetReplicateCheckpoint returns the WAL checkpoint that will be used to create scanner.
 	GetReplicateCheckpoint(ctx context.Context, channelName string) (*wal.ReplicateCheckpoint, error)
+
+	// GetSalvageCheckpoint returns all salvage checkpoints captured during force promote.
+	// Returns an empty slice if no force promote has occurred.
+	GetSalvageCheckpoint(ctx context.Context, channelName string) ([]*wal.ReplicateCheckpoint, error)
 
 	// GetWALMetricsIfLocal gets the metrics of the local wal.
 	// It will only return the metrics of the local wal but not the remote wal.

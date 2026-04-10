@@ -10,25 +10,57 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "segcore/Utils.h"
-#include <arrow/record_batch.h>
 
+#include <cxxabi.h>
+#include <folly/ExceptionWrapper.h>
+#include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_set>
+#include <variant>
 #include <vector>
 
+#include "arrow/api.h"
+#include "arrow/io/memory.h"
 #include "cachinglayer/Manager.h"
-#include "common/type_c.h"
-#include "common/Common.h"
+#include "cachinglayer/Translator.h"
+#include "common/Channel.h"
 #include "common/FieldData.h"
 #include "common/FieldDataInterface.h"
+#include "common/FieldMeta.h"
+#include "common/JsonCastType.h"
+#include "common/TypeTraits.h"
 #include "common/Types.h"
 #include "common/Utils.h"
+#include "folly/FBVector.h"
+#include "glog/logging.h"
+#include "google/protobuf/descriptor.h"
+#include "index/Index.h"
+#include "index/IndexInfo.h"
+#include "index/Meta.h"
 #include "index/ScalarIndex.h"
+#include "index/Utils.h"
+#include "knowhere/sparse_utils.h"
 #include "log/Log.h"
+#include "milvus-storage/filesystem/fs.h"
+#include "nlohmann/json.hpp"
+#include "parquet/arrow/reader.h"
+#include "pb/schema.pb.h"
+#include "segcore/ConcurrentVector.h"
+#include "segcore/SegmentInterface.h"
+#include "segcore/Types.h"
+#include "segcore/storagev1translator/SealedIndexTranslator.h"
+#include "storage/ChunkManager.h"
 #include "storage/DataCodec.h"
+#include "storage/FileManager.h"
 #include "storage/RemoteChunkManagerSingleton.h"
+#include "storage/ThreadPool.h"
 #include "storage/ThreadPools.h"
+#include "storage/Types.h"
 #include "storage/Util.h"
 
 namespace milvus::segcore {
@@ -241,6 +273,30 @@ GetRawDataSizeOfDataArray(const DataArray* data,
                         }
                         break;
                     }
+                    case DataType::VECTOR_FLOAT16: {
+                        for (auto& e : obj) {
+                            result += e.float16_vector().size();
+                        }
+                        break;
+                    }
+                    case DataType::VECTOR_BFLOAT16: {
+                        for (auto& e : obj) {
+                            result += e.bfloat16_vector().size();
+                        }
+                        break;
+                    }
+                    case DataType::VECTOR_INT8: {
+                        for (auto& e : obj) {
+                            result += e.int8_vector().size();
+                        }
+                        break;
+                    }
+                    case DataType::VECTOR_BINARY: {
+                        for (auto& e : obj) {
+                            result += e.binary_vector().size();
+                        }
+                        break;
+                    }
                     default: {
                         ThrowInfo(NotImplemented,
                                   fmt::format("not implemented vector type {}",
@@ -276,6 +332,31 @@ CreateEmptyScalarDataArray(int64_t count, const FieldMeta& field_meta) {
     }
 
     auto scalar_array = data_array->mutable_scalars();
+    SetUpScalarFieldData(
+        scalar_array, data_type, field_meta.get_element_type(), count);
+    return data_array;
+}
+
+void
+CreateScalarDataArray(DataArray& data_array,
+                      int64_t count,
+                      DataType data_type,
+                      DataType element_type,
+                      bool nullable) {
+    data_array.set_type(
+        static_cast<milvus::proto::schema::DataType>(data_type));
+    if (nullable) {
+        data_array.mutable_valid_data()->Resize(count, false);
+    }
+    auto scalar_array = data_array.mutable_scalars();
+    SetUpScalarFieldData(scalar_array, data_type, element_type, count);
+}
+
+void
+SetUpScalarFieldData(milvus::proto::schema::ScalarField*& scalar_array,
+                     DataType data_type,
+                     DataType element_type,
+                     int64_t count) {
     switch (data_type) {
         case DataType::BOOL: {
             auto obj = scalar_array->mutable_bool_data();
@@ -346,8 +427,8 @@ CreateEmptyScalarDataArray(int64_t count, const FieldMeta& field_meta) {
         case DataType::ARRAY: {
             auto obj = scalar_array->mutable_array_data();
             obj->mutable_data()->Reserve(count);
-            obj->set_element_type(static_cast<milvus::proto::schema::DataType>(
-                field_meta.get_element_type()));
+            obj->set_element_type(
+                static_cast<milvus::proto::schema::DataType>(element_type));
             for (int i = 0; i < count; i++) {
                 *(obj->mutable_data()->Add()) = proto::schema::ScalarField();
             }
@@ -358,8 +439,6 @@ CreateEmptyScalarDataArray(int64_t count, const FieldMeta& field_meta) {
                       fmt::format("unsupported datatype {}", data_type));
         }
     }
-
-    return data_array;
 }
 
 std::unique_ptr<DataArray>
@@ -432,6 +511,23 @@ CreateEmptyVectorDataArray(int64_t count, const FieldMeta& field_meta) {
 }
 
 std::unique_ptr<DataArray>
+CreateEmptyVectorDataArray(int64_t count,
+                           int64_t valid_count,
+                           const void* valid_data,
+                           const FieldMeta& field_meta) {
+    int64_t data_count = (field_meta.is_nullable() && valid_data != nullptr)
+                             ? valid_count
+                             : count;
+    auto data_array = CreateEmptyVectorDataArray(data_count, field_meta);
+    if (field_meta.is_nullable() && valid_data != nullptr) {
+        auto obj = data_array->mutable_valid_data();
+        auto valid_data_bool = reinterpret_cast<const bool*>(valid_data);
+        obj->Add(valid_data_bool, valid_data_bool + count);
+    }
+    return data_array;
+}
+
+std::unique_ptr<DataArray>
 CreateScalarDataArrayFrom(const void* data_raw,
                           const void* valid_data,
                           int64_t count,
@@ -441,10 +537,15 @@ CreateScalarDataArrayFrom(const void* data_raw,
     data_array->set_field_id(field_meta.get_id().get());
     data_array->set_type(static_cast<milvus::proto::schema::DataType>(
         field_meta.get_data_type()));
-    if (field_meta.is_nullable()) {
+    if (field_meta.is_nullable() && valid_data != nullptr) {
         auto valid_data_ = reinterpret_cast<const bool*>(valid_data);
         auto obj = data_array->mutable_valid_data();
         obj->Add(valid_data_, valid_data_ + count);
+    } else {
+        FixedVector<bool> always_valid(count, true);
+        auto obj = data_array->mutable_valid_data();
+        obj->Add(reinterpret_cast<const bool*>(always_valid.data()),
+                 reinterpret_cast<const bool*>(always_valid.data()) + count);
     }
 
     auto scalar_array = data_array->mutable_scalars();
@@ -657,6 +758,22 @@ CreateVectorDataArrayFrom(const void* data_raw,
 }
 
 std::unique_ptr<DataArray>
+CreateVectorDataArrayFrom(const void* data_raw,
+                          const void* valid_data,
+                          int64_t count,
+                          int64_t valid_count,
+                          const FieldMeta& field_meta) {
+    auto data_array =
+        CreateVectorDataArrayFrom(data_raw, valid_count, field_meta);
+    if (field_meta.is_nullable() && valid_data != nullptr) {
+        auto obj = data_array->mutable_valid_data();
+        auto valid_data_bool = reinterpret_cast<const bool*>(valid_data);
+        obj->Add(valid_data_bool, valid_data_bool + count);
+    }
+    return data_array;
+}
+
+std::unique_ptr<DataArray>
 CreateDataArrayFrom(const void* data_raw,
                     const void* valid_data,
                     int64_t count,
@@ -688,6 +805,21 @@ MergeDataArray(std::vector<MergeBase>& merge_bases,
         AssertInfo(data_type == DataType(src_field_data->type()),
                    "merge field data type not consistent");
         if (field_meta.is_vector()) {
+            bool is_valid = true;
+            if (nullable) {
+                auto data = src_field_data->valid_data().data();
+                auto obj = data_array->mutable_valid_data();
+                is_valid = data[src_offset];
+                *(obj->Add()) = is_valid;
+            }
+
+            if (!is_valid) {
+                continue;
+            }
+
+            int64_t physical_offset =
+                merge_base.getValidDataOffset(field_meta.get_id());
+
             auto vector_array = data_array->mutable_vectors();
             auto dim = 0;
             if (!IsSparseFloatVectorDataType(data_type)) {
@@ -697,17 +829,19 @@ MergeDataArray(std::vector<MergeBase>& merge_bases,
             if (field_meta.get_data_type() == DataType::VECTOR_FLOAT) {
                 auto data = VEC_FIELD_DATA(src_field_data, float).data();
                 auto obj = vector_array->mutable_float_vector();
-                obj->mutable_data()->Add(data + src_offset * dim,
-                                         data + (src_offset + 1) * dim);
+                obj->mutable_data()->Add(data + physical_offset * dim,
+                                         data + (physical_offset + 1) * dim);
             } else if (field_meta.get_data_type() == DataType::VECTOR_FLOAT16) {
                 auto data = VEC_FIELD_DATA(src_field_data, float16);
                 auto obj = vector_array->mutable_float16_vector();
-                obj->assign(data, dim * sizeof(float16));
+                obj->assign(data + physical_offset * dim * sizeof(float16),
+                            dim * sizeof(float16));
             } else if (field_meta.get_data_type() ==
                        DataType::VECTOR_BFLOAT16) {
                 auto data = VEC_FIELD_DATA(src_field_data, bfloat16);
                 auto obj = vector_array->mutable_bfloat16_vector();
-                obj->assign(data, dim * sizeof(bfloat16));
+                obj->assign(data + physical_offset * dim * sizeof(bfloat16),
+                            dim * sizeof(bfloat16));
             } else if (field_meta.get_data_type() == DataType::VECTOR_BINARY) {
                 AssertInfo(
                     dim % 8 == 0,
@@ -715,26 +849,28 @@ MergeDataArray(std::vector<MergeBase>& merge_bases,
                 auto num_bytes = dim / 8;
                 auto data = VEC_FIELD_DATA(src_field_data, binary);
                 auto obj = vector_array->mutable_binary_vector();
-                obj->assign(data + src_offset * num_bytes, num_bytes);
+                obj->assign(data + physical_offset * num_bytes, num_bytes);
             } else if (field_meta.get_data_type() ==
                        DataType::VECTOR_SPARSE_U32_F32) {
-                auto src = src_field_data->vectors().sparse_float_vector();
+                auto& src_vec = src_field_data->vectors().sparse_float_vector();
                 auto dst = vector_array->mutable_sparse_float_vector();
-                if (src.dim() > dst->dim()) {
-                    dst->set_dim(src.dim());
+                if (src_vec.dim() > dst->dim()) {
+                    dst->set_dim(src_vec.dim());
                 }
                 vector_array->set_dim(dst->dim());
-                *dst->mutable_contents() = src.contents();
+                auto& src_contents = src_vec.contents(physical_offset);
+                *(dst->mutable_contents()->Add()) = src_contents;
             } else if (field_meta.get_data_type() == DataType::VECTOR_INT8) {
                 auto data = VEC_FIELD_DATA(src_field_data, int8);
                 auto obj = vector_array->mutable_int8_vector();
-                obj->assign(data, dim * sizeof(int8));
+                obj->assign(data + physical_offset * dim * sizeof(int8),
+                            dim * sizeof(int8));
             } else if (field_meta.get_data_type() == DataType::VECTOR_ARRAY) {
-                auto data = src_field_data->vectors().vector_array();
+                auto& data = src_field_data->vectors().vector_array();
                 auto obj = vector_array->mutable_vector_array();
                 obj->set_element_type(
                     proto::schema::DataType(field_meta.get_element_type()));
-                obj->CopyFrom(data);
+                *(obj->mutable_data()->Add()) = data.data(physical_offset);
             } else {
                 ThrowInfo(DataTypeInvalid,
                           fmt::format("unsupported datatype {}", data_type));
@@ -1000,10 +1136,10 @@ ReverseDataFromIndex(const index::IndexBase* index,
                     valid_data[i] = true;
                 }
                 raw_data[i] = raw.value();
-                auto obj = scalar_array->mutable_timestamptz_data();
-                *(obj->mutable_data()) = {raw_data.begin(), raw_data.end()};
-                break;
             }
+            auto obj = scalar_array->mutable_timestamptz_data();
+            *(obj->mutable_data()) = {raw_data.begin(), raw_data.end()};
+            break;
         }
         case DataType::VARCHAR: {
             using IndexType = index::ScalarIndex<std::string>;
@@ -1125,10 +1261,10 @@ LoadArrowReaderFromRemote(const std::vector<std::string>& remote_files,
 
         auto codec_futures = storage::GetObjectData(
             rcm.get(), remote_files, milvus::PriorityForLoad(priority), false);
-        for (auto& codec_future : codec_futures) {
-            auto reader = codec_future.get()->GetReader();
-            channel->push(reader);
-        }
+        storage::ProcessFuturesInOrder(
+            codec_futures, [&](std::unique_ptr<storage::DataCodec> codec) {
+                channel->push(codec->GetReader());
+            });
         channel->close();
     } catch (std::exception& e) {
         LOG_INFO("failed to load data from remote: {}", e.what());
@@ -1145,10 +1281,10 @@ LoadFieldDatasFromRemote(const std::vector<std::string>& remote_files,
                        .GetRemoteChunkManager();
         auto codec_futures = storage::GetObjectData(
             rcm.get(), remote_files, milvus::PriorityForLoad(priority));
-        for (auto& codec_future : codec_futures) {
-            auto field_data = codec_future.get()->GetFieldData();
-            channel->push(field_data);
-        }
+        storage::ProcessFuturesInOrder(
+            codec_futures, [&](std::unique_ptr<storage::DataCodec> codec) {
+                channel->push(codec->GetFieldData());
+            });
         channel->close();
     } catch (std::exception& e) {
         LOG_INFO("failed to load data from remote: {}", e.what());
@@ -1172,14 +1308,34 @@ upper_bound(const ConcurrentVector<Timestamp>& timestamps,
     return first;
 }
 
-// Get the globally configured cache warmup policy for the given content type.
+// Get the cache warmup policy for the given content type.
+// If warmup_policy is not empty, parse it and return the corresponding policy.
+// If warmup_policy is empty, fall back to the global config.
 CacheWarmupPolicy
-getCacheWarmupPolicy(bool is_vector, bool is_index, bool in_load_list) {
-    auto& manager = milvus::cachinglayer::Manager::GetInstance();
+getCacheWarmupPolicy(const std::string& warmup_policy,
+                     bool is_vector,
+                     bool is_index,
+                     bool in_load_list) {
     // if field not in load list(hint), disable warmup
     if (!in_load_list) {
         return CacheWarmupPolicy::CacheWarmupPolicy_Disable;
     }
+
+    // If user specified a warmup policy, use it
+    if (!warmup_policy.empty()) {
+        if (warmup_policy == "disable") {
+            return CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+        } else if (warmup_policy == "sync") {
+            return CacheWarmupPolicy::CacheWarmupPolicy_Sync;
+        } else if (warmup_policy == "async") {
+            return CacheWarmupPolicy::CacheWarmupPolicy_Async;
+        }
+        // Unknown policy string, should not happen, been checked by milvus proxy side
+        AssertInfo(false, "Unknown warmup policy '{}'", warmup_policy);
+    }
+
+    // Fall back to global config
+    auto& manager = milvus::cachinglayer::Manager::GetInstance();
     if (is_index) {
         return is_vector ? manager.getVectorIndexCacheWarmupPolicy()
                          : manager.getScalarIndexCacheWarmupPolicy();
@@ -1200,4 +1356,246 @@ getCellDataType(bool is_vector, bool is_index) {
     }
 }
 
+void
+LoadIndexData(milvus::tracer::TraceContext& ctx,
+              milvus::segcore::LoadIndexInfo* load_index_info,
+              milvus::OpContext* op_ctx) {
+    auto& index_params = load_index_info->index_params;
+    auto field_type = load_index_info->field_type;
+    auto engine_version = load_index_info->index_engine_version;
+
+    milvus::index::CreateIndexInfo index_info;
+    index_info.field_type = load_index_info->field_type;
+    index_info.field_name = load_index_info->schema.name();
+    index_info.index_engine_version = engine_version;
+
+    auto config = milvus::index::ParseConfigFromIndexParams(
+        load_index_info->index_params);
+    auto load_priority_str = config[milvus::LOAD_PRIORITY].get<std::string>();
+    auto priority_for_load = milvus::PriorityForLoad(load_priority_str);
+    config[milvus::LOAD_PRIORITY] = priority_for_load;
+
+    // Config should have value for milvus::index::SCALAR_INDEX_ENGINE_VERSION for production calling chain.
+    // Use value_or(1) for unit test without setting this value
+    index_info.scalar_index_engine_version =
+        milvus::index::GetValueFromConfig<int32_t>(
+            config, milvus::index::SCALAR_INDEX_ENGINE_VERSION)
+            .value_or(1);
+
+    index_info.tantivy_index_version =
+        milvus::index::GetValueFromConfig<int32_t>(
+            config, milvus::index::TANTIVY_INDEX_VERSION)
+            .value_or(milvus::index::TANTIVY_INDEX_LATEST_VERSION);
+
+    LOG_INFO(
+        "[collection={}][segment={}][field={}][enable_mmap={}][load_"
+        "priority={}] load index {}, "
+        "mmap_dir_path={}",
+        load_index_info->collection_id,
+        load_index_info->segment_id,
+        load_index_info->field_id,
+        load_index_info->enable_mmap,
+        load_priority_str,
+        load_index_info->index_id,
+        load_index_info->mmap_dir_path);
+    // get index type
+    AssertInfo(index_params.find("index_type") != index_params.end(),
+               "index type is empty");
+    index_info.index_type = index_params.at("index_type");
+
+    // get metric type
+    if (milvus::IsVectorDataType(field_type)) {
+        AssertInfo(index_params.find("metric_type") != index_params.end(),
+                   "metric type is empty for vector index");
+        index_info.metric_type = index_params.at("metric_type");
+    }
+
+    if (index_info.index_type == milvus::index::NGRAM_INDEX_TYPE) {
+        AssertInfo(
+            index_params.find(milvus::index::MIN_GRAM) != index_params.end(),
+            "min_gram is empty for ngram index");
+        AssertInfo(
+            index_params.find(milvus::index::MAX_GRAM) != index_params.end(),
+            "max_gram is empty for ngram index");
+
+        // get min_gram and max_gram and convert to uintptr_t
+        milvus::index::NgramParams ngram_params{};
+        ngram_params.loading_index = true;
+        ngram_params.min_gram =
+            std::stoul(milvus::index::GetValueFromConfig<std::string>(
+                           config, milvus::index::MIN_GRAM)
+                           .value());
+        ngram_params.max_gram =
+            std::stoul(milvus::index::GetValueFromConfig<std::string>(
+                           config, milvus::index::MAX_GRAM)
+                           .value());
+        index_info.ngram_params = std::make_optional(ngram_params);
+    }
+
+    // init file manager
+    milvus::storage::FieldDataMeta field_meta{load_index_info->collection_id,
+                                              load_index_info->partition_id,
+                                              load_index_info->segment_id,
+                                              load_index_info->field_id,
+                                              load_index_info->schema};
+    milvus::storage::IndexMeta index_meta{load_index_info->segment_id,
+                                          load_index_info->field_id,
+                                          load_index_info->index_build_id,
+                                          load_index_info->index_version};
+    config[milvus::index::INDEX_FILES] = load_index_info->index_files;
+
+    if (load_index_info->field_type == milvus::DataType::JSON) {
+        index_info.json_cast_type = milvus::JsonCastType::FromString(
+            config.at(JSON_CAST_TYPE).get<std::string>());
+        index_info.json_path = config.at(JSON_PATH).get<std::string>();
+    }
+    auto remote_chunk_manager =
+        milvus::storage::RemoteChunkManagerSingleton::GetInstance()
+            .GetRemoteChunkManager();
+    auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
+                  .GetArrowFileSystem();
+    AssertInfo(fs != nullptr, "arrow file system is nullptr");
+    milvus::storage::FileManagerContext file_manager_context(
+        field_meta, index_meta, remote_chunk_manager, fs);
+    file_manager_context.set_for_loading_index(true);
+
+    // use cache layer to load vector/scalar index
+    std::unique_ptr<milvus::cachinglayer::Translator<milvus::index::IndexBase>>
+        translator = std::make_unique<
+            milvus::segcore::storagev1translator::SealedIndexTranslator>(
+            index_info, load_index_info, ctx, file_manager_context, config);
+
+    load_index_info->cache_index =
+        milvus::cachinglayer::Manager::GetInstance().CreateCacheSlot(
+            std::move(translator), op_ctx);
+}
+
+FieldDataPtr
+bulk_script_field_data(milvus::OpContext* op_ctx,
+                       FieldId fieldId,
+                       DataType dataType,
+                       const int64_t* seg_offsets,
+                       int64_t count,
+                       const segcore::SegmentInternalInterface* segment,
+                       TargetBitmap& valid_view,
+                       bool small_int_raw_type) {
+    FieldDataPtr ret = nullptr;
+    switch (dataType) {
+        case milvus::DataType::BOOL: {
+            FixedVector<bool> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view);
+            ret = std::make_shared<FieldDataImpl<bool, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        case milvus::DataType::INT8: {
+            FixedVector<int8_t> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view,
+                                    small_int_raw_type);
+            ret = std::make_shared<FieldDataImpl<int8_t, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        case milvus::DataType::INT16: {
+            FixedVector<int16_t> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view,
+                                    small_int_raw_type);
+            ret = std::make_shared<FieldDataImpl<int16_t, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        case milvus::DataType::INT32: {
+            FixedVector<int32_t> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view);
+            ret = std::make_shared<FieldDataImpl<int32_t, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        case milvus::DataType::TIMESTAMPTZ:
+        case milvus::DataType::INT64: {
+            FixedVector<int64_t> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view);
+            ret = std::make_shared<FieldDataImpl<int64_t, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        case milvus::DataType::FLOAT: {
+            FixedVector<float> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view);
+            ret = std::make_shared<FieldDataImpl<float, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        case milvus::DataType::DOUBLE: {
+            FixedVector<double> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view);
+            ret = std::make_shared<FieldDataImpl<double, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        case milvus::DataType::STRING:
+        case milvus::DataType::VARCHAR:
+        case milvus::DataType::TEXT: {
+            FixedVector<std::string> vec(count);
+            segment->bulk_subscript(op_ctx,
+                                    fieldId,
+                                    dataType,
+                                    seg_offsets,
+                                    count,
+                                    vec.data(),
+                                    valid_view);
+            ret = std::make_shared<FieldDataImpl<std::string, true>>(
+                1, dataType, false, std::move(vec));
+            break;
+        }
+        default: {
+            ThrowInfo(DataTypeInvalid,
+                      fmt::format("unsupported data type {}", dataType));
+        }
+    }
+
+    return ret;
+}
 }  // namespace milvus::segcore

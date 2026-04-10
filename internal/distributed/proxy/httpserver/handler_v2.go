@@ -40,6 +40,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/hook"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/types"
@@ -51,6 +52,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/requestutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -67,6 +69,110 @@ func NewHandlersV2(proxyClient types.ProxyComponent) *HandlersV2 {
 	}
 }
 
+var routeToMethod = map[string]string{
+	"/v2/vectordb/collections/list":                 "ShowCollections",
+	"/v2/vectordb/collections/has":                  "HasCollection",
+	"/v2/vectordb/collections/describe":             "DescribeCollection",
+	"/v2/vectordb/collections/get_stats":            "GetCollectionStatistics",
+	"/v2/vectordb/collections/get_load_state":       "GetLoadState",
+	"/v2/vectordb/collections/create":               "CreateCollection",
+	"/v2/vectordb/collections/drop":                 "DropCollection",
+	"/v2/vectordb/collections/truncate":             "TruncateCollection",
+	"/v2/vectordb/collections/rename":               "RenameCollection",
+	"/v2/vectordb/collections/load":                 "LoadCollection",
+	"/v2/vectordb/collections/refresh_load":         "LoadCollection",
+	"/v2/vectordb/collections/release":              "ReleaseCollection",
+	"/v2/vectordb/collections/alter_properties":     "AlterCollection",
+	"/v2/vectordb/collections/add_function":         "AddCollectionFunction",
+	"/v2/vectordb/collections/alter_function":       "AlterCollectionFunction",
+	"/v2/vectordb/collections/drop_function":        "DropCollectionFunction",
+	"/v2/vectordb/collections/drop_properties":      "AlterCollection",
+	"/v2/vectordb/collections/compact":              "ManualCompaction",
+	"/v2/vectordb/collections/get_compaction_state": "GetCompactionState",
+	"/v2/vectordb/collections/flush":                "Flush",
+
+	"/v2/vectordb/collections/fields/alter_properties": "AlterCollectionField",
+	"/v2/vectordb/collections/fields/add":              "AddCollectionField",
+
+	"/v2/vectordb/databases/create":           "CreateDatabase",
+	"/v2/vectordb/databases/drop":             "DropDatabase",
+	"/v2/vectordb/databases/drop_properties":  "AlterDatabase",
+	"/v2/vectordb/databases/list":             "ListDatabases",
+	"/v2/vectordb/databases/describe":         "DescribeDatabase",
+	"/v2/vectordb/databases/alter":            "AlterDatabase",
+	"/v2/vectordb/databases/alter_properties": "AlterDatabase",
+
+	"/v2/vectordb/entities/query":           "Query",
+	"/v2/vectordb/entities/get":             "Query",
+	"/v2/vectordb/entities/delete":          "Delete",
+	"/v2/vectordb/entities/insert":          "Insert",
+	"/v2/vectordb/entities/upsert":          "Upsert",
+	"/v2/vectordb/entities/search":          "Search",
+	"/v2/vectordb/entities/advanced_search": "HybridSearch",
+	"/v2/vectordb/entities/hybrid_search":   "HybridSearch",
+
+	"/v2/vectordb/partitions/list":      "ShowPartitions",
+	"/v2/vectordb/partitions/has":       "HasPartition",
+	"/v2/vectordb/partitions/get_stats": "GetPartitionStatistics",
+	"/v2/vectordb/partitions/create":    "CreatePartition",
+	"/v2/vectordb/partitions/drop":      "DropPartition",
+	"/v2/vectordb/partitions/load":      "LoadPartitions",
+	"/v2/vectordb/partitions/release":   "ReleasePartitions",
+
+	"/v2/vectordb/users/list":            "ListCredUsers",
+	"/v2/vectordb/users/describe":        "SelectUser",
+	"/v2/vectordb/users/create":          "CreateCredential",
+	"/v2/vectordb/users/update_password": "UpdateCredential",
+	"/v2/vectordb/users/drop":            "DeleteCredential",
+	"/v2/vectordb/users/grant_role":      "OperateUserRole",
+	"/v2/vectordb/users/revoke_role":     "OperateUserRole",
+
+	"/v2/vectordb/roles/list":                "SelectRole",
+	"/v2/vectordb/roles/describe":            "SelectGrant",
+	"/v2/vectordb/roles/create":              "CreateRole",
+	"/v2/vectordb/roles/drop":                "DropRole",
+	"/v2/vectordb/roles/grant_privilege":     "OperatePrivilege",
+	"/v2/vectordb/roles/revoke_privilege":    "OperatePrivilege",
+	"/v2/vectordb/roles/grant_privilege_v2":  "OperatePrivilege",
+	"/v2/vectordb/roles/revoke_privilege_v2": "OperatePrivilege",
+
+	"/v2/vectordb/privilege_groups/create":                       "CreatePrivilegeGroup",
+	"/v2/vectordb/privilege_groups/drop":                         "DropPrivilegeGroup",
+	"/v2/vectordb/privilege_groups/list":                         "ListPrivilegeGroups",
+	"/v2/vectordb/privilege_groups/add_privileges_to_group":      "OperatePrivilegeGroup",
+	"/v2/vectordb/privilege_groups/remove_privileges_from_group": "OperatePrivilegeGroup",
+
+	"/v2/vectordb/indexes/list":             "DescribeIndex",
+	"/v2/vectordb/indexes/describe":         "DescribeIndex",
+	"/v2/vectordb/indexes/create":           "CreateIndex",
+	"/v2/vectordb/indexes/drop":             "DropIndex",
+	"/v2/vectordb/indexes/alter_properties": "AlterIndex",
+	"/v2/vectordb/indexes/drop_properties":  "AlterIndex",
+
+	"/v2/vectordb/aliases/list":     "ListAliases",
+	"/v2/vectordb/aliases/describe": "DescribeAlias",
+	"/v2/vectordb/aliases/create":   "CreateAlias",
+	"/v2/vectordb/aliases/drop":     "DropAlias",
+	"/v2/vectordb/aliases/alter":    "AlterAlias",
+
+	"/v2/vectordb/jobs/import/list":         "ListImports",
+	"/v2/vectordb/jobs/import/create":       "Import",
+	"/v2/vectordb/jobs/import/get_progress": "GetImportProgress",
+	"/v2/vectordb/jobs/import/describe":     "GetImportProgress",
+
+	"/v2/vectordb/resource_groups/create":           "CreateResourceGroup",
+	"/v2/vectordb/resource_groups/drop":             "DropResourceGroup",
+	"/v2/vectordb/resource_groups/alter":            "UpdateResourceGroups",
+	"/v2/vectordb/resource_groups/describe":         "DescribeResourceGroup",
+	"/v2/vectordb/resource_groups/list":             "ListResourceGroups",
+	"/v2/vectordb/resource_groups/transfer_replica": "TransferMaster",
+
+	"/v2/vectordb/segments/describe":    "GetSegmentsInfo",
+	"/v2/vectordb/quotacenter/describe": "GetQuotaMetrics",
+
+	"/v2/vectordb/common/run_analyzer": "RunAnalyzer",
+}
+
 func (h *HandlersV2) RegisterRoutesToV2(router gin.IRouter) {
 	router.POST(CollectionCategory+ListAction, timeoutMiddleware(wrapperPost(func() any { return &DatabaseReq{} }, wrapperTraceLog(h.listCollections))))
 	router.POST(CollectionCategory+HasAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionNameReq{} }, wrapperTraceLog(h.hasCollection))))
@@ -76,11 +182,15 @@ func (h *HandlersV2) RegisterRoutesToV2(router gin.IRouter) {
 	router.POST(CollectionCategory+LoadStateAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionNameReq{} }, wrapperTraceLog(h.getCollectionLoadState))))
 	router.POST(CollectionCategory+CreateAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionReq{AutoID: DisableAutoID} }, wrapperTraceLog(h.createCollection))))
 	router.POST(CollectionCategory+DropAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionNameReq{} }, wrapperTraceLog(h.dropCollection))))
+	router.POST(CollectionCategory+TruncateAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionNameReq{} }, wrapperTraceLog(h.truncateCollection))))
 	router.POST(CollectionCategory+RenameAction, timeoutMiddleware(wrapperPost(func() any { return &RenameCollectionReq{} }, wrapperTraceLog(h.renameCollection))))
 	router.POST(CollectionCategory+LoadAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionNameReq{} }, wrapperTraceLog(h.loadCollection))))
 	router.POST(CollectionCategory+RefreshLoadAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionNameReq{} }, wrapperTraceLog(h.refreshLoadCollection))))
 	router.POST(CollectionCategory+ReleaseAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionNameReq{} }, wrapperTraceLog(h.releaseCollection))))
 	router.POST(CollectionCategory+AlterPropertiesAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionReqWithProperties{} }, wrapperTraceLog(h.alterCollectionProperties))))
+	router.POST(CollectionCategory+AddFunctionAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionAddFunction{} }, wrapperTraceLog(h.addCollectionFunction))))
+	router.POST(CollectionCategory+AlterFunctionAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionAlterFunction{} }, wrapperTraceLog(h.alterCollectionFunction))))
+	router.POST(CollectionCategory+DropFunctionAction, timeoutMiddleware(wrapperPost(func() any { return &CollectionDropFunction{} }, wrapperTraceLog(h.dropCollectionFunction))))
 	router.POST(CollectionCategory+DropPropertiesAction, timeoutMiddleware(wrapperPost(func() any { return &DropCollectionPropertiesReq{} }, wrapperTraceLog(h.dropCollectionProperties))))
 	router.POST(CollectionCategory+CompactAction, timeoutMiddleware(wrapperPost(func() any { return &CompactReq{} }, wrapperTraceLog(h.compact))))
 	router.POST(CollectionCategory+CompactionStateAction, timeoutMiddleware(wrapperPost(func() any { return &GetCompactionStateReq{} }, wrapperTraceLog(h.getcompactionState))))
@@ -244,6 +354,7 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 			return
 		}
 		dbName := ""
+		collectionName := ""
 		if req != nil {
 			if getter, ok := req.(requestutil.DBNameGetter); ok {
 				dbName = getter.GetDbName()
@@ -254,6 +365,9 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 					dbName = DefaultDbName
 				}
 			}
+			if getter, ok := req.(requestutil.CollectionNameGetter); ok {
+				collectionName = getter.GetCollectionName()
+			}
 		}
 		innerCtx := gCtx.Request.Context()
 		ctx, span := otel.Tracer(typeutil.ProxyRole).Start(innerCtx, gCtx.Request.URL.Path)
@@ -262,10 +376,31 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 		ctx = proxy.NewContextWithMetadata(ctx, username.(string), dbName)
 		traceID := span.SpanContext().TraceID().String()
 		ctx = log.WithTraceID(ctx, traceID)
-		gCtx.Keys["traceID"] = traceID
+		gCtx.Set("traceID", traceID)
 		log.Ctx(ctx).Debug("high level restful api, read parameters from request body, then start to handle.",
 			zap.Any("url", gCtx.Request.URL.Path))
-		v2(ctx, gCtx, req, dbName)
+
+		resp, err := v2(ctx, gCtx, req, dbName)
+		methodTag, ok := routeToMethod[gCtx.FullPath()]
+		if !ok {
+			return
+		}
+		metrics.ProxyFunctionCall.WithLabelValues(
+			strconv.FormatInt(paramtable.GetNodeID(), 10),
+			methodTag,
+			metrics.TotalLabel,
+			dbName,
+			collectionName,
+		).Inc()
+		label := requestutil.ParseMetricLabel(resp, err)
+		// set metrics for state code
+		metrics.ProxyFunctionCall.WithLabelValues(
+			strconv.FormatInt(paramtable.GetNodeID(), 10),
+			methodTag,
+			label,
+			dbName,
+			collectionName,
+		).Inc()
 	}
 }
 
@@ -333,6 +468,18 @@ func checkAuthorizationV2(ctx context.Context, c *gin.Context, ignoreErr bool, r
 	return nil
 }
 
+func checkAuthorizationHelper(ctx context.Context, c *gin.Context, req interface{}) error {
+	username, ok := c.Get(ContextUsername)
+	if !ok || username.(string) == "" {
+		return merr.ErrNeedAuthenticate
+	}
+	_, authErr := proxy.PrivilegeInterceptor(ctx, req)
+	if authErr != nil {
+		return authErr
+	}
+	return nil
+}
+
 func wrapperProxy(ctx context.Context, c *gin.Context, req any, checkAuth bool, ignoreErr bool, fullMethod string, handler func(reqCtx context.Context, req any) (any, error)) (interface{}, error) {
 	return wrapperProxyWithLimit(ctx, c, req, checkAuth, ignoreErr, fullMethod, false, nil, handler)
 }
@@ -366,7 +513,16 @@ func wrapperProxyWithLimit(ctx context.Context, ginCtx *gin.Context, req any, ch
 		username = ""
 	}
 
-	response, err := proxy.HookInterceptor(context.WithValue(ctx, hook.GinParamsKey, ginCtx.Keys), req, username.(string), fullMethod, handler)
+	forwardHandler := func(reqCtx context.Context, req any) (any, error) {
+		interceptor := streaming.ForwardLegacyProxyUnaryServerInterceptor()
+		if token, ok := ginCtx.Get(ContextToken); ok {
+			interceptor = streaming.ForwardLegacyProxyUnaryServerInterceptor(streaming.OptForwardAuth(token.(string)))
+		}
+		return interceptor(reqCtx, req, &grpc.UnaryServerInfo{FullMethod: fullMethod}, func(ctx context.Context, req any) (interface{}, error) {
+			return handler(ctx, req)
+		})
+	}
+	response, err := proxy.HookInterceptor(context.WithValue(ctx, hook.GinParamsKey, ginCtx.Keys), req, username.(string), fullMethod, forwardHandler)
 	if err == nil {
 		status, ok := requestutil.GetStatusFromResponse(response)
 		if ok {
@@ -393,6 +549,7 @@ func (h *HandlersV2) hasCollection(ctx context.Context, c *gin.Context, anyReq a
 			DbName:         dbName,
 			CollectionName: collectionName,
 		}
+		// handle at rootcoord side
 		resp, err := wrapperProxy(ctx, c, req, false, false, "/milvus.proto.milvus.MilvusService/HasCollection", func(reqCtx context.Context, req any) (interface{}, error) {
 			return h.proxy.HasCollection(reqCtx, req.(*milvuspb.HasCollectionRequest))
 		})
@@ -410,6 +567,7 @@ func (h *HandlersV2) listCollections(ctx context.Context, c *gin.Context, anyReq
 		DbName: dbName,
 	}
 	c.Set(ContextRequest, req)
+	// handle at rootcoord side
 	resp, err := wrapperProxy(ctx, c, req, false, false, "/milvus.proto.milvus.MilvusService/ShowCollections", func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.ShowCollections(reqCtx, req.(*milvuspb.ShowCollectionsRequest))
 	})
@@ -596,6 +754,22 @@ func (h *HandlersV2) dropCollection(ctx context.Context, c *gin.Context, anyReq 
 	return resp, err
 }
 
+func (h *HandlersV2) truncateCollection(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	getter, _ := anyReq.(requestutil.CollectionNameGetter)
+	req := &milvuspb.TruncateCollectionRequest{
+		DbName:         dbName,
+		CollectionName: getter.GetCollectionName(),
+	}
+	c.Set(ContextRequest, req)
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/TruncateCollection", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.TruncateCollection(reqCtx, req.(*milvuspb.TruncateCollectionRequest))
+	})
+	if err == nil {
+		HTTPReturn(c, http.StatusOK, wrapperReturnDefault())
+	}
+	return resp, err
+}
+
 func (h *HandlersV2) renameCollection(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
 	httpReq := anyReq.(*RenameCollectionReq)
 	req := &milvuspb.RenameCollectionRequest{
@@ -678,6 +852,74 @@ func (h *HandlersV2) alterCollectionProperties(ctx context.Context, c *gin.Conte
 	c.Set(ContextRequest, req)
 	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/AlterCollection", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.AlterCollection(reqCtx, req.(*milvuspb.AlterCollectionRequest))
+	})
+	if err == nil {
+		HTTPReturn(c, http.StatusOK, wrapperReturnDefault())
+	}
+	return resp, err
+}
+
+func (h *HandlersV2) addCollectionFunction(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	httpReq := anyReq.(*CollectionAddFunction)
+	req := &milvuspb.AddCollectionFunctionRequest{
+		DbName:         dbName,
+		CollectionName: httpReq.CollectionName,
+	}
+	fSchema, err := genFunctionSchema(ctx, &httpReq.Function)
+	if err != nil {
+		HTTPAbortReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
+			HTTPReturnMessage: err.Error(),
+		})
+	}
+
+	req.FunctionSchema = fSchema
+	c.Set(ContextRequest, req)
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/AddCollectionFunction", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.AddCollectionFunction(reqCtx, req.(*milvuspb.AddCollectionFunctionRequest))
+	})
+	if err == nil {
+		HTTPReturn(c, http.StatusOK, wrapperReturnDefault())
+	}
+	return resp, err
+}
+
+func (h *HandlersV2) alterCollectionFunction(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	httpReq := anyReq.(*CollectionAlterFunction)
+	req := &milvuspb.AlterCollectionFunctionRequest{
+		DbName:         dbName,
+		CollectionName: httpReq.CollectionName,
+		FunctionName:   httpReq.FunctionName,
+	}
+	fSchema, err := genFunctionSchema(ctx, &httpReq.Function)
+	if err != nil {
+		HTTPAbortReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
+			HTTPReturnMessage: err.Error(),
+		})
+	}
+
+	req.FunctionSchema = fSchema
+	c.Set(ContextRequest, req)
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/AlterCollectionFunction", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.AlterCollectionFunction(reqCtx, req.(*milvuspb.AlterCollectionFunctionRequest))
+	})
+	if err == nil {
+		HTTPReturn(c, http.StatusOK, wrapperReturnDefault())
+	}
+	return resp, err
+}
+
+func (h *HandlersV2) dropCollectionFunction(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	httpReq := anyReq.(*CollectionDropFunction)
+	req := &milvuspb.DropCollectionFunctionRequest{
+		DbName:         dbName,
+		CollectionName: httpReq.CollectionName,
+		FunctionName:   httpReq.FunctionName,
+	}
+	c.Set(ContextRequest, req)
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/DropCollectionFunction", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.DropCollectionFunction(reqCtx, req.(*milvuspb.DropCollectionFunctionRequest))
 	})
 	if err == nil {
 		HTTPReturn(c, http.StatusOK, wrapperReturnDefault())
@@ -1209,8 +1451,8 @@ func generatePlaceholderGroup(ctx context.Context, body string, collSchema *sche
 
 	if vectorField.GetIsFunctionOutput() {
 		for _, function := range collSchema.Functions {
-			if function.Type == schemapb.FunctionType_BM25 || function.Type == schemapb.FunctionType_TextEmbedding {
-				// TODO: currently only BM25 & text embedding function is supported, thus guarantees one input field to one output field
+			if function.Type == schemapb.FunctionType_BM25 || function.Type == schemapb.FunctionType_TextEmbedding || function.Type == schemapb.FunctionType_MinHash {
+				// TODO: currently only BM25, text & MinHash embedding function is supported, thus guarantees one input field to one output field
 				if function.OutputFieldNames[0] == vectorField.Name {
 					dataType = schemapb.DataType_VarChar
 				}
@@ -1257,6 +1499,28 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 		return nil, err
 	}
 
+	// Check if search by primary keys or by vectors
+	hasIDs := len(httpReq.Ids) > 0
+	hasData := len(httpReq.Data) > 0
+
+	// Primary keys and query vectors are mutually exclusive
+	if hasIDs && hasData {
+		HTTPAbortReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
+			HTTPReturnMessage: "primary keys (ids) and query vectors (data) are mutually exclusive. Please provide either 'ids' or 'data', not both",
+		})
+		return nil, merr.ErrParameterInvalid
+	}
+
+	// At least one of ids or data must be provided
+	if !hasIDs && !hasData {
+		HTTPAbortReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode:    merr.Code(merr.ErrMissingRequiredParameters),
+			HTTPReturnMessage: "either 'ids' (for primary key search) or 'data' (for vector search) must be provided",
+		})
+		return nil, merr.ErrMissingRequiredParameters
+	}
+
 	searchParams, err := generateSearchParams(httpReq.SearchParams)
 	if err != nil {
 		log.Ctx(ctx).Warn("high level restful api, generate SearchParams failed", zap.Error(err))
@@ -1282,19 +1546,55 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 		}
 	}
 
-	searchParams = append(searchParams, &commonpb.KeyValuePair{Key: proxy.AnnsFieldKey, Value: httpReq.AnnsField})
-	body, _ := c.Get(gin.BodyBytesKey)
-	placeholderGroup, err := generatePlaceholderGroup(ctx, string(body.([]byte)), collSchema, httpReq.AnnsField)
-	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, search with vector invalid", zap.Error(err))
-		HTTPAbortReturn(c, http.StatusOK, gin.H{
-			HTTPReturnCode:    merr.Code(merr.ErrIncorrectParameterFormat),
-			HTTPReturnMessage: merr.ErrIncorrectParameterFormat.Error() + ", error: " + err.Error(),
-		})
-		return nil, err
+	if hasIDs {
+		// Search by primary keys
+		primaryField, ok := getPrimaryField(collSchema)
+		if !ok {
+			HTTPAbortReturn(c, http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
+				HTTPReturnMessage: "collection has no primary key field",
+			})
+			return nil, merr.ErrParameterInvalid
+		}
+
+		// Convert ids to schemapb.IDs
+		ids, err := convertIDsToSchemapbIDs(httpReq.Ids, primaryField)
+		if err != nil {
+			log.Ctx(ctx).Warn("high level restful api, convert ids to schemapb.IDs failed", zap.Error(err))
+			HTTPAbortReturn(c, http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
+				HTTPReturnMessage: merr.ErrParameterInvalid.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
+		}
+
+		// Set Ids field using the oneof SearchInput field
+		req.SearchInput = &milvuspb.SearchRequest_Ids{
+			Ids: ids,
+		}
+		// Set anns_field in search params if provided
+		if httpReq.AnnsField != "" {
+			searchParams = append(searchParams, &commonpb.KeyValuePair{Key: proxy.AnnsFieldKey, Value: httpReq.AnnsField})
+		}
+	} else {
+		// Search by vectors (existing logic)
+		searchParams = append(searchParams, &commonpb.KeyValuePair{Key: proxy.AnnsFieldKey, Value: httpReq.AnnsField})
+		body, _ := c.Get(gin.BodyBytesKey)
+		placeholderGroup, err := generatePlaceholderGroup(ctx, string(body.([]byte)), collSchema, httpReq.AnnsField)
+		if err != nil {
+			log.Ctx(ctx).Warn("high level restful api, search with vector invalid", zap.Error(err))
+			HTTPAbortReturn(c, http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(merr.ErrIncorrectParameterFormat),
+				HTTPReturnMessage: merr.ErrIncorrectParameterFormat.Error() + ", error: " + err.Error(),
+			})
+			return nil, err
+		}
+		req.SearchInput = &milvuspb.SearchRequest_PlaceholderGroup{
+			PlaceholderGroup: placeholderGroup,
+		}
 	}
+
 	req.SearchParams = searchParams
-	req.PlaceholderGroup = placeholderGroup
 	req.ExprTemplateValues = generateExpressionTemplate(httpReq.ExprParams)
 	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/Search", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.Search(reqCtx, req.(*milvuspb.SearchRequest))
@@ -1412,14 +1712,16 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 			return nil, err
 		}
 		searchReq := &milvuspb.SearchRequest{
-			DbName:           dbName,
-			CollectionName:   httpReq.CollectionName,
-			Dsl:              subReq.Filter,
-			PlaceholderGroup: placeholderGroup,
-			DslType:          commonpb.DslType_BoolExprV1,
-			OutputFields:     httpReq.OutputFields,
-			PartitionNames:   httpReq.PartitionNames,
-			SearchParams:     searchParams,
+			DbName:         dbName,
+			CollectionName: httpReq.CollectionName,
+			Dsl:            subReq.Filter,
+			SearchInput: &milvuspb.SearchRequest_PlaceholderGroup{
+				PlaceholderGroup: placeholderGroup,
+			},
+			DslType:        commonpb.DslType_BoolExprV1,
+			OutputFields:   httpReq.OutputFields,
+			PartitionNames: httpReq.PartitionNames,
+			SearchParams:   searchParams,
 		}
 		searchReq.ExprTemplateValues = generateExpressionTemplate(subReq.ExprParams)
 		req.Requests = append(req.Requests, searchReq)
@@ -1716,6 +2018,12 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 			Value: fmt.Sprintf("%v", httpReq.Params["ttlSeconds"]),
 		})
 	}
+	if _, ok := httpReq.Params["ttlField"]; ok {
+		req.Properties = append(req.Properties, &commonpb.KeyValuePair{
+			Key:   common.CollectionTTLFieldKey,
+			Value: fmt.Sprintf("%v", httpReq.Params["ttlField"]),
+		})
+	}
 	if _, ok := httpReq.Params["partitionKeyIsolation"]; ok {
 		req.Properties = append(req.Properties, &commonpb.KeyValuePair{
 			Key:   common.PartitionKeyIsolationKey,
@@ -1727,6 +2035,19 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 			Key:   common.MmapEnabledKey,
 			Value: fmt.Sprintf("%v", httpReq.Params[common.MmapEnabledKey]),
 		})
+	}
+	for _, key := range []string{
+		common.WarmupScalarFieldKey,
+		common.WarmupScalarIndexKey,
+		common.WarmupVectorFieldKey,
+		common.WarmupVectorIndexKey,
+	} {
+		if _, ok := httpReq.Params[key]; ok {
+			req.Properties = append(req.Properties, &commonpb.KeyValuePair{
+				Key:   key,
+				Value: fmt.Sprintf("%v", httpReq.Params[key]),
+			})
+		}
 	}
 
 	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/CreateCollection", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
@@ -1858,6 +2179,7 @@ func (h *HandlersV2) dropDatabaseProperties(ctx context.Context, c *gin.Context,
 func (h *HandlersV2) listDatabases(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
 	req := &milvuspb.ListDatabasesRequest{}
 	c.Set(ContextRequest, req)
+	// handle at rootcoord side
 	resp, err := wrapperProxy(ctx, c, req, false, false, "/milvus.proto.milvus.MilvusService/ListDatabases", func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.ListDatabases(reqCtx, req.(*milvuspb.ListDatabasesRequest))
 	})
@@ -2405,6 +2727,7 @@ func (h *HandlersV2) describeIndex(ctx context.Context, c *gin.Context, anyReq a
 			indexType := ""
 			mmapEnabled := ""
 			indexOffsetCacheEnabled := ""
+			warmup := ""
 			for _, pair := range indexDescription.Params {
 				switch pair.Key {
 				case common.MetricTypeKey:
@@ -2415,6 +2738,8 @@ func (h *HandlersV2) describeIndex(ctx context.Context, c *gin.Context, anyReq a
 					mmapEnabled = pair.Value
 				case common.IndexOffsetCacheEnabledKey:
 					indexOffsetCacheEnabled = pair.Value
+				case common.WarmupKey:
+					warmup = pair.Value
 				}
 			}
 			indexInfo := map[string]any{
@@ -2424,6 +2749,7 @@ func (h *HandlersV2) describeIndex(ctx context.Context, c *gin.Context, anyReq a
 				HTTPReturnIndexMetricType:      metricType,
 				HTTPMmapEnabledKey:             mmapEnabled,
 				HTTPIndexOffsetCacheEnabledKey: indexOffsetCacheEnabled,
+				HTTPWarmupKey:                  warmup,
 				HTTPReturnIndexTotalRows:       indexDescription.TotalRows,
 				HTTPReturnIndexPendingRows:     indexDescription.PendingIndexRows,
 				HTTPReturnIndexIndexedRows:     indexDescription.IndexedRows,
@@ -2641,15 +2967,6 @@ func (h *HandlersV2) listImportJob(ctx context.Context, c *gin.Context, anyReq a
 	}
 	c.Set(ContextRequest, req)
 
-	if h.checkAuth {
-		err := checkAuthorizationV2(ctx, c, false, &milvuspb.ListImportsAuthPlaceholder{
-			DbName:         dbName,
-			CollectionName: collectionName,
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
 	resp, err := wrapperProxy(ctx, c, req, false, false, "/milvus.proto.milvus.MilvusService/ListImports", func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.ListImports(reqCtx, req.(*internalpb.ListImportsRequest))
 	})
@@ -2657,13 +2974,29 @@ func (h *HandlersV2) listImportJob(ctx context.Context, c *gin.Context, anyReq a
 		returnData := make(map[string]interface{})
 		records := make([]map[string]interface{}, 0)
 		response := resp.(*internalpb.ListImportsResponse)
-		for i, jobID := range response.GetJobIDs() {
+		jobIDs := response.GetJobIDs()
+		states := response.GetStates()
+		progresses := response.GetProgresses()
+		reasons := response.GetReasons()
+		collections := response.GetCollectionNames()
+
+		for i, jobID := range jobIDs {
+			collection := collections[i]
+			if h.checkAuth {
+				err = checkAuthorizationHelper(ctx, c, &milvuspb.ImportAuthPlaceholder{
+					DbName:         dbName,
+					CollectionName: collection,
+				})
+				if err != nil {
+					continue
+				}
+			}
 			jobDetail := make(map[string]interface{})
 			jobDetail["jobId"] = jobID
-			jobDetail["collectionName"] = response.GetCollectionNames()[i]
-			jobDetail["state"] = response.GetStates()[i].String()
-			jobDetail["progress"] = response.GetProgresses()[i]
-			reason := response.GetReasons()[i]
+			jobDetail["collectionName"] = collection
+			jobDetail["state"] = states[i].String()
+			jobDetail["progress"] = progresses[i]
+			reason := reasons[i]
 			if reason != "" {
 				jobDetail["reason"] = reason
 			}
@@ -2722,19 +3055,24 @@ func (h *HandlersV2) getImportJobProcess(ctx context.Context, c *gin.Context, an
 	}
 	c.Set(ContextRequest, req)
 
-	if h.checkAuth {
-		err := checkAuthorizationV2(ctx, c, false, &milvuspb.GetImportProgressAuthPlaceholder{
-			DbName: dbName,
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
 	resp, err := wrapperProxy(ctx, c, req, false, false, "/milvus.proto.milvus.MilvusService/GetImportProgress", func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.GetImportProgress(reqCtx, req.(*internalpb.GetImportProgressRequest))
 	})
 	if err == nil {
 		response := resp.(*internalpb.GetImportProgressResponse)
+		if h.checkAuth {
+			err := checkAuthorizationHelper(ctx, c, &milvuspb.ImportAuthPlaceholder{
+				DbName:         dbName,
+				CollectionName: response.GetCollectionName(),
+			})
+			if err != nil {
+				HTTPReturn(c, http.StatusForbidden, gin.H{
+					HTTPReturnCode:    merr.Code(err),
+					HTTPReturnMessage: err.Error(),
+				})
+				return nil, err
+			}
+		}
 		returnData := make(map[string]interface{})
 		returnData["jobId"] = jobIDGetter.GetJobID()
 		returnData["createTime"] = response.GetCreateTime()

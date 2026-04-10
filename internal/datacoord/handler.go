@@ -18,17 +18,28 @@ package datacoord
 
 import (
 	"context"
+	"math"
+	"path"
+	"strconv"
 	"time"
 
 	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
 	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -45,6 +56,8 @@ type Handler interface {
 	GetCollection(ctx context.Context, collectionID UniqueID) (*collectionInfo, error)
 	GetCurrentSegmentsView(ctx context.Context, channel RWChannel, partitionIDs ...UniqueID) *SegmentsView
 	ListLoadedSegments(ctx context.Context) ([]int64, error)
+	GenSnapshot(ctx context.Context, collectionID UniqueID) (*SnapshotData, error)
+	GetDeltaLogFromCompactTo(ctx context.Context, segmentID UniqueID) ([]*datapb.FieldBinlog, error)
 }
 
 type SegmentsView struct {
@@ -66,6 +79,10 @@ func newServerHandler(s *Server) *ServerHandler {
 }
 
 // GetDataVChanPositions gets vchannel latest positions with provided dml channel names for DataNode.
+// unflushend segmentIDs ---> L1, growing segments
+// flushend segmentIDs   ---> L1&L2, flushed segments
+// dropped segmentIDs    ---> dropped segments
+// level zero segmentIDs ---> L0 segments
 func (h *ServerHandler) GetDataVChanPositions(channel RWChannel, partitionID UniqueID) *datapb.VchannelInfo {
 	segments := h.s.meta.GetRealSegmentsForChannel(channel.GetName())
 	log.Info("GetDataVChanPositions",
@@ -74,6 +91,7 @@ func (h *ServerHandler) GetDataVChanPositions(channel RWChannel, partitionID Uni
 		zap.Int("numOfSegments", len(segments)),
 	)
 	var (
+		levelZeroIDs = make(typeutil.UniqueSet)
 		flushedIDs   = make(typeutil.UniqueSet)
 		unflushedIDs = make(typeutil.UniqueSet)
 		droppedIDs   = make(typeutil.UniqueSet)
@@ -90,12 +108,14 @@ func (h *ServerHandler) GetDataVChanPositions(channel RWChannel, partitionID Uni
 			continue
 		}
 
-		if s.GetState() == commonpb.SegmentState_Dropped {
+		switch {
+		case s.GetState() == commonpb.SegmentState_Dropped:
 			droppedIDs.Insert(s.GetID())
-			continue
-		} else if s.GetState() == commonpb.SegmentState_Flushing || s.GetState() == commonpb.SegmentState_Flushed {
+		case s.GetLevel() == datapb.SegmentLevel_L0:
+			levelZeroIDs.Insert(s.GetID())
+		case isFlushState(s.GetState()):
 			flushedIDs.Insert(s.GetID())
-		} else {
+		default:
 			unflushedIDs.Insert(s.GetID())
 		}
 	}
@@ -107,6 +127,7 @@ func (h *ServerHandler) GetDataVChanPositions(channel RWChannel, partitionID Uni
 		FlushedSegmentIds:   flushedIDs.Collect(),
 		UnflushedSegmentIds: unflushedIDs.Collect(),
 		DroppedSegmentIds:   droppedIDs.Collect(),
+		LevelZeroSegmentIds: levelZeroIDs.Collect(),
 	}
 }
 
@@ -145,12 +166,12 @@ func (h *ServerHandler) GetQueryVChanPositions(channel RWChannel, partitionIDs .
 	validSegmentInfos := make(map[int64]*SegmentInfo)
 	indexedSegments := FilterInIndexedSegments(context.Background(), h, h.s.meta, false, segments...)
 	indexed := typeutil.NewUniqueSet(lo.Map(indexedSegments, func(segment *SegmentInfo, _ int) int64 { return segment.GetID() })...)
-
 	for _, s := range segments {
 		if filterWithPartition && !validPartitionsMap[s.GetPartitionID()] {
 			continue
 		}
-		if s.GetStartPosition() == nil && s.GetDmlPosition() == nil {
+		if s.GetStartPosition() == nil && s.GetDmlPosition() == nil && s.GetManifestPath() == "" {
+			// External collection segments may not have start/DML positions but have ManifestPath
 			continue
 		}
 		if s.GetIsImporting() {
@@ -201,20 +222,10 @@ func (h *ServerHandler) GetQueryVChanPositions(channel RWChannel, partitionIDs .
 	// ================================================
 
 	segmentIndexed := func(segID UniqueID) bool {
-		return indexed.Contain(segID) || (validSegmentInfos[segID].GetIsSorted() && validSegmentInfos[segID].GetNumOfRows() < Params.DataCoordCfg.MinSegmentNumRowsToEnableIndex.GetAsInt64())
+		return indexed.Contain(segID) || ((validSegmentInfos[segID].GetIsSorted() || validSegmentInfos[segID].GetIsSortedByNamespace()) && validSegmentInfos[segID].GetNumOfRows() < Params.DataCoordCfg.MinSegmentNumRowsToEnableIndex.GetAsInt64())
 	}
 
 	flushedIDs, droppedIDs = retrieveSegment(validSegmentInfos, flushedIDs, droppedIDs, segmentIndexed)
-
-	log.Info("GetQueryVChanPositions",
-		zap.Int64("collectionID", channel.GetCollectionID()),
-		zap.String("channel", channel.GetName()),
-		zap.Int("numOfSegments", len(segments)),
-		zap.Int("result flushed", len(flushedIDs)),
-		zap.Int("result growing", len(growingIDs)),
-		zap.Int("result L0", len(levelZeroIDs)),
-		zap.Any("partition stats", partStatsVersionsMap),
-	)
 
 	seekPosition := h.GetChannelSeekPosition(channel, partitionIDs...)
 	// if no l0 segment exist, use checkpoint as delete checkpoint
@@ -464,9 +475,6 @@ func (h *ServerHandler) GetChannelSeekPosition(channel RWChannel, partitionIDs .
 	var seekPosition *msgpb.MsgPosition
 	seekPosition = h.s.meta.GetChannelCheckpoint(channel.GetName())
 	if seekPosition != nil {
-		log.Info("channel seek position set from channel checkpoint meta",
-			zap.Uint64("posTs", seekPosition.Timestamp),
-			zap.Time("posTime", tsoutil.PhysicalTime(seekPosition.GetTimestamp())))
 		return seekPosition
 	}
 
@@ -490,6 +498,7 @@ func (h *ServerHandler) GetChannelSeekPosition(channel RWChannel, partitionIDs .
 	return nil
 }
 
+// Deprecated: use toMsgPositionWithWALNames
 func toMsgPosition(channel string, startPositions []*commonpb.KeyDataPair) *msgpb.MsgPosition {
 	for _, sp := range startPositions {
 		if sp.GetKey() != funcutil.ToPhysicalChannel(channel) {
@@ -498,6 +507,21 @@ func toMsgPosition(channel string, startPositions []*commonpb.KeyDataPair) *msgp
 		return &msgpb.MsgPosition{
 			ChannelName: channel,
 			MsgID:       sp.GetData(),
+		}
+	}
+	return nil
+}
+
+func toMsgPositionWithWALNames(channel string, startPositions []*commonpb.KeyDataPair, channelWALNames map[string]commonpb.WALName) *msgpb.MsgPosition {
+	for _, sp := range startPositions {
+		pChannel := funcutil.ToPhysicalChannel(channel)
+		if sp.GetKey() != pChannel {
+			continue
+		}
+		return &msgpb.MsgPosition{
+			ChannelName: channel,
+			MsgID:       sp.GetData(),
+			WALName:     channelWALNames[pChannel],
 		}
 	}
 	return nil
@@ -565,6 +589,7 @@ func (h *ServerHandler) GetCollection(ctx context.Context, collectionID UniqueID
 		return nil, err
 	}
 
+	// TODO: the cache should be removed in next step.
 	return h.s.meta.GetCollection(collectionID), nil
 }
 
@@ -592,4 +617,287 @@ func (h *ServerHandler) FinishDropChannel(channel string, collectionID int64) er
 
 func (h *ServerHandler) ListLoadedSegments(ctx context.Context) ([]int64, error) {
 	return h.s.listLoadedSegments(ctx)
+}
+
+// GetSnapshotTs use the smallest channel checkpoint ts as snapshot ts
+// Note: if channel has tt lag, the snapshot ts also has tt lag
+func (h *ServerHandler) GetSnapshotTs(ctx context.Context, collectionID UniqueID, partitionIDs ...UniqueID) (uint64, error) {
+	channels, err := h.s.getChannelsByCollectionID(ctx, collectionID)
+	if err != nil {
+		return 0, err
+	}
+	minTs := uint64(math.MaxUint64)
+	for _, channel := range channels {
+		seekPosition := h.GetChannelSeekPosition(channel, partitionIDs...)
+		if seekPosition != nil && seekPosition.Timestamp < minTs {
+			minTs = seekPosition.Timestamp
+		}
+	}
+	// Check if no valid seek position was found
+	if minTs == math.MaxUint64 {
+		return 0, merr.WrapErrServiceInternal("no valid channel seek position for snapshot")
+	}
+	return minTs, nil
+}
+
+// GenSnapshot generates a point-in-time snapshot of a collection's data and metadata.
+//
+// This function captures a consistent view of a collection at a specific timestamp, including:
+// - Collection schema and configuration
+// - Partition metadata (excluding auto-created partitions)
+// - Segment data (binlogs, deltalogs, statslogs)
+// - All index types (vector/scalar, text, JSON key)
+// - Compaction history deltalogs
+//
+// Process flow:
+//  1. Retrieve collection schema and partition information
+//  2. Filter user-created partitions (exclude default and auto-created partitions)
+//  3. Generate snapshot timestamp ensuring data consistency
+//  4. Collect index metadata created before snapshot timestamp
+//  5. Select segments with data that started before snapshot timestamp
+//  6. Decompress binlog paths for segment data
+//  7. Gather delta logs from compacted segments
+//  8. Build segment descriptions with all binlog and index file paths
+//  9. Assemble complete snapshot data structure
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout
+//   - collectionID: ID of collection to snapshot
+//
+// Returns:
+//   - SnapshotData: Complete snapshot with collection metadata and segment descriptions
+//   - error: If collection not found, timestamp generation fails, or binlog operations fail
+//
+// Partition filtering logic:
+//   - Collections without partition key: Include only explicitly user-created partitions
+//     (exclude "_default" and "_default_*" auto-sharded partitions)
+//   - Collections with partition key: Include all partitions (filtering handled elsewhere)
+//
+// Segment selection criteria:
+// - Must have data (binlogs or deltalogs present)
+// - StartPosition timestamp < snapshot timestamp (data started before snapshot)
+// - State != Dropped (still valid)
+// - Not importing (stable segments only)
+//
+// Index handling:
+// - Only includes indexes created before snapshot timestamp
+// - Captures vector/scalar indexes with full file paths
+// - Includes text indexes and JSON key indexes
+// - Preserves index parameters and versions
+//
+// Why decompress binlogs:
+// - Binlogs are stored compressed in metadata for space efficiency
+// - Snapshot needs full paths for file copying during restore
+// - Decompression expands compressed paths to complete S3/MinIO paths
+//
+// Use case:
+// - Creating backup snapshots for disaster recovery
+// - Point-in-time restore for data rollback
+// - Collection cloning to different database/cluster
+func (h *ServerHandler) GenSnapshot(ctx context.Context, collectionID UniqueID) (*SnapshotData, error) {
+	// get coll info
+	resp, err := h.s.broker.DescribeCollectionInternal(ctx, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	showPartitionResp, err := h.s.broker.ShowPartitions(ctx, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	partitionIDs := showPartitionResp.GetPartitionIDs()
+	partitionNames := showPartitionResp.GetPartitionNames()
+
+	partitionMapping := make(map[string]int64)
+	for idx, name := range partitionNames {
+		partitionMapping[name] = partitionIDs[idx]
+	}
+
+	// generate snapshot ts with current partition ids
+	snapshotTs, err := h.GetSnapshotTs(ctx, collectionID, partitionIDs...)
+	if err != nil {
+		return nil, err
+	}
+
+	indexes := h.s.meta.indexMeta.GetIndexesForCollection(collectionID, "")
+	indexInfos := lo.FilterMap(indexes, func(index *model.Index, _ int) (*indexpb.IndexInfo, bool) {
+		return &indexpb.IndexInfo{
+			IndexID:         index.IndexID,
+			CollectionID:    index.CollectionID,
+			FieldID:         index.FieldID,
+			IndexName:       index.IndexName,
+			TypeParams:      index.TypeParams,
+			IndexParams:     index.IndexParams,
+			IsAutoIndex:     index.IsAutoIndex,
+			UserIndexParams: index.UserIndexParams,
+		}, true
+	})
+
+	// get segment info
+	segments := h.s.meta.SelectSegments(ctx, WithCollection(collectionID), SegmentFilterFunc(func(info *SegmentInfo) bool {
+		segmentHasData := len(info.GetBinlogs()) > 0 || len(info.GetDeltalogs()) > 0
+		return segmentHasData && info.GetStartPosition().GetTimestamp() < snapshotTs && info.GetState() != commonpb.SegmentState_Dropped && !info.GetIsImporting()
+	}))
+
+	if len(segments) == 0 {
+		log.Info("no segments found for collection when generating snapshot",
+			zap.Int64("collectionID", collectionID),
+			zap.Uint64("snapshotTs", snapshotTs))
+	}
+
+	segmentInfos := lo.Map(segments, func(segment *SegmentInfo, _ int) *datapb.SegmentInfo {
+		return proto.Clone(segment.SegmentInfo).(*datapb.SegmentInfo)
+	})
+
+	err = binlog.DecompressMultiBinLogs(segmentInfos)
+	if err != nil {
+		log.Error("decompress segment binlogs failed when generating snapshot",
+			zap.Int64("collectionID", collectionID),
+			zap.Uint64("snapshotTs", snapshotTs),
+			zap.Error(err))
+		return nil, err
+	}
+
+	// get delta logs from compactTo segments
+	lo.ForEach(segmentInfos, func(segInfo *datapb.SegmentInfo, _ int) {
+		deltalogs, err := h.GetDeltaLogFromCompactTo(ctx, segInfo.GetID())
+		if err != nil {
+			log.Error("get delta logs from compactTo failed when generating snapshot",
+				zap.Int64("collectionID", collectionID),
+				zap.Uint64("snapshotTs", snapshotTs),
+				zap.Int64("segmentID", segInfo.GetID()),
+				zap.Error(err))
+			return
+		}
+		segInfo.Deltalogs = append(segInfo.GetDeltalogs(), deltalogs...)
+	})
+
+	segDescList := lo.Map(segmentInfos, func(segInfo *datapb.SegmentInfo, _ int) *datapb.SegmentDescription {
+		segID := segInfo.GetID()
+		indexesFiles := uncompressIndexFiles(h, collectionID, segID)
+		uncompressedJsonStats := make(map[int64]*datapb.JsonKeyStats)
+		for id, jsonStats := range segInfo.GetJsonKeyStats() {
+			uncompressedJsonStats[id] = uncompressJsonStats(h, segInfo, jsonStats)
+		}
+		return &datapb.SegmentDescription{
+			SegmentId:         segInfo.GetID(),
+			SegmentLevel:      segInfo.GetLevel(),
+			PartitionId:       segInfo.GetPartitionID(),
+			ChannelName:       segInfo.GetInsertChannel(),
+			NumOfRows:         segInfo.GetNumOfRows(),
+			StartPosition:     segInfo.GetStartPosition(),
+			DmlPosition:       segInfo.GetDmlPosition(),
+			StorageVersion:    segInfo.GetStorageVersion(),
+			IsSorted:          segInfo.GetIsSorted(),
+			Binlogs:           segInfo.GetBinlogs(),
+			Deltalogs:         segInfo.GetDeltalogs(),
+			Statslogs:         segInfo.GetStatslogs(),
+			Bm25Statslogs:     segInfo.GetBm25Statslogs(),
+			IndexFiles:        indexesFiles,
+			JsonKeyIndexFiles: uncompressedJsonStats,
+			TextIndexFiles:    segInfo.GetTextStatsLogs(),
+			ManifestPath:      segInfo.GetManifestPath(),
+		}
+	})
+
+	// Clone schema and add consistency level to properties
+	// This is needed because mustConsumeConsistencyLevel in restore expects consistency level in schema.Properties
+	schema := proto.Clone(resp.GetSchema()).(*schemapb.CollectionSchema)
+	schema.Properties = append(schema.Properties, &commonpb.KeyValuePair{
+		Key:   common.ConsistencyLevel,
+		Value: strconv.Itoa(int(resp.GetConsistencyLevel())),
+	})
+
+	return &SnapshotData{
+		SnapshotInfo: &datapb.SnapshotInfo{
+			CollectionId: collectionID,
+			PartitionIds: partitionIDs,
+			CreateTs:     int64(snapshotTs),
+		},
+		Collection: &datapb.CollectionDescription{
+			Schema:              schema,
+			NumShards:           int64(resp.GetShardsNum()),
+			NumPartitions:       int64(resp.GetNumPartitions()),
+			Partitions:          partitionMapping,
+			VirtualChannelNames: resp.GetVirtualChannelNames(),
+		},
+		Indexes:  indexInfos,
+		Segments: segDescList,
+	}, nil
+}
+
+func uncompressJsonStats(h *ServerHandler, segInfo *datapb.SegmentInfo, jsonStats *datapb.JsonKeyStats) *datapb.JsonKeyStats {
+	prefix := metautil.BuildJSONKeyStatsPrefix(h.s.meta.chunkManager.RootPath(), jsonStats.GetJsonKeyStatsDataFormat(),
+		jsonStats.GetBuildID(), jsonStats.GetVersion(), segInfo.GetCollectionID(), segInfo.GetPartitionID(), segInfo.GetID(), jsonStats.GetFieldID())
+	uncompressedFiles := make([]string, 0)
+	for _, file := range jsonStats.GetFiles() {
+		uncompressedFiles = append(uncompressedFiles, path.Join(prefix, file))
+	}
+	uncompressedJsonStats := proto.Clone(jsonStats).(*datapb.JsonKeyStats)
+	uncompressedJsonStats.Files = uncompressedFiles
+	return uncompressedJsonStats
+}
+
+func uncompressIndexFiles(h *ServerHandler, collectionID int64, segID int64) []*indexpb.IndexFilePathInfo {
+	segIdxes := h.s.meta.indexMeta.getSegmentIndexes(collectionID, segID)
+	indexesFiles := make([]*indexpb.IndexFilePathInfo, 0)
+	for _, segIdx := range segIdxes {
+		if segIdx.IndexState == commonpb.IndexState_Finished {
+			fieldID := h.s.meta.indexMeta.GetFieldIDByIndexID(segIdx.CollectionID, segIdx.IndexID)
+			indexName := h.s.meta.indexMeta.GetIndexNameByID(segIdx.CollectionID, segIdx.IndexID)
+
+			indexFilePaths := metautil.BuildSegmentIndexFilePaths(h.s.meta.chunkManager.RootPath(), segIdx.BuildID, segIdx.IndexVersion,
+				segIdx.PartitionID, segIdx.SegmentID, segIdx.IndexFileKeys)
+			indexParams := h.s.meta.indexMeta.GetIndexParams(segIdx.CollectionID, segIdx.IndexID)
+			indexParams = append(indexParams, h.s.meta.indexMeta.GetTypeParams(segIdx.CollectionID, segIdx.IndexID)...)
+
+			indexesFiles = append(indexesFiles, &indexpb.IndexFilePathInfo{
+				SegmentID:                 segID,
+				FieldID:                   fieldID,
+				IndexID:                   segIdx.IndexID,
+				BuildID:                   segIdx.BuildID,
+				IndexName:                 indexName,
+				IndexParams:               indexParams,
+				IndexFilePaths:            indexFilePaths,
+				SerializedSize:            segIdx.IndexSerializedSize,
+				MemSize:                   segIdx.IndexMemSize,
+				IndexVersion:              segIdx.IndexVersion,
+				NumRows:                   segIdx.NumRows,
+				CurrentIndexVersion:       segIdx.CurrentIndexVersion,
+				CurrentScalarIndexVersion: segIdx.CurrentScalarIndexVersion,
+			})
+		}
+	}
+	return indexesFiles
+}
+
+func (h *ServerHandler) GetDeltaLogFromCompactTo(ctx context.Context, segmentID UniqueID) ([]*datapb.FieldBinlog, error) {
+	var getChildrenDelta func(id UniqueID) ([]*datapb.FieldBinlog, error)
+	getChildrenDelta = func(id UniqueID) ([]*datapb.FieldBinlog, error) {
+		children, ok := h.s.meta.GetCompactionTo(id)
+		// double-check the segment, maybe the segment is being dropped concurrently.
+		if !ok {
+			log.Warn("failed to get segment, this may have been cleaned", zap.Int64("segmentID", id))
+			err := merr.WrapErrSegmentNotFound(id)
+			return nil, err
+		}
+		allDeltaLogs := make([]*datapb.FieldBinlog, 0)
+		for _, child := range children {
+			clonedChild := child.Clone()
+			// child segment should decompress binlog path
+			if err := binlog.DecompressBinLog(storage.DeleteBinlog, clonedChild.GetCollectionID(), clonedChild.GetPartitionID(), clonedChild.GetID(), clonedChild.GetDeltalogs()); err != nil {
+				log.Warn("failed to decompress delta binlog", zap.Int64("segmentID", clonedChild.GetID()), zap.Error(err))
+				return nil, err
+			}
+			allDeltaLogs = append(allDeltaLogs, clonedChild.GetDeltalogs()...)
+			allChildrenDeltas, err := getChildrenDelta(child.GetID())
+			if err != nil {
+				return nil, err
+			}
+			allDeltaLogs = append(allDeltaLogs, allChildrenDeltas...)
+		}
+
+		return allDeltaLogs, nil
+	}
+
+	return getChildrenDelta(segmentID)
 }

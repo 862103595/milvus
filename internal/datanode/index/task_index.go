@@ -121,8 +121,8 @@ func (it *indexBuildTask) Name() string {
 func (it *indexBuildTask) SetState(state indexpb.JobState, failReason string) {
 	it.manager.StoreIndexTaskState(it.req.GetClusterID(), it.req.GetBuildID(), commonpb.IndexState(state), failReason)
 	if state == indexpb.JobState_JobStateFinished {
-		metrics.DataNodeBuildIndexLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(it.tr.ElapseSpan().Seconds())
-		metrics.DataNodeIndexTaskLatencyInQueue.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(it.queueDur.Milliseconds()))
+		metrics.DataNodeBuildIndexLatency.WithLabelValues(paramtable.GetStringNodeID()).Observe(it.tr.ElapseSpan().Seconds())
+		metrics.DataNodeIndexTaskLatencyInQueue.WithLabelValues(paramtable.GetStringNodeID()).Observe(float64(it.queueDur.Milliseconds()))
 	}
 }
 
@@ -141,6 +141,11 @@ func (it *indexBuildTask) OnEnqueue(ctx context.Context) error {
 
 func (it *indexBuildTask) GetSlot() int64 {
 	return it.req.GetTaskSlot()
+}
+
+func (it *indexBuildTask) IsVectorIndex() bool {
+	indexType := GetIndexType(it.req.GetIndexParams())
+	return vecindexmgr.GetVecIndexMgrInstance().IsVecIndex(indexType)
 }
 
 func (it *indexBuildTask) PreExecute(ctx context.Context) error {
@@ -209,7 +214,7 @@ func (it *indexBuildTask) PreExecute(ctx context.Context) error {
 	}
 
 	it.req.CurrentIndexVersion = getCurrentIndexVersion(it.req.GetCurrentIndexVersion())
-	it.req.CurrentScalarIndexVersion = getCurrentScalarIndexVersion(it.req.GetCurrentScalarIndexVersion())
+	it.req.CurrentScalarIndexVersion = common.ClampScalarIndexVersion(it.req.GetCurrentScalarIndexVersion())
 
 	log.Ctx(ctx).Info("Successfully prepare indexBuildTask", zap.Int64("buildID", it.req.GetBuildID()),
 		zap.Int64("collectionID", it.req.GetCollectionID()), zap.Int64("segmentID", it.req.GetSegmentID()),
@@ -221,8 +226,11 @@ func (it *indexBuildTask) PreExecute(ctx context.Context) error {
 }
 
 func (it *indexBuildTask) Execute(ctx context.Context) error {
-	log := log.Ctx(ctx).With(zap.String("clusterID", it.req.GetClusterID()), zap.Int64("buildID", it.req.GetBuildID()),
-		zap.Int64("collection", it.req.GetCollectionID()), zap.Int64("segmentID", it.req.GetSegmentID()),
+	log := log.Ctx(ctx).With(
+		zap.String("clusterID", it.req.GetClusterID()),
+		zap.Int64("buildID", it.req.GetBuildID()),
+		zap.Int64("collection", it.req.GetCollectionID()),
+		zap.Int64("segmentID", it.req.GetSegmentID()),
 		zap.Int32("currentIndexVersion", it.req.GetCurrentIndexVersion()))
 
 	indexType := it.newIndexParams[common.IndexTypeKey]
@@ -260,6 +268,8 @@ func (it *indexBuildTask) Execute(ctx context.Context) error {
 		RequestTimeoutMs:  it.req.GetStorageConfig().GetRequestTimeoutMs(),
 		SslCACert:         it.req.GetStorageConfig().GetSslCACert(),
 		GcpCredentialJSON: it.req.GetStorageConfig().GetGcpCredentialJSON(),
+		SslTlsMinVersion:  it.req.GetStorageConfig().GetSslTlsMinVersion(),
+		UseCrc32CChecksum: it.req.GetStorageConfig().GetUseCrc32CChecksum(),
 	}
 
 	optFields := make([]*indexcgopb.OptionalFieldInfo, 0, len(it.req.GetOptionalScalarFields()))
@@ -298,20 +308,21 @@ func (it *indexBuildTask) Execute(ctx context.Context) error {
 		LackBinlogRows:            it.req.GetLackBinlogRows(),
 		StorageVersion:            it.req.GetStorageVersion(),
 	}
-
-	if it.pluginContext != nil {
-		buildIndexParams.StoragePluginContext = it.pluginContext
-	}
-
-	if buildIndexParams.StorageVersion == storage.StorageV2 {
+	if buildIndexParams.StorageVersion == storage.StorageV2 || buildIndexParams.StorageVersion == storage.StorageV3 {
 		buildIndexParams.SegmentInsertFiles = util.GetSegmentInsertFiles(
 			it.req.GetInsertLogs(),
 			it.req.GetStorageConfig(),
 			it.req.GetCollectionID(),
 			it.req.GetPartitionID(),
 			it.req.GetSegmentID())
+		buildIndexParams.Manifest = it.req.GetManifest()
 	}
 	log.Info("create index", zap.Any("buildIndexParams", buildIndexParams))
+
+	// set plugin context after logging the indexParams to avoid logging sensitive data
+	if it.pluginContext != nil {
+		buildIndexParams.StoragePluginContext = it.pluginContext
+	}
 
 	it.index, err = indexcgowrapper.CreateIndex(ctx, buildIndexParams)
 	if err != nil {

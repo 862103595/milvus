@@ -65,6 +65,9 @@ const (
 	StartTs2 = "startTs"
 	EndTs    = "end_ts"
 	EndTs2   = "endTs"
+
+	// EZK is the base64-encoded encryption zone key for reading encrypted backup data.
+	EZK = "ezk"
 )
 
 type Options []*commonpb.KeyValuePair
@@ -144,10 +147,16 @@ func GetStorageVersion(options Options) (int64, error) {
 	if err != nil {
 		return 0, merr.WrapErrImportFailed(fmt.Sprintf("parse storage_version failed, value=%s, err=%s", storageVersion, err))
 	}
-	if version == storage.StorageV2 {
+	switch version {
+	case storage.StorageV2:
 		return storage.StorageV2, nil
+	case storage.StorageV3:
+		return storage.StorageV3, nil
+	case storage.StorageV1:
+		fallthrough
+	default:
+		return storage.StorageV1, nil
 	}
-	return storage.StorageV1, nil
 }
 
 // SkipDiskQuotaCheck indicates whether the import skips the disk quota check.
@@ -182,4 +191,12 @@ func GetCSVNullKey(options Options) (string, error) {
 		return defaultNullKey, nil
 	}
 	return nullKey, nil
+}
+
+func GetEZK(options Options) (string, error) {
+	ezk, err := funcutil.GetAttrByKeyFromRepeatedKV(EZK, options)
+	if err != nil || len(ezk) == 0 {
+		return "", nil
+	}
+	return ezk, nil
 }

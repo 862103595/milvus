@@ -27,6 +27,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/grpcclient"
@@ -67,7 +68,7 @@ type Client struct {
 // etcdEndpoints are the address list for etcd end points
 // timeout is default setting for each grpc call
 func NewClient(ctx context.Context) (types.MixCoordClient, error) {
-	sess := sessionutil.NewSession(ctx)
+	sess := sessionutil.NewSession(context.Background())
 	if sess == nil {
 		err := errors.New("new session error, maybe can not connect to etcd")
 		log.Ctx(ctx).Debug("New MixCoord Client failed", zap.Error(err))
@@ -109,7 +110,7 @@ func (c *Client) newGrpcClient(cc *grpc.ClientConn) MixCoordClient {
 func (c *Client) getMixCoordAddr() (string, error) {
 	log := log.Ctx(c.ctx)
 	key := c.grpcClient.GetRole()
-	msess, _, err := c.sess.GetSessions(key)
+	msess, _, err := c.sess.GetSessions(c.ctx, key)
 	if err != nil {
 		log.Debug("MixCoordClient GetSessions failed", zap.Any("key", key))
 		return "", err
@@ -134,7 +135,7 @@ func (c *Client) getMixCoordAddr() (string, error) {
 // compatible with standalone mode upgrade from 2.5, shoule be removed in 3.0
 func (c *Client) getCompatibleMixCoordAddr() (string, error) {
 	log := log.Ctx(c.ctx)
-	msess, _, err := c.sess.GetSessions(typeutil.RootCoordRole)
+	msess, _, err := c.sess.GetSessions(c.ctx, typeutil.RootCoordRole)
 	if err != nil {
 		log.Debug("mixCoordClient getSessions failed", zap.Any("key", typeutil.RootCoordRole), zap.Error(err))
 		return "", errors.New("find no available mixcoord, check mixcoord state")
@@ -335,6 +336,50 @@ func (c *Client) AlterCollectionField(ctx context.Context, request *milvuspb.Alt
 	)
 	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*commonpb.Status, error) {
 		return client.AlterCollectionField(ctx, request)
+	})
+}
+
+func (c *Client) AlterCollectionSchema(ctx context.Context, request *milvuspb.AlterCollectionSchemaRequest, opts ...grpc.CallOption) (*milvuspb.AlterCollectionSchemaResponse, error) {
+	request = typeutil.Clone(request)
+	commonpbutil.UpdateMsgBase(
+		request.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*milvuspb.AlterCollectionSchemaResponse, error) {
+		return client.RootCoordClient.AlterCollectionSchema(ctx, request)
+	})
+}
+
+func (c *Client) AddCollectionFunction(ctx context.Context, request *milvuspb.AddCollectionFunctionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	request = typeutil.Clone(request)
+	commonpbutil.UpdateMsgBase(
+		request.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*commonpb.Status, error) {
+		return client.AddCollectionFunction(ctx, request)
+	})
+}
+
+func (c *Client) AlterCollectionFunction(ctx context.Context, request *milvuspb.AlterCollectionFunctionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	request = typeutil.Clone(request)
+	commonpbutil.UpdateMsgBase(
+		request.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*commonpb.Status, error) {
+		return client.AlterCollectionFunction(ctx, request)
+	})
+}
+
+func (c *Client) DropCollectionFunction(ctx context.Context, request *milvuspb.DropCollectionFunctionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	request = typeutil.Clone(request)
+	commonpbutil.UpdateMsgBase(
+		request.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*commonpb.Status, error) {
+		return client.DropCollectionFunction(ctx, request)
 	})
 }
 
@@ -860,6 +905,50 @@ func (c *Client) FlushAll(ctx context.Context, req *datapb.FlushAllRequest, opts
 	)
 	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.FlushAllResponse, error) {
 		return client.FlushAll(ctx, req)
+	})
+}
+
+func (c *Client) CreateExternalCollection(ctx context.Context, req *msgpb.CreateCollectionRequest, opts ...grpc.CallOption) (*datapb.CreateExternalCollectionResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.CreateExternalCollectionResponse, error) {
+		return client.CreateExternalCollection(ctx, req)
+	})
+}
+
+func (c *Client) RefreshExternalCollection(ctx context.Context, req *datapb.RefreshExternalCollectionRequest, opts ...grpc.CallOption) (*datapb.RefreshExternalCollectionResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.RefreshExternalCollectionResponse, error) {
+		return client.RefreshExternalCollection(ctx, req)
+	})
+}
+
+func (c *Client) GetRefreshExternalCollectionProgress(ctx context.Context, req *datapb.GetRefreshExternalCollectionProgressRequest, opts ...grpc.CallOption) (*datapb.GetRefreshExternalCollectionProgressResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.GetRefreshExternalCollectionProgressResponse, error) {
+		return client.GetRefreshExternalCollectionProgress(ctx, req)
+	})
+}
+
+func (c *Client) ListRefreshExternalCollectionJobs(ctx context.Context, req *datapb.ListRefreshExternalCollectionJobsRequest, opts ...grpc.CallOption) (*datapb.ListRefreshExternalCollectionJobsResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.ListRefreshExternalCollectionJobsResponse, error) {
+		return client.ListRefreshExternalCollectionJobs(ctx, req)
 	})
 }
 
@@ -1905,13 +1994,165 @@ func (c *Client) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerReques
 	})
 }
 
-func (c *Client) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+func (c *Client) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest, opts ...grpc.CallOption) (*querypb.ValidateAnalyzerResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*querypb.ValidateAnalyzerResponse, error) {
+		return client.ValidateAnalyzer(ctx, req)
+	})
+}
+
+func (c *Client) ComputePhraseMatchSlop(ctx context.Context, req *querypb.ComputePhraseMatchSlopRequest, opts ...grpc.CallOption) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*querypb.ComputePhraseMatchSlopResponse, error) {
+		return client.ComputePhraseMatchSlop(ctx, req)
+	})
+}
+
+// TruncateCollection truncate collection
+func (c *Client) TruncateCollection(ctx context.Context, in *milvuspb.TruncateCollectionRequest, opts ...grpc.CallOption) (*milvuspb.TruncateCollectionResponse, error) {
+	in = typeutil.Clone(in)
+	commonpbutil.UpdateMsgBase(
+		in.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*milvuspb.TruncateCollectionResponse, error) {
+		return client.TruncateCollection(ctx, in)
+	})
+}
+
+func (c *Client) BackupEzk(ctx context.Context, req *internalpb.BackupEzkRequest, opts ...grpc.CallOption) (*internalpb.BackupEzkResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*internalpb.BackupEzkResponse, error) {
+		return client.BackupEzk(ctx, req)
+	})
+}
+
+func (c *Client) CreateSnapshot(ctx context.Context, req *datapb.CreateSnapshotRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	req = typeutil.Clone(req)
 	commonpbutil.UpdateMsgBase(
 		req.GetBase(),
 		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
 	)
 	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*commonpb.Status, error) {
-		return client.ValidateAnalyzer(ctx, req)
+		return client.CreateSnapshot(ctx, req)
+	})
+}
+
+func (c *Client) DropSnapshot(ctx context.Context, req *datapb.DropSnapshotRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*commonpb.Status, error) {
+		return client.DropSnapshot(ctx, req)
+	})
+}
+
+func (c *Client) DescribeSnapshot(ctx context.Context, req *datapb.DescribeSnapshotRequest, opts ...grpc.CallOption) (*datapb.DescribeSnapshotResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.DescribeSnapshotResponse, error) {
+		return client.DescribeSnapshot(ctx, req)
+	})
+}
+
+func (c *Client) ListSnapshots(ctx context.Context, req *datapb.ListSnapshotsRequest, opts ...grpc.CallOption) (*datapb.ListSnapshotsResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.ListSnapshotsResponse, error) {
+		return client.ListSnapshots(ctx, req)
+	})
+}
+
+// RestoreSnapshot is the DataCoord API for restoring snapshot.
+// DataCoord creates collection/partitions via RootCoord, then creates copy segment jobs.
+func (c *Client) RestoreSnapshot(ctx context.Context, req *datapb.RestoreSnapshotRequest, opts ...grpc.CallOption) (*datapb.RestoreSnapshotResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.RestoreSnapshotResponse, error) {
+		return client.RestoreSnapshot(ctx, req)
+	})
+}
+
+func (c *Client) GetRestoreSnapshotState(ctx context.Context, req *datapb.GetRestoreSnapshotStateRequest, opts ...grpc.CallOption) (*datapb.GetRestoreSnapshotStateResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.GetRestoreSnapshotStateResponse, error) {
+		return client.GetRestoreSnapshotState(ctx, req)
+	})
+}
+
+func (c *Client) ListRestoreSnapshotJobs(ctx context.Context, req *datapb.ListRestoreSnapshotJobsRequest, opts ...grpc.CallOption) (*datapb.ListRestoreSnapshotJobsResponse, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*datapb.ListRestoreSnapshotJobsResponse, error) {
+		return client.ListRestoreSnapshotJobs(ctx, req)
+	})
+}
+
+func (c *Client) BatchUpdateManifest(ctx context.Context, req *datapb.BatchUpdateManifestRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	req = typeutil.Clone(req)
+	commonpbutil.UpdateMsgBase(
+		req.GetBase(),
+		commonpbutil.FillMsgBaseFromClient(paramtable.GetNodeID(), commonpbutil.WithTargetID(c.grpcClient.GetNodeID())),
+	)
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*commonpb.Status, error) {
+		return client.BatchUpdateManifest(ctx, req)
+	})
+}
+
+// ClientHeartbeat handles client telemetry heartbeat requests
+func (c *Client) ClientHeartbeat(ctx context.Context, req *milvuspb.ClientHeartbeatRequest, opts ...grpc.CallOption) (*milvuspb.ClientHeartbeatResponse, error) {
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*milvuspb.ClientHeartbeatResponse, error) {
+		return client.RootCoordClient.ClientHeartbeat(ctx, req, opts...)
+	})
+}
+
+// GetClientTelemetry retrieves client telemetry data
+func (c *Client) GetClientTelemetry(ctx context.Context, req *milvuspb.GetClientTelemetryRequest, opts ...grpc.CallOption) (*milvuspb.GetClientTelemetryResponse, error) {
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*milvuspb.GetClientTelemetryResponse, error) {
+		return client.RootCoordClient.GetClientTelemetry(ctx, req, opts...)
+	})
+}
+
+// PushClientCommand pushes a command to clients
+func (c *Client) PushClientCommand(ctx context.Context, req *milvuspb.PushClientCommandRequest, opts ...grpc.CallOption) (*milvuspb.PushClientCommandResponse, error) {
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*milvuspb.PushClientCommandResponse, error) {
+		return client.RootCoordClient.PushClientCommand(ctx, req, opts...)
+	})
+}
+
+// DeleteClientCommand deletes a client command
+func (c *Client) DeleteClientCommand(ctx context.Context, req *milvuspb.DeleteClientCommandRequest, opts ...grpc.CallOption) (*milvuspb.DeleteClientCommandResponse, error) {
+	return wrapGrpcCall(ctx, c, func(client MixCoordClient) (*milvuspb.DeleteClientCommandResponse, error) {
+		return client.RootCoordClient.DeleteClientCommand(ctx, req, opts...)
 	})
 }

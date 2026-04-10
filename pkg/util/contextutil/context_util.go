@@ -51,7 +51,7 @@ func TenantID(ctx context.Context) string {
 
 func AppendToIncomingContext(ctx context.Context, kv ...string) context.Context {
 	if len(kv)%2 == 1 {
-		panic(fmt.Sprintf("metadata: AppendToOutgoingContext got an odd number of input pairs for metadata: %d", len(kv)))
+		panic(fmt.Sprintf("metadata: AppendToIncomingContext got an odd number of input pairs for metadata: %d", len(kv)))
 	}
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
@@ -60,6 +60,23 @@ func AppendToIncomingContext(ctx context.Context, kv ...string) context.Context 
 	for i, s := range kv {
 		if i%2 == 0 {
 			md.Append(s, kv[i+1])
+		}
+	}
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+// SetToIncomingContext sets the metadata to the incoming context.
+func SetToIncomingContext(ctx context.Context, kv ...string) context.Context {
+	if len(kv)%2 == 1 {
+		panic(fmt.Sprintf("metadata: SetToIncomingContext got an odd number of input pairs for metadata: %d", len(kv)))
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		md = metadata.New(make(map[string]string, len(kv)/2))
+	}
+	for i, s := range kv {
+		if i%2 == 0 {
+			md.Set(s, kv[i+1])
 		}
 	}
 	return metadata.NewIncomingContext(ctx, md)
@@ -84,7 +101,7 @@ func GetAuthInfoFromContext(ctx context.Context) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("fail to decode the token, token: %s", token)
 	}
-	secrets := strings.SplitN(rawToken, util.CredentialSeperator, 2)
+	secrets := strings.SplitN(rawToken, util.CredentialSeparator, 2)
 	if len(secrets) < 2 {
 		return "", "", fmt.Errorf("fail to get user info from the raw token, raw token: %s", rawToken)
 	}

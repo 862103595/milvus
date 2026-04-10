@@ -10,10 +10,11 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <gtest/gtest.h>
-
 #include <string>
 
 #include "common/Utils.h"
+#include "gtest/gtest.h"
+#include "knowhere/comp/index_param.h"
 
 TEST(Util_Common, GetCommonPrefix) {
     std::string str1 = "";
@@ -41,4 +42,18 @@ TEST(SimilarityCorelation, Naive) {
     ASSERT_FALSE(milvus::PositivelyRelated(knowhere::metric::JACCARD));
     ASSERT_FALSE(milvus::PositivelyRelated(knowhere::metric::SUBSTRUCTURE));
     ASSERT_FALSE(milvus::PositivelyRelated(knowhere::metric::SUPERSTRUCTURE));
+}
+
+TEST(SimilarityCorelation, MaxSimMetrics) {
+    // MAX_SIM, MAX_SIM_IP, MAX_SIM_COSINE are positively related
+    // (higher distance = better similarity)
+    ASSERT_TRUE(milvus::PositivelyRelated(knowhere::metric::MAX_SIM));
+    ASSERT_TRUE(milvus::PositivelyRelated(knowhere::metric::MAX_SIM_IP));
+    ASSERT_TRUE(milvus::PositivelyRelated(knowhere::metric::MAX_SIM_COSINE));
+
+    // MAX_SIM_L2, MAX_SIM_HAMMING, MAX_SIM_JACCARD are negatively related
+    // (lower distance = better similarity)
+    ASSERT_FALSE(milvus::PositivelyRelated(knowhere::metric::MAX_SIM_L2));
+    ASSERT_FALSE(milvus::PositivelyRelated(knowhere::metric::MAX_SIM_HAMMING));
+    ASSERT_FALSE(milvus::PositivelyRelated(knowhere::metric::MAX_SIM_JACCARD));
 }

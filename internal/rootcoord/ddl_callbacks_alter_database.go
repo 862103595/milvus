@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/ce"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -55,7 +56,7 @@ func (c *Core) broadcastAlterDatabase(ctx context.Context, req *rootcoordpb.Alte
 
 	// Validate timezone
 	tz, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(common.TimezoneKey, req.GetProperties())
-	if exist && !funcutil.IsTimezoneValid(tz) {
+	if exist && !timestamptz.IsTimezoneValid(tz) {
 		return merr.WrapErrParameterInvalidMsg("unknown or invalid IANA Time Zone ID: %s", tz)
 	}
 
@@ -136,7 +137,7 @@ func (c *DDLCallback) alterDatabaseV1AckCallback(ctx context.Context, result mes
 	header := result.Message.Header()
 	body := result.Message.MustBody()
 
-	db := model.NewDatabase(header.DbId, header.DbName, etcdpb.DatabaseState_DatabaseCreated, result.Message.MustBody().Properties)
+	db := model.NewDatabase(header.DbId, header.DbName, etcdpb.DatabaseState_DatabaseCreated, body.Properties)
 	if err := c.meta.AlterDatabase(ctx, db, result.GetControlChannelResult().TimeTick); err != nil {
 		return errors.Wrap(err, "failed to alter database")
 	}
@@ -154,19 +155,10 @@ func (c *DDLCallback) alterDatabaseV1AckCallback(ctx context.Context, result mes
 		WithLegacyProxyCollectionMetaCache(
 			ce.OptLPCMDBName(header.DbName),
 			ce.OptLPCMMsgType(commonpb.MsgType_AlterDatabase),
-		),
-		result.GetControlChannelResult().TimeTick)
+		))
 }
 
 func MergeProperties(oldProps, updatedProps []*commonpb.KeyValuePair) []*commonpb.KeyValuePair {
-	_, existEndTS := common.GetReplicateEndTS(updatedProps)
-	if existEndTS {
-		updatedProps = append(updatedProps, &commonpb.KeyValuePair{
-			Key:   common.ReplicateIDKey,
-			Value: "",
-		})
-	}
-
 	props := make(map[string]string)
 	for _, prop := range oldProps {
 		props[prop.Key] = prop.Value

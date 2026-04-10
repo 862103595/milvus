@@ -13,6 +13,9 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#RandomSample.
 	VisitRandomSample(ctx *RandomSampleContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#SpatialBinary.
+	VisitSpatialBinary(ctx *SpatialBinaryContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#Parens.
 	VisitParens(ctx *ParensContext) interface{}
 
@@ -37,8 +40,8 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#Identifier.
 	VisitIdentifier(ctx *IdentifierContext) interface{}
 
-	// Visit a parse tree produced by PlanParser#STIntersects.
-	VisitSTIntersects(ctx *STIntersectsContext) interface{}
+	// Visit a parse tree produced by PlanParser#StructField.
+	VisitStructField(ctx *StructFieldContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#Like.
 	VisitLike(ctx *LikeContext) interface{}
@@ -70,9 +73,6 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#Call.
 	VisitCall(ctx *CallContext) interface{}
 
-	// Visit a parse tree produced by PlanParser#STCrosses.
-	VisitSTCrosses(ctx *STCrossesContext) interface{}
-
 	// Visit a parse tree produced by PlanParser#ReverseRange.
 	VisitReverseRange(ctx *ReverseRangeContext) interface{}
 
@@ -97,23 +97,17 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#TextMatch.
 	VisitTextMatch(ctx *TextMatchContext) interface{}
 
-	// Visit a parse tree produced by PlanParser#STTouches.
-	VisitSTTouches(ctx *STTouchesContext) interface{}
-
-	// Visit a parse tree produced by PlanParser#STContains.
-	VisitSTContains(ctx *STContainsContext) interface{}
-
 	// Visit a parse tree produced by PlanParser#Term.
 	VisitTerm(ctx *TermContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#JSONContains.
 	VisitJSONContains(ctx *JSONContainsContext) interface{}
 
-	// Visit a parse tree produced by PlanParser#STWithin.
-	VisitSTWithin(ctx *STWithinContext) interface{}
-
 	// Visit a parse tree produced by PlanParser#Range.
 	VisitRange(ctx *RangeContext) interface{}
+
+	// Visit a parse tree produced by PlanParser#MatchSimple.
+	VisitMatchSimple(ctx *MatchSimpleContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#Unary.
 	VisitUnary(ctx *UnaryContext) interface{}
@@ -127,26 +121,32 @@ type PlanVisitor interface {
 	// Visit a parse tree produced by PlanParser#JSONContainsAny.
 	VisitJSONContainsAny(ctx *JSONContainsAnyContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#STIsValid.
+	VisitSTIsValid(ctx *STIsValidContext) interface{}
+
+	// Visit a parse tree produced by PlanParser#MatchThreshold.
+	VisitMatchThreshold(ctx *MatchThresholdContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#BitXor.
 	VisitBitXor(ctx *BitXorContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#Exists.
 	VisitExists(ctx *ExistsContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#ElementFilter.
+	VisitElementFilter(ctx *ElementFilterContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#BitAnd.
 	VisitBitAnd(ctx *BitAndContext) interface{}
-
-	// Visit a parse tree produced by PlanParser#STEuqals.
-	VisitSTEuqals(ctx *STEuqalsContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#IsNull.
 	VisitIsNull(ctx *IsNullContext) interface{}
 
+	// Visit a parse tree produced by PlanParser#StructSubField.
+	VisitStructSubField(ctx *StructSubFieldContext) interface{}
+
 	// Visit a parse tree produced by PlanParser#Power.
 	VisitPower(ctx *PowerContext) interface{}
-
-	// Visit a parse tree produced by PlanParser#STOverlaps.
-	VisitSTOverlaps(ctx *STOverlapsContext) interface{}
 
 	// Visit a parse tree produced by PlanParser#textMatchOption.
 	VisitTextMatchOption(ctx *TextMatchOptionContext) interface{}

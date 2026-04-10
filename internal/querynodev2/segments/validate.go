@@ -22,7 +22,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func validate(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64, segmentFilter ...SegmentFilter) ([]Segment, error) {
@@ -30,8 +32,6 @@ func validate(ctx context.Context, manager *Manager, collectionID int64, partiti
 	if collection == nil {
 		return nil, merr.WrapErrCollectionNotFound(collectionID)
 	}
-
-	log.Ctx(ctx).Debug("read target partitions", zap.Int64("collectionID", collectionID), zap.Int64s("partitionIDs", partitionIDs))
 
 	// validate segment
 	segments := make([]Segment, 0, len(segmentIDs))
@@ -60,10 +60,44 @@ func validate(ctx context.Context, manager *Manager, collectionID int64, partiti
 	return segments, nil
 }
 
-func validateOnHistorical(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64) ([]Segment, error) {
-	return validate(ctx, manager, collectionID, partitionIDs, segmentIDs, WithType(SegmentTypeSealed))
+func validateOnHistorical(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64, plan *planpb.PlanNode) ([]Segment, error) {
+	filters := []SegmentFilter{WithType(SegmentTypeSealed)}
+	var filteredCount int
+	sparseFilterEnabled := paramtable.Get().QueryNodeCfg.EnableSparseFilterInQuery.GetAsBool() && plan != nil
+	if sparseFilterEnabled {
+		filters = append(filters, WithSparseFilter(plan, &filteredCount))
+	}
+
+	segments, err := validate(ctx, manager, collectionID, partitionIDs, segmentIDs, filters...)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Ctx(ctx).Debug("sparse filter filtered out segments in historical",
+		zap.Int64("collectionID", collectionID),
+		zap.Int("filtered", filteredCount),
+		zap.Int("remaining", len(segments)))
+
+	return segments, nil
 }
 
-func validateOnStream(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64) ([]Segment, error) {
-	return validate(ctx, manager, collectionID, partitionIDs, segmentIDs, WithType(SegmentTypeGrowing))
+func validateOnStream(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64, plan *planpb.PlanNode) ([]Segment, error) {
+	filters := []SegmentFilter{WithType(SegmentTypeGrowing)}
+	var filteredCount int
+	sparseFilterEnabled := paramtable.Get().QueryNodeCfg.EnableSparseFilterInQuery.GetAsBool() && plan != nil
+	if sparseFilterEnabled {
+		filters = append(filters, WithSparseFilter(plan, &filteredCount))
+	}
+
+	segments, err := validate(ctx, manager, collectionID, partitionIDs, segmentIDs, filters...)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Ctx(ctx).Debug("sparse filter filtered out segments in streaming",
+		zap.Int64("collectionID", collectionID),
+		zap.Int("filtered", filteredCount),
+		zap.Int("remaining", len(segments)))
+
+	return segments, nil
 }

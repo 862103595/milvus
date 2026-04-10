@@ -107,8 +107,9 @@ func (i *indexInspector) createIndexForSegmentLoop(ctx context.Context) {
 			}
 		case collectionID := <-i.notifyIndexChan:
 			log.Info("receive create index notify", zap.Int64("collectionID", collectionID))
+			isExternal := i.isExternalCollection(collectionID)
 			segments := i.meta.SelectSegments(ctx, WithCollection(collectionID), SegmentFilterFunc(func(info *SegmentInfo) bool {
-				return isFlush(info) && (!enableSortCompaction() || info.GetIsSorted())
+				return isFlush(info) && (!enableSortCompaction() || info.GetIsSorted() || info.GetIsSortedByNamespace() || isExternal)
 			}))
 			for _, segment := range segments {
 				if err := i.createIndexesForSegment(ctx, segment); err != nil {
@@ -146,7 +147,7 @@ func (i *indexInspector) getUnIndexTaskSegments(ctx context.Context) []*SegmentI
 }
 
 func (i *indexInspector) createIndexesForSegment(ctx context.Context, segment *SegmentInfo) error {
-	if enableSortCompaction() && !segment.GetIsSorted() {
+	if enableSortCompaction() && !segment.GetIsSorted() && !segment.GetIsSortedByNamespace() && !i.isExternalCollection(segment.CollectionID) {
 		log.Ctx(ctx).Debug("segment is not sorted by pk, skip create indexes", zap.Int64("segmentID", segment.GetID()))
 		return nil
 	}
@@ -175,13 +176,16 @@ func (i *indexInspector) createIndexForSegment(ctx context.Context, segment *Seg
 	if err != nil {
 		return err
 	}
-	taskSlot := calculateIndexTaskSlot(segment.getSegmentSize())
 
 	indexParams := i.meta.indexMeta.GetIndexParams(segment.CollectionID, indexID)
 	indexType := GetIndexType(indexParams)
+	isVectorIndex := vecindexmgr.GetVecIndexMgrInstance().IsVecIndex(indexType)
+	fieldID := i.meta.indexMeta.GetFieldIDByIndexID(segment.CollectionID, indexID)
+	fieldSize := segment.getFieldBinlogSize(fieldID)
+	taskSlot := calculateIndexTaskSlot(fieldSize, isVectorIndex)
 
 	// rewrite the index type if needed, and this final index type will be persisted in the meta
-	if vecindexmgr.GetVecIndexMgrInstance().IsVecIndex(indexType) && Params.KnowhereConfig.Enable.GetAsBool() {
+	if isVectorIndex && Params.KnowhereConfig.Enable.GetAsBool() {
 		var err error
 		indexParams, err = Params.KnowhereConfig.UpdateIndexParams(indexType, paramtable.BuildStage, indexParams)
 		if err != nil {
@@ -214,7 +218,19 @@ func (i *indexInspector) createIndexForSegment(ctx context.Context, segment *Seg
 		i.handler,
 		i.storageCli,
 		i.indexEngineVersionManager))
+	log.Info("indexInspector create index for segment success",
+		zap.Int64("segmentID", segment.ID),
+		zap.Int64("indexID", indexID),
+		zap.Int64("fieldID", fieldID),
+		zap.Int64("segment size", segment.getSegmentSize()),
+		zap.Int64("field size", fieldSize),
+		zap.Int64("task slot", taskSlot))
 	return nil
+}
+
+func (i *indexInspector) isExternalCollection(collectionID int64) bool {
+	coll := i.meta.GetCollection(collectionID)
+	return coll != nil && coll.IsExternal()
 }
 
 func (i *indexInspector) reloadFromMeta() {
@@ -227,9 +243,16 @@ func (i *indexInspector) reloadFromMeta() {
 				continue
 			}
 
+			indexParams := i.meta.indexMeta.GetIndexParams(segment.CollectionID, segIndex.IndexID)
+			indexType := GetIndexType(indexParams)
+			isVectorIndex := vecindexmgr.GetVecIndexMgrInstance().IsVecIndex(indexType)
+			fieldID := i.meta.indexMeta.GetFieldIDByIndexID(segment.CollectionID, segIndex.IndexID)
+			fieldSize := segment.getFieldBinlogSize(fieldID)
+			taskSlot := calculateIndexTaskSlot(fieldSize, isVectorIndex)
+
 			i.scheduler.Enqueue(newIndexBuildTask(
 				model.CloneSegmentIndex(segIndex),
-				calculateIndexTaskSlot(segment.getSegmentSize()),
+				taskSlot,
 				i.meta,
 				i.handler,
 				i.storageCli,

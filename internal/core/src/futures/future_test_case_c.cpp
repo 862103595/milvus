@@ -9,8 +9,24 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include "Future.h"
+#include <folly/CancellationToken.h>
+#include <folly/ExceptionWrapper.h>
+#include <folly/Try.h>
+#include <folly/futures/Promise.h>
+#include <chrono>
+#include <exception>
+#include <memory>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
+
 #include "Executor.h"
+#include "Future.h"
+#include "common/EasyAssert.h"
+#include "folly/executors/CPUThreadPoolExecutor.h"
+#include "folly/futures/Future.h"
+#include "futures/future_c_types.h"
 
 extern "C" CFuture*
 future_create_test_case(int interval, int loop_cnt, int case_no) {
@@ -18,10 +34,10 @@ future_create_test_case(int interval, int loop_cnt, int case_no) {
         milvus::futures::getGlobalCPUExecutor(),
         milvus::futures::ExecutePriority::HIGH,
         [interval = interval, loop_cnt = loop_cnt, case_no = case_no](
-            milvus::futures::CancellationToken token) {
+            const folly::CancellationToken& token) {
             for (int i = 0; i < loop_cnt; i++) {
                 if (case_no != 0) {
-                    token.throwIfCancelled();
+                    milvus::futures::throwIfCancelled(token);
                 }
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(interval));

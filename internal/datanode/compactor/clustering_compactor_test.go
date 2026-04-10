@@ -64,6 +64,7 @@ func (s *ClusteringCompactionTaskSuite) SetupSuite() {
 
 func (s *ClusteringCompactionTaskSuite) setupTest() {
 	paramtable.Get().Save(paramtable.Get().CommonCfg.StorageType.Key, "local")
+	paramtable.Get().Save(paramtable.Get().CommonCfg.UseLoonFFI.Key, "false")
 
 	s.mockBinlogIO = mock_util.NewMockBinlogIO(s.T())
 
@@ -83,7 +84,6 @@ func (s *ClusteringCompactionTaskSuite) setupTest() {
 
 	s.task = NewClusteringCompactionTask(context.Background(), s.mockBinlogIO, nil, compaction.GenParams())
 
-	paramtable.Get().Save(paramtable.Get().CommonCfg.EntityExpirationTTL.Key, "0")
 	params, err := compaction.GenerateJSONParams()
 	if err != nil {
 		panic(err)
@@ -117,8 +117,8 @@ func (s *ClusteringCompactionTaskSuite) SetupSubTest() {
 }
 
 func (s *ClusteringCompactionTaskSuite) TearDownTest() {
-	paramtable.Get().Reset(paramtable.Get().CommonCfg.EntityExpirationTTL.Key)
 	paramtable.Get().Reset(paramtable.Get().CommonCfg.StorageType.Key)
+	paramtable.Get().Reset(paramtable.Get().CommonCfg.UseLoonFFI.Key)
 }
 
 func (s *ClusteringCompactionTaskSuite) TestWrongCompactionType() {

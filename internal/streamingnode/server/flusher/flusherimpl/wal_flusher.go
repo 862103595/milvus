@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
@@ -12,9 +13,11 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/util"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/adaptor/rate"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/recovery"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
 	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/adaptor"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/options"
@@ -22,16 +25,18 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 var errChannelLifetimeUnrecoverable = errors.New("channel lifetime unrecoverable")
 
 // RecoverWALFlusherParam is the parameter for building wal flusher.
 type RecoverWALFlusherParam struct {
-	ChannelInfo      types.PChannelInfo
-	WAL              *syncutil.Future[wal.WAL]
-	RecoverySnapshot *recovery.RecoverySnapshot
-	RecoveryStorage  recovery.RecoveryStorage
+	ChannelInfo        types.PChannelInfo
+	WAL                *syncutil.Future[wal.WAL]
+	RecoverySnapshot   *recovery.RecoverySnapshot
+	RecoveryStorage    recovery.RecoveryStorage
+	RateLimitComponent *rate.WALRateLimitComponent
 }
 
 // RecoverWALFlusher recovers the wal flusher.
@@ -42,19 +47,24 @@ func RecoverWALFlusher(param *RecoverWALFlusherParam) *WALFlusherImpl {
 		logger: resource.Resource().Logger().With(
 			log.FieldComponent("flusher"),
 			zap.String("pchannel", param.ChannelInfo.String())),
-		metrics:         newFlusherMetrics(param.ChannelInfo),
-		RecoveryStorage: param.RecoveryStorage,
+		metrics:              newFlusherMetrics(param.ChannelInfo),
+		emptyTimeTickCounter: metrics.WALFlusherEmptyTimeTickFilteredTotal.WithLabelValues(paramtable.GetStringNodeID(), param.ChannelInfo.Name),
+		rateLimitComponent:   param.RateLimitComponent,
+		RecoveryStorage:      param.RecoveryStorage,
 	}
 	go flusher.Execute(param.RecoverySnapshot)
 	return flusher
 }
 
 type WALFlusherImpl struct {
-	notifier          *syncutil.AsyncTaskNotifier[struct{}]
-	wal               *syncutil.Future[wal.WAL]
-	flusherComponents *flusherComponents
-	logger            *log.MLogger
-	metrics           *flusherMetrics
+	notifier             *syncutil.AsyncTaskNotifier[struct{}]
+	wal                  *syncutil.Future[wal.WAL]
+	flusherComponents    *flusherComponents
+	logger               *log.MLogger
+	metrics              *flusherMetrics
+	lastDispatchTimeTick uint64 // The last time tick that the message is dispatched.
+	emptyTimeTickCounter prometheus.Counter
+	rateLimitComponent   *rate.WALRateLimitComponent
 	recovery.RecoveryStorage
 }
 
@@ -72,6 +82,11 @@ func (impl *WALFlusherImpl) Execute(recoverSnapshot *recovery.RecoverySnapshot) 
 		}
 		impl.logger.Warn("wal flusher is canceled before executing", zap.Error(err))
 	}()
+
+	// because current flusher is build asynchronously,
+	// so we need to enter slowdown mode to protect the wal from being overloaded before the recovery-storage scanner is started.
+	// recovery-storage scanner will protect the wal from being overloaded after the recovery-storage is started.
+	impl.rateLimitComponent.FlusherRecovering.EnterSlowdownMode(nil)
 
 	impl.logger.Info("wal flusher start to recovery...")
 	l, err := impl.wal.GetWithContext(impl.notifier.Context())
@@ -96,6 +111,7 @@ func (impl *WALFlusherImpl) Execute(recoverSnapshot *recovery.RecoverySnapshot) 
 	impl.logger.Info("wal flusher start to work")
 	impl.metrics.IntoState(flusherStateInWorking)
 	defer impl.metrics.IntoState(flusherStateOnClosing)
+	impl.rateLimitComponent.FlusherRecovering.EnterRecoveryMode()
 
 	for {
 		select {
@@ -157,7 +173,7 @@ func (impl *WALFlusherImpl) buildFlusherComponents(ctx context.Context, l wal.WA
 	chunkManager := resource.Resource().ChunkManager()
 
 	cpUpdater := util.NewChannelCheckpointUpdaterWithCallback(broker, func(mp *msgpb.MsgPosition) {
-		messageID := adaptor.MustGetMessageIDFromMQWrapperIDBytes(mp.MsgID)
+		messageID := adaptor.MustGetMessageIDFromMQWrapperIDBytesWithWALName(impl.wal.Get().WALName(), mp.MsgID)
 		impl.RecoveryStorage.UpdateFlusherCheckpoint(mp.ChannelName, &recovery.WALCheckpoint{
 			MessageID: messageID,
 			TimeTick:  mp.Timestamp,
@@ -191,9 +207,10 @@ func (impl *WALFlusherImpl) buildFlusherComponents(ctx context.Context, l wal.WA
 func (impl *WALFlusherImpl) generateScanner(ctx context.Context, l wal.WAL, checkpoint message.MessageID) (wal.Scanner, error) {
 	handler := make(adaptor.ChanMessageHandler, 64)
 	readOpt := wal.ReadOption{
-		VChannel:       "", // We need consume all message from wal.
-		MesasgeHandler: handler,
-		DeliverPolicy:  options.DeliverPolicyAll(),
+		VChannel:         "", // We need consume all message from wal.
+		MesasgeHandler:   handler,
+		DeliverPolicy:    options.DeliverPolicyAll(),
+		RateLimitControl: impl.rateLimitComponent.RecoveryStorage,
 	}
 	if checkpoint != nil {
 		impl.logger.Info("wal start to scan from minimum checkpoint", zap.Stringer("checkpointMessageID", checkpoint))
@@ -206,16 +223,43 @@ func (impl *WALFlusherImpl) generateScanner(ctx context.Context, l wal.WAL, chec
 
 // dispatch dispatches the message to the related handler for flusher components.
 func (impl *WALFlusherImpl) dispatch(msg message.ImmutableMessage) (err error) {
-	// TODO: We will merge the flusher into recovery storage in future.
-	// Currently, flusher works as a separate component.
-	defer func() {
-		if err = impl.RecoveryStorage.ObserveMessage(impl.notifier.Context(), msg); err != nil {
-			impl.logger.Warn("failed to observe message", zap.Error(err))
+	if msg.MessageType() == message.MessageTypeTimeTick && !msg.IsPersisted() {
+		// Currently, milvus use the timetick to synchronize the system periodically,
+		// so the wal will still produce empty timetick message after the last write operation is done.
+		// When there're huge amount of vchannel in one pchannel, every time tick will be dispatched,
+		// which will waste a lot of cpu resources.
+		// So we only dispatch the timetick message when the timetick-lastDispatchTimeTick is greater than a threshold.
+		timetick := msg.TimeTick()
+		threshold := paramtable.Get().StreamingCfg.FlushEmptyTimeTickMaxFilterInterval.GetAsDurationByParse()
+		if tsoutil.CalculateDuration(timetick, impl.lastDispatchTimeTick) < threshold.Milliseconds() {
+			impl.emptyTimeTickCounter.Inc()
+			return
 		}
+	}
+	timetick := msg.TimeTick()
+	defer func() {
+		impl.lastDispatchTimeTick = timetick
 	}()
 
-	// wal flusher will not handle the control channel message.
-	if funcutil.IsControlChannel(msg.VChannel()) {
+	// TODO: should be removed at 3.0, after merge the flusher logic into recovery storage.
+	// only for truncate api now.
+	if bh := msg.BroadcastHeader(); bh != nil && bh.AckSyncUp {
+		if err := impl.RecoveryStorage.ObserveMessage(impl.notifier.Context(), msg); err != nil {
+			impl.logger.Warn("failed to observe message", zap.Error(err))
+			return err
+		}
+	} else {
+		// TODO: We will merge the flusher into recovery storage in future.
+		// Currently, flusher works as a separate component.
+		defer func() {
+			if err = impl.RecoveryStorage.ObserveMessage(impl.notifier.Context(), msg); err != nil {
+				impl.logger.Warn("failed to observe message", zap.Error(err))
+			}
+		}()
+	}
+
+	// wal flusher will not handle the control channel message unless it's a pchannel-level message.
+	if funcutil.IsControlChannel(msg.VChannel()) && !msg.IsPChannelLevel() {
 		return nil
 	}
 

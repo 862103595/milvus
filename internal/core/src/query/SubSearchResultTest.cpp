@@ -10,10 +10,18 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <queue>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "filemanager/InputStream.h"
+#include "gtest/gtest.h"
 #include "knowhere/comp/index_param.h"
 #include "query/SubSearchResult.h"
 
@@ -55,7 +63,7 @@ GenSubSearchResult(const int64_t nq,
         }
     }
     sub_result->mutable_distances() = std::move(distances);
-    sub_result->mutable_seg_offsets() = std::move(ids);
+    sub_result->mutable_offsets() = std::move(ids);
     return sub_result;
 }
 
@@ -72,7 +80,7 @@ CheckSubSearchResult(const int64_t nq,
             auto ref_x = result_ref[n].top();
             result_ref[n].pop();
             auto index = n * topk + topk - 1 - k;
-            auto id = result.get_seg_offsets()[index];
+            auto id = result.get_offsets()[index];
             auto distance = result.get_distances()[index];
             ASSERT_EQ(id, ref_x);
             ASSERT_EQ(distance, ref_x);

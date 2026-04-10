@@ -31,12 +31,13 @@ type Params struct {
 	PreferSegmentSizeRatio    float64                `json:"prefer_segment_size_ratio,omitempty"`
 	BloomFilterApplyBatchSize int                    `json:"bloom_filter_apply_batch_size,omitempty"`
 	StorageConfig             *indexpb.StorageConfig `json:"storage_config,omitempty"`
+	UseLoonFFI                bool                   `json:"use_loon_ffi,omitempty"`
 }
 
 func GenParams() Params {
-	storageVersion := storage.StorageV1
-	if paramtable.Get().CommonCfg.EnableStorageV2.GetAsBool() {
-		storageVersion = storage.StorageV2
+	storageVersion := storage.StorageV2
+	if paramtable.Get().CommonCfg.UseLoonFFI.GetAsBool() {
+		storageVersion = storage.StorageV3
 	}
 	return Params{
 		StorageVersion:            storageVersion,
@@ -46,6 +47,7 @@ func GenParams() Params {
 		PreferSegmentSizeRatio:    paramtable.Get().DataCoordCfg.ClusteringCompactionPreferSegmentSizeRatio.GetAsFloat(),
 		BloomFilterApplyBatchSize: paramtable.Get().CommonCfg.BloomFilterApplyBatchSize.GetAsInt(),
 		StorageConfig:             CreateStorageConfig(),
+		UseLoonFFI:                paramtable.Get().CommonCfg.UseLoonFFI.GetAsBool(),
 	}
 }
 
@@ -61,10 +63,6 @@ func GenerateJSONParams() (string, error) {
 func ParseParamsFromJSON(jsonStr string) (Params, error) {
 	var compactionParams Params
 	err := json.Unmarshal([]byte(jsonStr), &compactionParams)
-	if err != nil && jsonStr == "" {
-		// Ensure the compatibility with the legacy requests sent by the old datacoord.
-		return GenParams(), nil
-	}
 	return compactionParams, err
 }
 
@@ -93,6 +91,8 @@ func CreateStorageConfig() *indexpb.StorageConfig {
 			CloudProvider:     paramtable.Get().MinioCfg.CloudProvider.GetValue(),
 			RequestTimeoutMs:  paramtable.Get().MinioCfg.RequestTimeoutMs.GetAsInt64(),
 			GcpCredentialJSON: paramtable.Get().MinioCfg.GcpCredentialJSON.GetValue(),
+			SslTlsMinVersion:  paramtable.Get().MinioCfg.SslTLSMinVersion.GetValue(),
+			UseCrc32CChecksum: paramtable.Get().MinioCfg.UseCRC32C.GetAsBool(),
 		}
 	}
 

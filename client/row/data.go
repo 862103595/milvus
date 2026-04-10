@@ -138,7 +138,15 @@ func AnyToColumns(rows []interface{}, keepPkField bool, schemas ...*entity.Schem
 			}
 			nameColumns[fieldName] = column
 
-			err = column.AppendValue(candi.v.Interface())
+			if candi.isPtr {
+				if candi.v.IsNil() {
+					err = column.AppendNull()
+				} else {
+					err = column.AppendValue(candi.v.Elem().Interface())
+				}
+			} else {
+				err = column.AppendValue(candi.v.Interface())
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -148,7 +156,15 @@ func AnyToColumns(rows []interface{}, keepPkField bool, schemas ...*entity.Schem
 		if isDynamic {
 			m := make(map[string]interface{})
 			for name, candi := range set {
-				m[name] = candi.v.Interface()
+				if candi.isPtr {
+					if candi.v.IsNil() {
+						m[name] = nil
+					} else {
+						m[name] = candi.v.Elem().Interface()
+					}
+				} else {
+					m[name] = candi.v.Interface()
+				}
 			}
 			bs, err := json.Marshal(m)
 			if err != nil {
@@ -210,6 +226,9 @@ func getColumnCreators(sch *entity.Schema) map[string]columnCreator {
 			case entity.FieldTypeJSON:
 				data := make([][]byte, 0, rowsLen)
 				col = column.NewColumnJSONBytes(field.Name, data)
+			case entity.FieldTypeMol:
+				data := make([]string, 0, rowsLen)
+				col = column.NewColumnMolSmiles(field.Name, data)
 			case entity.FieldTypeArray:
 				col = NewArrayColumn(field)
 				if col == nil {
@@ -312,7 +331,17 @@ func SetField(receiver any, fieldName string, value any) error {
 	}
 
 	if candidate.v.CanSet() {
-		candidate.v.Set(reflect.ValueOf(value))
+		if candidate.isPtr {
+			if value == nil {
+				candidate.v.Set(reflect.Zero(candidate.v.Type()))
+			} else {
+				ptr := reflect.New(candidate.v.Type().Elem())
+				ptr.Elem().Set(reflect.ValueOf(value))
+				candidate.v.Set(ptr)
+			}
+		} else {
+			candidate.v.Set(reflect.ValueOf(value))
+		}
 	}
 
 	return nil
@@ -322,6 +351,7 @@ type fieldCandi struct {
 	name    string
 	v       reflect.Value
 	options map[string]string
+	isPtr   bool
 }
 
 func reflectValueCandi(v reflect.Value) (map[string]fieldCandi, error) {
@@ -400,6 +430,7 @@ func getStructReflectCandidates(v reflect.Value) (map[string]fieldCandi, error) 
 		}
 
 		v := v.Field(i)
+		isPtr := v.Kind() == reflect.Ptr
 		if v.Kind() == reflect.Array {
 			v = v.Slice(0, v.Len())
 		}
@@ -408,6 +439,7 @@ func getStructReflectCandidates(v reflect.Value) (map[string]fieldCandi, error) 
 			name:    name,
 			v:       v,
 			options: settings,
+			isPtr:   isPtr,
 		}
 	}
 

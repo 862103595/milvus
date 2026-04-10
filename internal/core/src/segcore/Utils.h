@@ -22,6 +22,9 @@
 #include "index/Index.h"
 #include "cachinglayer/Utils.h"
 #include "segcore/ConcurrentVector.h"
+#include "segcore/Types.h"
+#include "common/Consts.h"
+#include "segcore/SegmentInterface.h"
 
 namespace milvus::segcore {
 
@@ -51,8 +54,27 @@ GetRawDataSizeOfDataArray(const DataArray* data,
 std::unique_ptr<DataArray>
 CreateEmptyScalarDataArray(int64_t count, const FieldMeta& field_meta);
 
+void
+SetUpScalarFieldData(milvus::proto::schema::ScalarField*& scalar_array,
+                     DataType data_type,
+                     DataType element_type,
+                     int64_t count);
+
+void
+CreateScalarDataArray(DataArray& data_array,
+                      int64_t count,
+                      DataType data_type,
+                      DataType element_type,
+                      bool nullable);
+
 std::unique_ptr<DataArray>
 CreateEmptyVectorDataArray(int64_t count, const FieldMeta& field_meta);
+
+std::unique_ptr<DataArray>
+CreateEmptyVectorDataArray(int64_t count,
+                           int64_t valid_count,
+                           const void* valid_data,
+                           const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
 CreateScalarDataArrayFrom(const void* data_raw,
@@ -66,6 +88,13 @@ CreateVectorDataArrayFrom(const void* data_raw,
                           const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
+CreateVectorDataArrayFrom(const void* data_raw,
+                          const void* valid_data,
+                          int64_t count,
+                          int64_t valid_count,
+                          const FieldMeta& field_meta);
+
+std::unique_ptr<DataArray>
 CreateDataArrayFrom(const void* data_raw,
                     const void* valid_data,
                     int64_t count,
@@ -76,6 +105,7 @@ struct MergeBase {
  private:
     std::map<FieldId, std::unique_ptr<milvus::DataArray>>* output_fields_data_;
     size_t offset_;
+    std::map<FieldId, size_t> valid_data_offsets_;
 
  public:
     MergeBase() {
@@ -89,6 +119,20 @@ struct MergeBase {
 
     size_t
     getOffset() const {
+        return offset_;
+    }
+
+    void
+    setValidDataOffset(FieldId fieldId, size_t valid_offset) {
+        valid_data_offsets_[fieldId] = valid_offset;
+    }
+
+    size_t
+    getValidDataOffset(FieldId fieldId) const {
+        auto it = valid_data_offsets_.find(fieldId);
+        if (it != valid_data_offsets_.end()) {
+            return it->second;
+        }
         return offset_;
     }
 
@@ -137,10 +181,89 @@ upper_bound(const ConcurrentVector<Timestamp>& timestamps,
             int64_t last,
             Timestamp value);
 
+// Get the cache warmup policy for the given content type.
+// If warmup_policy is not empty, parse it and return the corresponding policy.
+// If warmup_policy is empty, fall back to the global config.
 CacheWarmupPolicy
-getCacheWarmupPolicy(bool is_vector, bool is_index, bool in_load_list = true);
+getCacheWarmupPolicy(const std::string& warmup_policy,
+                     bool is_vector,
+                     bool is_index,
+                     bool in_load_list = true);
 
 milvus::cachinglayer::CellDataType
 getCellDataType(bool is_vector, bool is_index);
+
+void
+LoadIndexData(milvus::tracer::TraceContext& ctx,
+              milvus::segcore::LoadIndexInfo* load_index_info,
+              milvus::OpContext* op_ctx = nullptr);
+
+/**
+ * Convert Milvus timestamp to physical time in milliseconds.
+ * Milvus timestamp format: physical time in the high bits, logical counter in
+ * the lower LOGICAL_BITS bits. Shifting by LOGICAL_BITS extracts the physical
+ * time component in milliseconds.
+ *
+ * @param timestamp Milvus timestamp value
+ * @return Physical time in millisecond
+ */
+inline uint64_t
+TimestampToPhysicalMs(Timestamp timestamp) {
+    return timestamp >> LOGICAL_BITS;
+}
+
+FieldDataPtr
+bulk_script_field_data(milvus::OpContext* op_ctx,
+                       FieldId fieldId,
+                       DataType dataType,
+                       const int64_t* seg_offsets,
+                       int64_t count,
+                       const segcore::SegmentInternalInterface* segment,
+                       TargetBitmap& valid_view,
+                       bool small_int_raw_type = false);
+
+/**
+ * @brief Check if an operation has been cancelled and throw if so.
+ *
+ * This is a helper function to reduce boilerplate cancellation checking code.
+ *
+ * @param op_ctx The operation context containing the cancellation token (can be nullptr)
+ * @param segment_id The segment ID for error message context
+ * @param operation Description of the operation being performed
+ * @throws SegcoreError with ErrorCode::FollyCancel if cancellation was requested
+ */
+inline void
+CheckCancellation(milvus::OpContext* op_ctx,
+                  int64_t segment_id,
+                  const std::string& operation) {
+    if (op_ctx && op_ctx->cancellation_token.isCancellationRequested()) {
+        throw SegcoreError(
+            ErrorCode::FollyCancel,
+            fmt::format("{} cancelled for segment {}", operation, segment_id));
+    }
+}
+
+/**
+ * @brief Check if an operation has been cancelled and throw if so (with field context).
+ *
+ * @param op_ctx The operation context containing the cancellation token (can be nullptr)
+ * @param segment_id The segment ID for error message context
+ * @param field_id The field ID for error message context
+ * @param operation Description of the operation being performed
+ * @throws SegcoreError with ErrorCode::FollyCancel if cancellation was requested
+ */
+inline void
+CheckCancellation(milvus::OpContext* op_ctx,
+                  int64_t segment_id,
+                  int64_t field_id,
+                  const std::string& operation) {
+    if (op_ctx && op_ctx->cancellation_token.isCancellationRequested()) {
+        throw SegcoreError(ErrorCode::FollyCancel,
+                           fmt::format("{} cancelled for segment {} field {}",
+                                       operation,
+                                       segment_id,
+                                       field_id));
+    }
+}
 
 }  // namespace milvus::segcore

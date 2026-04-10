@@ -15,33 +15,48 @@
 // limitations under the License.
 
 #include "index/IndexFactory.h"
-#include <cstdlib>
+
+#include <assert.h>
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
+
+#include "common/Consts.h"
 #include "common/EasyAssert.h"
-#include "common/FieldDataInterface.h"
+#include "common/JsonCastFunction.h"
 #include "common/JsonCastType.h"
 #include "common/Types.h"
-#include "index/Index.h"
-#include "index/JsonFlatIndex.h"
-#include "index/VectorMemIndex.h"
-#include "index/Utils.h"
-#include "index/Meta.h"
-#include "index/JsonInvertedIndex.h"
-#include "index/NgramInvertedIndex.h"
-#include "knowhere/utils.h"
-
-#include "index/VectorDiskIndex.h"
-#include "index/ScalarIndexSort.h"
-#include "index/StringIndexSort.h"
-#include "index/StringIndexMarisa.h"
-#include "index/BoolIndex.h"
-#include "index/InvertedIndexTantivy.h"
+#include "common/Utils.h"
+#include "fmt/core.h"
+#include "glog/logging.h"
+#include "index/BitmapIndex.h"
 #include "index/HybridScalarIndex.h"
+#include "index/Index.h"
+#include "index/IndexInfo.h"
+#include "index/InvertedIndexTantivy.h"
+#include "index/TextMatchIndex.h"
+#include "index/JsonFlatIndex.h"
+#include "index/JsonInvertedIndex.h"
+#include "index/Meta.h"
+#include "index/NgramInvertedIndex.h"
 #include "index/RTreeIndex.h"
+#include "index/ScalarIndexSort.h"
+#include "index/StringIndexMarisa.h"
+#include "index/StringIndexSort.h"
+#include "index/Utils.h"
+#include "index/VectorDiskIndex.h"
+#include "index/VectorMemIndex.h"
 #include "knowhere/comp/knowhere_check.h"
+#include "knowhere/expected.h"
+#include "knowhere/index/index_static.h"
+#include "knowhere/operands.h"
+#include "knowhere/utils.h"
 #include "log/Log.h"
+#include "nlohmann/json.hpp"
 #include "pb/schema.pb.h"
+#include "storage/Types.h"
 
 namespace milvus::index {
 
@@ -78,6 +93,16 @@ IndexFactory::CreatePrimitiveScalarIndex<std::string>(
 #if defined(__linux__) || defined(__APPLE__)
     if (index_type == INVERTED_INDEX_TYPE) {
         assert(create_index_info.tantivy_index_version != 0);
+        if (create_index_info.is_text_match) {
+            auto field_schema = FieldMeta::ParseFrom(
+                file_manager_context.fieldDataMeta.field_schema);
+            return std::make_unique<TextMatchIndex>(
+                file_manager_context,
+                create_index_info.tantivy_index_version,
+                "milvus_tokenizer",
+                field_schema.get_analyzer_params().c_str(),
+                create_index_info.analyzer_extra_info.c_str());
+        }
         // scalar_index_engine_version 0 means we should built tantivy index within single segment
         return std::make_unique<InvertedIndexTantivy<std::string>>(
             create_index_info.tantivy_index_version,
@@ -86,12 +111,16 @@ IndexFactory::CreatePrimitiveScalarIndex<std::string>(
     }
     if (index_type == BITMAP_INDEX_TYPE) {
         return std::make_unique<BitmapIndex<std::string>>(file_manager_context);
-    }
-    if (index_type == HYBRID_INDEX_TYPE) {
+    } else if (index_type == HYBRID_INDEX_TYPE) {
         return std::make_unique<HybridScalarIndex<std::string>>(
             create_index_info.tantivy_index_version, file_manager_context);
+    } else if (index_type == MARISA_TRIE || index_type == MARISA_TRIE_UPPER) {
+        return CreateStringIndexMarisa(file_manager_context);
+    } else if (index_type == ASCENDING_SORT) {
+        return CreateStringIndexSort(file_manager_context);
+    } else {
+        ThrowInfo(Unsupported, "unsupported index type: {}", index_type);
     }
-    return CreateStringIndexSort(file_manager_context);
 #else
     ThrowInfo(Unsupported, "unsupported platform");
 #endif
@@ -530,10 +559,108 @@ IndexFactory::CreateGeometryIndex(
 }
 
 IndexBasePtr
+IndexFactory::CreateNestedIndex(
+    IndexType index_type,
+    int32_t tantivy_index_version,
+    const storage::FileManagerContext& file_manager_context) {
+    if (index_type == INVERTED_INDEX_TYPE) {
+        return CreateNestedIndexInverted(tantivy_index_version,
+                                         file_manager_context);
+    }
+
+    return CreateNestedIndexScalarIndexSort(file_manager_context);
+}
+
+IndexBasePtr
+IndexFactory::CreateNestedIndexInverted(
+    int32_t tantivy_index_version,
+    const storage::FileManagerContext& file_manager_context) {
+    DataType element_type = static_cast<DataType>(
+        file_manager_context.fieldDataMeta.field_schema.element_type());
+    switch (element_type) {
+        case DataType::BOOL:
+            return std::make_unique<InvertedIndexTantivy<bool>>(
+                tantivy_index_version,
+                file_manager_context,
+                false,  // inverted_index_single_segment
+                true,   // user_specified_doc_id
+                true);  // is_nested_index
+        case DataType::INT8:
+            return std::make_unique<InvertedIndexTantivy<int8_t>>(
+                tantivy_index_version, file_manager_context, false, true, true);
+        case DataType::INT16:
+            return std::make_unique<InvertedIndexTantivy<int16_t>>(
+                tantivy_index_version, file_manager_context, false, true, true);
+        case DataType::INT32:
+            return std::make_unique<InvertedIndexTantivy<int32_t>>(
+                tantivy_index_version, file_manager_context, false, true, true);
+        case DataType::INT64:
+            return std::make_unique<InvertedIndexTantivy<int64_t>>(
+                tantivy_index_version, file_manager_context, false, true, true);
+        case DataType::FLOAT:
+            return std::make_unique<InvertedIndexTantivy<float>>(
+                tantivy_index_version, file_manager_context, false, true, true);
+        case DataType::DOUBLE:
+            return std::make_unique<InvertedIndexTantivy<double>>(
+                tantivy_index_version, file_manager_context, false, true, true);
+        case DataType::STRING:
+        case DataType::VARCHAR:
+            return std::make_unique<InvertedIndexTantivy<std::string>>(
+                tantivy_index_version, file_manager_context, false, true, true);
+        default:
+            ThrowInfo(DataTypeInvalid, "Invalid data type:{}", element_type);
+    }
+}
+
+IndexBasePtr
+IndexFactory::CreateNestedIndexScalarIndexSort(
+    const storage::FileManagerContext& file_manager_context) {
+    DataType element_type = static_cast<DataType>(
+        file_manager_context.fieldDataMeta.field_schema.element_type());
+    switch (element_type) {
+        case DataType::BOOL:
+            return std::make_unique<ScalarIndexSort<bool>>(file_manager_context,
+                                                           true);
+        case DataType::INT8:
+            return std::make_unique<ScalarIndexSort<int8_t>>(
+                file_manager_context, true);
+        case DataType::INT16:
+            return std::make_unique<ScalarIndexSort<int16_t>>(
+                file_manager_context, true);
+        case DataType::INT32:
+            return std::make_unique<ScalarIndexSort<int32_t>>(
+                file_manager_context, true);
+        case DataType::INT64:
+            return std::make_unique<ScalarIndexSort<int64_t>>(
+                file_manager_context, true);
+        case DataType::FLOAT:
+            return std::make_unique<ScalarIndexSort<float>>(
+                file_manager_context, true);
+        case DataType::DOUBLE:
+            return std::make_unique<ScalarIndexSort<double>>(
+                file_manager_context, true);
+        case DataType::STRING:
+        case DataType::VARCHAR:
+            return std::make_unique<StringIndexSort>(file_manager_context,
+                                                     true);
+        default:
+            ThrowInfo(DataTypeInvalid, "Invalid data type:{}", element_type);
+    }
+}
+
+IndexBasePtr
 IndexFactory::CreateScalarIndex(
     const CreateIndexInfo& create_index_info,
     const storage::FileManagerContext& file_manager_context) {
     auto data_type = create_index_info.field_type;
+
+    if (IsStructSubField(create_index_info.field_name)) {
+        assert(data_type == DataType::ARRAY);
+        return CreateNestedIndex(create_index_info.index_type,
+                                 create_index_info.tantivy_index_version,
+                                 file_manager_context);
+    }
+
     switch (data_type) {
         case DataType::BOOL:
         case DataType::INT8:

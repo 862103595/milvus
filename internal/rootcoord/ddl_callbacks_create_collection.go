@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/adaptor"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/ce"
+	"github.com/milvus-io/milvus/pkg/v2/util"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -56,13 +57,17 @@ func (c *Core) broadcastCreateCollectionV1(ctx context.Context, req *milvuspb.Cr
 		req.NumPartitions = int64(1)
 	}
 
-	broadcaster, err := startBroadcastWithCollectionLock(ctx, req.GetDbName(), req.GetCollectionName())
+	broadcaster, err := c.startBroadcastWithCollectionLock(ctx, req.GetDbName(), req.GetCollectionName())
 	if err != nil {
 		return err
 	}
 	defer broadcaster.Close()
 
-	// prepare and validate the create collection message.
+	// prepare and validate the creation collection message.
+	preserveFieldID, exist := funcutil.TryGetAttrByKeyFromRepeatedKV(util.PreserveFieldIdsKey, req.GetProperties())
+	if !exist {
+		preserveFieldID = "false"
+	}
 	createCollectionTask := createCollectionTask{
 		Core:   c,
 		Req:    req,
@@ -72,12 +77,13 @@ func (c *Core) broadcastCreateCollectionV1(ctx context.Context, req *milvuspb.Cr
 			CollectionName:   req.GetCollectionName(),
 			CollectionSchema: schema,
 		},
+		preserveFieldID: preserveFieldID == "true",
 	}
 	if err := createCollectionTask.Prepare(ctx); err != nil {
 		return err
 	}
 
-	// setup the broadcast virtual channels and control channel, then make a broadcast message.
+	// set up the broadcast virtual channels and control channel, then make a broadcast message.
 	broadcastChannel := make([]string, 0, createCollectionTask.Req.ShardsNum+1)
 	broadcastChannel = append(broadcastChannel, streaming.WAL().ControlChannel())
 	for i := 0; i < int(createCollectionTask.Req.ShardsNum); i++ {
@@ -86,10 +92,7 @@ func (c *Core) broadcastCreateCollectionV1(ctx context.Context, req *milvuspb.Cr
 	msg := message.NewCreateCollectionMessageBuilderV1().
 		WithHeader(createCollectionTask.header).
 		WithBody(createCollectionTask.body).
-		WithBroadcast(broadcastChannel,
-			message.NewSharedDBNameResourceKey(createCollectionTask.body.DbName),
-			message.NewExclusiveCollectionNameResourceKey(createCollectionTask.body.DbName, createCollectionTask.body.CollectionName),
-		).
+		WithBroadcast(broadcastChannel).
 		MustBuildBroadcast()
 	if _, err := broadcaster.Broadcast(ctx, msg); err != nil {
 		return err
@@ -113,26 +116,26 @@ func (c *DDLCallback) createCollectionV1AckCallback(ctx context.Context, result 
 	if err := c.meta.AddCollection(ctx, newCollInfo); err != nil {
 		return errors.Wrap(err, "failed to add collection to meta table")
 	}
+
 	return c.ExpireCaches(ctx, ce.NewBuilder().WithLegacyProxyCollectionMetaCache(
 		ce.OptLPCMDBName(body.DbName),
 		ce.OptLPCMCollectionName(body.CollectionName),
 		ce.OptLPCMCollectionID(header.CollectionId),
-		ce.OptLPCMMsgType(commonpb.MsgType_DropCollection)),
-		newCollInfo.UpdateTimestamp,
-	)
+		ce.OptLPCMMsgType(commonpb.MsgType_CreateCollection)))
 }
 
 func (c *DDLCallback) createCollectionShard(ctx context.Context, header *message.CreateCollectionMessageHeader, body *message.CreateCollectionRequest, vchannel string, appendResult *message.AppendResult) error {
 	// TODO: redundant channel watch by now, remove it in future.
-	startPosition := adaptor.MustGetMQWrapperIDFromMessage(appendResult.MessageID).Serialize()
+	startPosition, walName := adaptor.MustGetMQWrapperIDAndWALNameFromMessage(appendResult.MessageID)
 	// semantically, we should use the last confirmed message id to setup the start position.
 	// same as following `newCollectionModelWithMessage`.
 	resp, err := c.mixCoord.WatchChannels(ctx, &datapb.WatchChannelsRequest{
 		CollectionID:    header.CollectionId,
 		ChannelNames:    []string{vchannel},
-		StartPositions:  []*commonpb.KeyDataPair{{Key: funcutil.ToPhysicalChannel(vchannel), Data: startPosition}},
+		StartPositions:  []*commonpb.KeyDataPair{{Key: funcutil.ToPhysicalChannel(vchannel), Data: startPosition.Serialize()}},
 		Schema:          body.CollectionSchema,
 		CreateTimestamp: appendResult.TimeTick,
+		ChannelWalNames: map[string]commonpb.WALName{funcutil.ToPhysicalChannel(vchannel): walName},
 	})
 	return merr.CheckRPCCall(resp.GetStatus(), err)
 }
@@ -179,6 +182,14 @@ func newCollectionModel(header *message.CreateCollectionMessageHeader, body *mes
 		})
 	}
 	consistencyLevel, properties := mustConsumeConsistencyLevel(body.CollectionSchema.Properties)
+	shardInfos := make(map[string]*model.ShardInfo, len(body.VirtualChannelNames))
+	for idx, vchannel := range body.VirtualChannelNames {
+		shardInfos[vchannel] = &model.ShardInfo{
+			VChannelName:         vchannel,
+			PChannelName:         body.PhysicalChannelNames[idx],
+			LastTruncateTimeTick: 0,
+		}
+	}
 	return &model.Collection{
 		CollectionID:         header.CollectionId,
 		DBID:                 header.DbId,
@@ -198,7 +209,13 @@ func newCollectionModel(header *message.CreateCollectionMessageHeader, body *mes
 		Partitions:           partitions,
 		Properties:           properties,
 		EnableDynamicField:   body.CollectionSchema.EnableDynamicField,
+		EnableNamespace:      body.CollectionSchema.EnableNamespace,
 		UpdateTimestamp:      ts,
+		SchemaVersion:        0,
+		ShardInfos:           shardInfos,
+		FileResourceIds:      body.CollectionSchema.GetFileResourceIds(),
+		ExternalSource:       body.CollectionSchema.ExternalSource,
+		ExternalSpec:         body.CollectionSchema.ExternalSpec,
 	}
 }
 

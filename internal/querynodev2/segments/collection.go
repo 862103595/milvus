@@ -17,7 +17,7 @@
 package segments
 
 import (
-	"fmt"
+	"encoding/base64"
 	"sync"
 
 	"github.com/samber/lo"
@@ -103,6 +103,13 @@ func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.Collec
 				zap.Any("schema", schema),
 			)
 		}
+		// Always update index meta to ensure newly indexed fields are visible
+		// for search plan creation (CollectionIndexMeta::HasField check).
+		if meta != nil {
+			if err := collection.ccollection.UpdateIndexMeta(meta); err != nil {
+				return err
+			}
+		}
 		collection.Ref(1)
 		return nil
 	}
@@ -137,7 +144,7 @@ func (m *collectionManager) UpdateSchema(collectionID int64, schema *schemapb.Co
 }
 
 func (m *collectionManager) updateMetric() {
-	metrics.QueryNodeNumCollections.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Set(float64(len(m.collections)))
+	metrics.QueryNodeNumCollections.WithLabelValues(paramtable.GetStringNodeID()).Set(float64(len(m.collections)))
 }
 
 func (m *collectionManager) Ref(collectionID int64, count uint32) bool {
@@ -162,7 +169,9 @@ func (m *collectionManager) Unref(collectionID int64, count uint32) bool {
 				zap.Int64("nodeID", paramtable.GetNodeID()), zap.Int64("collectionID", collectionID))
 			delete(m.collections, collectionID)
 			DeleteCollection(collection)
-			metrics.CleanupQueryNodeCollectionMetrics(paramtable.GetNodeID(), collectionID)
+			// Run metrics cleanup in background; DeletePartialMatch is CPU-heavy and should not block Unref.
+			nodeID := paramtable.GetNodeID()
+			go metrics.CleanupQueryNodeCollectionMetrics(nodeID, collectionID)
 			m.updateMetric()
 			return true
 		}
@@ -260,22 +269,12 @@ func (c *Collection) GetLoadType() querypb.LoadType {
 
 func (c *Collection) Ref(count uint32) uint32 {
 	refCount := c.refCount.Add(count)
-	log.Debug("collection ref increment",
-		zap.Int64("nodeID", paramtable.GetNodeID()),
-		zap.Int64("collectionID", c.ID()),
-		zap.Uint32("refCount", refCount),
-	)
 	putOrUpdateStorageContext(c.Schema().GetProperties(), c.ID())
 	return refCount
 }
 
 func (c *Collection) Unref(count uint32) uint32 {
 	refCount := c.refCount.Sub(count)
-	log.Debug("collection ref decrement",
-		zap.Int64("nodeID", paramtable.GetNodeID()),
-		zap.Int64("collectionID", c.ID()),
-		zap.Uint32("refCount", refCount),
-	)
 	return refCount
 }
 
@@ -377,7 +376,7 @@ func DeleteCollection(collection *Collection) {
 	collection.mu.Lock()
 	defer collection.mu.Unlock()
 
-	if hookutil.IsClusterEncyptionEnabled() {
+	if hookutil.IsClusterEncryptionEnabled() {
 		ez := hookutil.GetEzByCollProperties(collection.Schema().GetProperties(), collection.ID())
 		if ez != nil {
 			if err := segcore.UnRefPluginContext(ez); err != nil {
@@ -394,11 +393,11 @@ func DeleteCollection(collection *Collection) {
 }
 
 func putOrUpdateStorageContext(properties []*commonpb.KeyValuePair, collectionID int64) {
-	if hookutil.IsClusterEncyptionEnabled() {
+	if hookutil.IsClusterEncryptionEnabled() {
 		ez := hookutil.GetEzByCollProperties(properties, collectionID)
 		if ez != nil {
 			key := hookutil.GetCipher().GetUnsafeKey(ez.EzID, ez.CollectionID)
-			err := segcore.PutOrRefPluginContext(ez, string(key))
+			err := segcore.PutOrRefPluginContext(ez, base64.StdEncoding.EncodeToString(key))
 			if err != nil {
 				log.Error("failed to put or update plugin context", zap.Int64("collectionID", collectionID), zap.Error(err))
 			}

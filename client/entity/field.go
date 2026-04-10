@@ -58,6 +58,8 @@ func (t FieldType) Name() string {
 		return "JSON"
 	case FieldTypeGeometry:
 		return "Geometry"
+	case FieldTypeMol:
+		return "Mol"
 	case FieldTypeBinaryVector:
 		return "BinaryVector"
 	case FieldTypeFloatVector:
@@ -102,6 +104,8 @@ func (t FieldType) String() string {
 		return "JSON"
 	case FieldTypeGeometry:
 		return "Geometry"
+	case FieldTypeMol:
+		return "Mol"
 	case FieldTypeBinaryVector:
 		return "[]byte"
 	case FieldTypeFloatVector:
@@ -144,6 +148,8 @@ func (t FieldType) PbFieldType() (string, string) {
 		return "JSON", "JSON"
 	case FieldTypeGeometry:
 		return "Geometry", "Geometry"
+	case FieldTypeMol:
+		return "Mol", "string"
 	case FieldTypeBinaryVector:
 		return "[]byte", ""
 	case FieldTypeFloatVector:
@@ -177,8 +183,6 @@ const (
 	FieldTypeFloat FieldType = 10
 	// FieldTypeDouble field type double
 	FieldTypeDouble FieldType = 11
-	// FieldTypeTimestamptz field type timestamptz
-	FieldTypeTimestamptz FieldType = 15
 	// FieldTypeString field type string
 	FieldTypeString FieldType = 20
 	// FieldTypeVarChar field type varchar
@@ -189,6 +193,10 @@ const (
 	FieldTypeJSON FieldType = 23
 	// FieldTypeGeometry field type Geometry
 	FieldTypeGeometry FieldType = 24
+	// FieldTypeMol field type Mol
+	FieldTypeMol FieldType = 27
+	// FieldTypeTimestamptz field type timestamptz
+	FieldTypeTimestamptz FieldType = 26
 	// FieldTypeBinaryVector field type binary vector
 	FieldTypeBinaryVector FieldType = 100
 	// FieldTypeFloatVector field type float vector
@@ -205,6 +213,17 @@ const (
 	// FieldTypeStruct field type struct
 	FieldTypeStruct FieldType = 201
 )
+
+// IsVectorType returns true if the field type is a vector type
+func (t FieldType) IsVectorType() bool {
+	switch t {
+	case FieldTypeBinaryVector, FieldTypeFloatVector, FieldTypeFloat16Vector,
+		FieldTypeBFloat16Vector, FieldTypeSparseVector, FieldTypeInt8Vector:
+		return true
+	default:
+		return false
+	}
+}
 
 // Field represent field schema in milvus
 type Field struct {
@@ -223,6 +242,7 @@ type Field struct {
 	DefaultValue    *schemapb.ValueField
 	Nullable        bool
 	StructSchema    *StructSchema
+	ExternalField   string // external field name - maps to column name in external source
 }
 
 // ProtoMessage generates corresponding FieldSchema
@@ -242,6 +262,7 @@ func (f *Field) ProtoMessage() *schemapb.FieldSchema {
 		ElementType:     schemapb.DataType(f.ElementType),
 		Nullable:        f.Nullable,
 		DefaultValue:    f.DefaultValue,
+		ExternalField:   f.ExternalField,
 	}
 }
 
@@ -449,6 +470,12 @@ func (f *Field) WithStructSchema(schema *StructSchema) *Field {
 	return f
 }
 
+// WithExternalField sets the external field name for external collection fields.
+func (f *Field) WithExternalField(externalField string) *Field {
+	f.ExternalField = externalField
+	return f
+}
+
 // ReadProto parses FieldSchema
 func (f *Field) ReadProto(p *schemapb.FieldSchema) *Field {
 	f.ID = p.GetFieldID()
@@ -465,6 +492,7 @@ func (f *Field) ReadProto(p *schemapb.FieldSchema) *Field {
 	f.ElementType = FieldType(p.GetElementType())
 	f.DefaultValue = p.GetDefaultValue()
 	f.Nullable = p.GetNullable()
+	f.ExternalField = p.GetExternalField()
 
 	return f
 }

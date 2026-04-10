@@ -252,7 +252,7 @@ class TestCreateCollectionWithFullTextSearchNegative(TestcaseBase):
             name=cf.gen_unique_str(prefix), schema=schema
         )
         res, result = collection_w.describe()
-        log.info(f"collection describe {res}")
+        # log.info(f"collection describe {res}")
         assert not result, (
             "create collection with unsupported tokenizer should be failed"
         )
@@ -342,7 +342,7 @@ class TestCreateCollectionWithFullTextSearchNegative(TestcaseBase):
                 name=cf.gen_unique_str(prefix), schema=schema
             )
             res, result = collection_w.describe()
-            log.info(f"collection describe {res}")
+            # log.info(f"collection describe {res}")
             assert result, (
                 "create collection with valid input/output should be successful"
             )
@@ -471,6 +471,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
                 name="text",
                 dtype=DataType.VARCHAR,
                 max_length=65535,
+                nullable=nullable,
                 enable_analyzer=True,
                 analyzer_params=analyzer_params,
             ),
@@ -507,7 +508,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
                     "paragraph": fake.paragraph().lower()
                     if random.random() < 0.5
                     else None,
-                    "text": fake.text().lower(),  # function input should not be None
+                    "text": fake.text().lower() if random.random() < 0.3 else None,  # function input supports None now
                     "emb": [random.random() for _ in range(dim)],
                 }
                 for i in range(data_size)
@@ -527,7 +528,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
         if text_lang == "hybrid":
             hybrid_data = []
             for i in range(data_size):
-                fake = random.choice([fake_en, fake_zh, Faker("de_DE")])
+                fake = random.choice([fake_en, fake_zh, fake_de])
                 tmp = {
                     "id": i,
                     "word": fake.word().lower(),
@@ -539,13 +540,13 @@ class TestInsertWithFullTextSearch(TestcaseBase):
                 hybrid_data.append(tmp)
             data = hybrid_data + data
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
-                data[i : i + batch_size]
+                data[i: i + batch_size]
                 if i + batch_size < len(df)
-                else data[i : len(df)]
+                else data[i: len(df)]
             )
         collection_w.create_index(
             "emb",
@@ -651,7 +652,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
         if text_lang == "zh":
             fake = fake_zh
         elif text_lang == "de":
-            fake = Faker("de_DE")
+            fake = fake_de
         elif text_lang == "hybrid":
             fake = Faker()
 
@@ -688,7 +689,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
         if text_lang == "hybrid":
             hybrid_data = []
             for i in range(data_size):
-                fake = random.choice([fake_en, fake_zh, Faker("de_DE")])
+                fake = random.choice([fake_en, fake_zh, fake_de])
                 tmp = {
                     "id": i,
                     "word": fake.word().lower(),
@@ -806,7 +807,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
         if text_lang == "zh":
             fake = fake_zh
         elif text_lang == "de":
-            fake = Faker("de_DE")
+            fake = fake_de
         elif text_lang == "hybrid":
             fake = Faker()
 
@@ -841,7 +842,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
         if text_lang == "hybrid":
             hybrid_data = []
             for i in range(data_size):
-                fake = random.choice([fake_en, fake_zh, Faker("de_DE")])
+                fake = random.choice([fake_en, fake_zh, fake_de])
                 tmp = {
                     "id": i,
                     "word": fake.word().lower(),
@@ -853,7 +854,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
                 hybrid_data.append(tmp)
             data = hybrid_data + data
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(df[i : i + batch_size])
@@ -947,7 +948,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
         collection_w = self.init_collection_wrap(
             name=cf.gen_unique_str(prefix), schema=schema
         )
-        log.info(f"collection describe {collection_w.describe()}")
+        # log.info(f"collection describe {collection_w.describe()}")
         fake = fake_en
         language = "en"
         if tokenizer == "jieba":
@@ -987,8 +988,8 @@ class TestInsertWithFullTextSearch(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
-        log.info("analyze documents")
+        # log.info(f"dataframe\n{df}")
+        # log.info("analyze documents")
         texts = df["text"].to_list()
         word_freq = cf.analyze_documents(texts, language=language)
         tokens = list(word_freq.keys())
@@ -1024,7 +1025,7 @@ class TestInsertWithFullTextSearch(TestcaseBase):
         for i in range(nq):
             assert len(res_list[i]) == limit
             search_text = search_data[i]
-            log.info(f"res: {res_list[i]}")
+            # log.info(f"res: {res_list[i]}")
             res = res_list[i]
             for j in range(len(res)):
                 r = res[j]
@@ -1128,7 +1129,7 @@ class TestInsertWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -1248,7 +1249,7 @@ class TestUpsertWithFullTextSearch(TestcaseBase):
                 for i in range(data_size)
             ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -1402,7 +1403,7 @@ class TestUpsertWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -1540,7 +1541,7 @@ class TestDeleteWithFullTextSearch(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -1703,7 +1704,7 @@ class TestCreateIndexWithFullTextSearch(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -1733,7 +1734,7 @@ class TestCreateIndexWithFullTextSearch(TestcaseBase):
         # describe index info to verify
         res = collection_w.indexes
         index_info = [r.to_dict() for r in res]
-        log.info(f"index info: {index_info}")
+        # log.info(f"index info: {index_info}")
         for info in index_info:
             if info["index_name"] == "text_sparse_emb":
                 assert info["index_param"]["index_type"] == index_type
@@ -1834,7 +1835,7 @@ class TestCreateIndexWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -1950,7 +1951,7 @@ class TestCreateIndexWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -2069,7 +2070,7 @@ class TestCreateIndexWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -2176,7 +2177,7 @@ class TestCreateIndexWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -2230,8 +2231,10 @@ class TestSearchWithFullTextSearch(TestcaseBase):
     @pytest.mark.parametrize("expr", ["text_match", "id_range"])
     @pytest.mark.parametrize("tokenizer", ["standard"])
     @pytest.mark.parametrize("offset", [10, 0])
+    @pytest.mark.parametrize("nullable", [False, True])
     def test_full_text_search_default(
         self,
+        nullable,
         offset,
         tokenizer,
         expr,
@@ -2239,7 +2242,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         enable_partition_key,
         empty_percent,
         index_type,
-        nq,
+        nq
     ):
         """
         target: test full text search
@@ -2266,6 +2269,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 name="sentence",
                 dtype=DataType.VARCHAR,
                 max_length=65535,
+                nullable=nullable,
                 enable_analyzer=True,
                 analyzer_params=analyzer_params,
             ),
@@ -2273,6 +2277,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 name="paragraph",
                 dtype=DataType.VARCHAR,
                 max_length=65535,
+                nullable=nullable,
                 enable_analyzer=True,
                 analyzer_params=analyzer_params,
             ),
@@ -2280,6 +2285,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 name="text",
                 dtype=DataType.VARCHAR,
                 max_length=65535,
+                nullable=nullable,      # function input supports None now
                 enable_analyzer=True,
                 enable_match=True,
                 analyzer_params=analyzer_params,
@@ -2307,29 +2313,32 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         else:
             language = "en"
 
+        empty_value = ""
+        if nullable is True:
+            empty_value = None
         data = [
             {
                 "id": i,
-                "word": fake.word().lower() if random.random() >= empty_percent else "",
+                "word": fake.word().lower() if random.random() >= empty_percent else "",   # partition key not support none
                 "sentence": fake.sentence().lower()
                 if random.random() >= empty_percent
-                else "",
+                else empty_value,
                 "paragraph": fake.paragraph().lower()
                 if random.random() >= empty_percent
-                else "",
-                "text": fake.text().lower() if random.random() >= empty_percent else "",
+                else empty_value,
+                "text": fake.text().lower() if random.random() >= empty_percent else empty_value,
                 "emb": [random.random() for _ in range(dim)],
             }
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         texts = df["text"].to_list()
         word_freq = cf.analyze_documents(texts, language=language)
         most_freq_word = word_freq.most_common(10)
         tokens = [item[0] for item in most_freq_word]
         if len(tokens) == 0:
-            log.info("empty tokens, add a dummy token")
+            # log.info("empty tokens, add a dummy token")
             tokens = ["dummy"]
         batch_size = 5000
         for i in range(0, len(df), batch_size):
@@ -2378,7 +2387,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
             limit=limit,
         )
         candidates_num = len(res)
-        log.info(f"search data: {search_data}")
+        # log.info(f"search data: {search_data}")
         # use offset = 0 to get all the results
         full_res_list, _ = collection_w.search(
             data=search_data,
@@ -2411,7 +2420,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         for i in range(nq):
             assert 0 < len(res_list[i]) <= min(limit, candidates_num)
             search_text = search_data[i]
-            log.info(f"res: {res_list[i]}")
+            # log.info(f"res: {res_list[i]}")
             res = res_list[i]
             for j in range(len(res)):
                 r = res[j]
@@ -2431,10 +2440,23 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 overlap, word_freq_a, word_freq_b = cf.check_token_overlap(
                     search_text, result_text, language=language
                 )
-                log.info(f"overlap {overlap}")
+                # log.info(f"overlap {overlap}")
                 assert len(overlap) > 0, (
                     f"query text: {search_text}, \ntext: {result_text} \n overlap: {overlap} \n word freq a: {word_freq_a} \n word freq b: {word_freq_b}\n result: {r}"
                 )
+
+        # verify full text search supports search by pk
+        pk_search_res, _ = collection_w.search(
+            ids=[0, 1],
+            anns_field="text_sparse_emb",
+            expr=filter,
+            param={},
+            limit=limit,
+            offset=0,
+            output_fields=["id", "text"],
+        )
+        # search by pk should return results (may be empty if filtered out or no overlap)
+        assert len(pk_search_res) == 2  # nq=2 for two PKs
 
     @pytest.mark.tags(CaseLabel.L0)
     @pytest.mark.parametrize("nq", [2])
@@ -2545,7 +2567,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         texts = df["text"].to_list()
         word_freq = cf.analyze_documents(texts, language=language)
         tokens = []
@@ -2553,7 +2575,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
             if len(item[0]) == 2:
                 tokens.append(item[0])
         if len(tokens) == 0:
-            log.info("empty tokens, add a dummy token")
+            # log.info("empty tokens, add a dummy token")
             tokens = ["dummy"]
         batch_size = 5000
         for i in range(0, len(df), batch_size):
@@ -2603,7 +2625,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
             limit=limit,
         )
         candidates_num = len(res)
-        log.info(f"search data: {search_data}")
+        # log.info(f"search data: {search_data}")
         # use offset = 0 to get all the results
         full_res_list, _ = collection_w.search(
             data=search_data,
@@ -2636,7 +2658,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         for i in range(nq):
             assert 0 < len(res_list[i]) <= min(limit, candidates_num)
             search_text = search_data[i]
-            log.info(f"res: {res_list[i]}")
+            # log.info(f"res: {res_list[i]}")
             res = res_list[i]
             for j in range(len(res)):
                 r = res[j]
@@ -2656,7 +2678,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 overlap, word_freq_a, word_freq_b = cf.check_token_overlap(
                     search_text, result_text, language=language
                 )
-                log.info(f"overlap {overlap}")
+                # log.info(f"overlap {overlap}")
                 assert len(overlap) > 0, (
                     f"query text: {search_text}, \ntext: {result_text} \n overlap: {overlap} \n word freq a: {word_freq_a} \n word freq b: {word_freq_b}\n result: {r}"
                 )
@@ -2763,13 +2785,13 @@ class TestSearchWithFullTextSearch(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         texts = df["text"].to_list()
         word_freq = cf.analyze_documents(texts, language=language)
         most_freq_word = word_freq.most_common(10)
         tokens = [item[0] for item in most_freq_word]
         if len(tokens) == 0:
-            log.info("empty tokens, add a dummy token")
+            # log.info("empty tokens, add a dummy token")
             tokens = ["dummy"]
         collection_w.create_index(
             "emb",
@@ -2818,7 +2840,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
             limit=limit,
         )
         candidates_num = len(res)
-        log.info(f"search data: {search_data}")
+        # log.info(f"search data: {search_data}")
         # use offset = 0 to get all the results
         full_res_list, _ = collection_w.search(
             data=search_data,
@@ -2851,7 +2873,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         for i in range(nq):
             assert 0 < len(res_list[i]) <= min(limit, candidates_num)
             search_text = search_data[i]
-            log.info(f"res: {res_list[i]}")
+            # log.info(f"res: {res_list[i]}")
             res = res_list[i]
             for j in range(len(res)):
                 r = res[j]
@@ -2871,14 +2893,15 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 overlap, word_freq_a, word_freq_b = cf.check_token_overlap(
                     search_text, result_text, language=language
                 )
-                log.info(f"overlap {overlap}")
+                # log.info(f"overlap {overlap}")
                 assert len(overlap) > 0, (
                     f"query text: {search_text}, \ntext: {result_text} \n overlap: {overlap} \n word freq a: {word_freq_a} \n word freq b: {word_freq_b}\n result: {r}"
                 )
 
     @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("nullable", [False, True])
     @pytest.mark.parametrize("nq", [2])
-    @pytest.mark.parametrize("empty_percent", [0])
+    @pytest.mark.parametrize("empty_percent", [0.2])
     @pytest.mark.parametrize("enable_partition_key", [True])
     @pytest.mark.parametrize("enable_inverted_index", [True])
     @pytest.mark.parametrize("index_type", ["SPARSE_INVERTED_INDEX"])
@@ -2893,6 +2916,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         empty_percent,
         index_type,
         nq,
+        nullable
     ):
         """
         target: test full text search
@@ -2919,6 +2943,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 name="sentence",
                 dtype=DataType.VARCHAR,
                 max_length=65535,
+                nullable=nullable,
                 enable_analyzer=True,
                 analyzer_params=analyzer_params,
             ),
@@ -2926,6 +2951,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 name="paragraph",
                 dtype=DataType.VARCHAR,
                 max_length=65535,
+                nullable=nullable,
                 enable_analyzer=True,
                 analyzer_params=analyzer_params,
             ),
@@ -2933,11 +2959,12 @@ class TestSearchWithFullTextSearch(TestcaseBase):
                 name="text",
                 dtype=DataType.VARCHAR,
                 max_length=65535,
+                nullable=nullable,
                 enable_analyzer=True,
                 enable_match=True,
                 analyzer_params=analyzer_params,
             ),
-            FieldSchema(name="emb", dtype=DataType.FLOAT_VECTOR, dim=dim),
+            FieldSchema(name="emb", dtype=DataType.FLOAT_VECTOR, dim=dim, nullable=nullable),
             FieldSchema(name="text_sparse_emb", dtype=DataType.SPARSE_FLOAT_VECTOR),
         ]
         schema = CollectionSchema(fields=fields, description="test collection")
@@ -2960,35 +2987,40 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         else:
             language = "en"
 
+        empty_value = ""
+        if nullable is True:
+            empty_value = None
         data = [
             {
                 "id": i,
-                "word": fake.word().lower() if random.random() >= empty_percent else "",
+                "word": fake.word().lower()
+                if random.random() >= empty_percent else "",   # partition key not support none
                 "sentence": fake.sentence().lower()
                 if random.random() >= empty_percent
-                else "",
+                else empty_value,
                 "paragraph": fake.paragraph().lower()
                 if random.random() >= empty_percent
-                else "",
-                "text": fake.text().lower() if random.random() >= empty_percent else "",
-                "emb": [random.random() for _ in range(dim)],
+                else empty_value,
+                "text": fake.text().lower() if random.random() >= empty_percent else empty_value,
+                "emb": None if nullable is True and random.random() < empty_percent
+                else [random.random() for _ in range(dim)],  # null vector supported
             }
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         texts = df["text"].to_list()
         word_freq = cf.analyze_documents(texts, language=language)
         tokens = list(word_freq.keys())
         if len(tokens) == 0:
-            log.info("empty tokens, add a dummy token")
+            # log.info("empty tokens, add a dummy token")
             tokens = ["dummy"]
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
-                data[i : i + batch_size]
+                data[i: i + batch_size]
                 if i + batch_size < len(df)
-                else data[i : len(df)]
+                else data[i: len(df)]
             )
         collection_w.create_index(
             "emb",
@@ -3014,7 +3046,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         collection_w.load()
         limit = 1000
         search_data = [fake.text().lower() + random.choice(tokens) for _ in range(nq)]
-        log.info(f"search data: {search_data}")
+        # log.info(f"search data: {search_data}")
         # get distance with search data
         res_list, _ = collection_w.search(
             data=search_data,
@@ -3045,7 +3077,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         )
         # verify correctness
         for i in range(nq):
-            log.info(f"res: {len(res_list[i])}")
+            # log.info(f"res: {len(res_list[i])}")
             assert len(res_list[i]) < limit  # less than limit, because the range is set
             res = res_list[i]
             for j in range(len(res)):
@@ -3153,12 +3185,12 @@ class TestSearchWithFullTextSearch(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         texts = df["text"].to_list()
         word_freq = cf.analyze_documents(texts, language=language)
         tokens = list(word_freq.keys())
         if len(tokens) == 0:
-            log.info("empty tokens, add a dummy token")
+            # log.info("empty tokens, add a dummy token")
             tokens = ["dummy"]
         batch_size = 5000
         for i in range(0, len(df), batch_size):
@@ -3192,7 +3224,7 @@ class TestSearchWithFullTextSearch(TestcaseBase):
         search_data = [
             fake.text().lower() + " " + random.choice(tokens) for _ in range(nq)
         ]
-        log.info(f"search data: {search_data}")
+        # log.info(f"search data: {search_data}")
         # get distance with search data
         batch_size = 100
         limit = batch_size * 10
@@ -3320,7 +3352,7 @@ class TestSearchWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -3353,7 +3385,7 @@ class TestSearchWithFullTextSearchNegative(TestcaseBase):
         nq = 2
         limit = 100
         search_data = ["" for _ in range(nq)]
-        log.info(f"search data: {search_data}")
+        # log.info(f"search data: {search_data}")
         res, _ = collection_w.search(
             data=search_data,
             anns_field="text_sparse_emb",
@@ -3462,12 +3494,12 @@ class TestSearchWithFullTextSearchNegative(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         texts = df["text"].to_list()
         word_freq = cf.analyze_documents(texts, language=language)
         tokens = list(word_freq.keys())
         if len(tokens) == 0:
-            log.info("empty tokens, add a dummy token")
+            # log.info("empty tokens, add a dummy token")
             tokens = ["dummy"]
         batch_size = 5000
         for i in range(0, len(df), batch_size):
@@ -3508,7 +3540,7 @@ class TestSearchWithFullTextSearchNegative(TestcaseBase):
             search_data = cf.gen_vectors(
                 nb=nq, dim=1000, vector_data_type=DataType.FLOAT_VECTOR
             )
-        log.info(f"search data: {search_data}")
+        # log.info(f"search data: {search_data}")
         error = {
             ct.err_code: 65535,
             ct.err_msg: "please provide varchar/text for BM25 Function based search",
@@ -3637,7 +3669,7 @@ class TestHybridSearchWithFullTextSearch(TestcaseBase):
             for i in range(data_size)
         ]
         df = pd.DataFrame(data)
-        log.info(f"dataframe\n{df}")
+        # log.info(f"dataframe\n{df}")
         batch_size = 5000
         for i in range(0, len(df), batch_size):
             collection_w.insert(
@@ -3705,7 +3737,7 @@ class TestHybridSearchWithFullTextSearch(TestcaseBase):
         assert len(res_list) == nq
         # check the result correctness
         for i in range(nq):
-            log.info(f"res length: {len(res_list[i])}")
+            # log.info(f"res length: {len(res_list[i])}")
             if enable_group_by_field:
                 assert len(res_list[i]) == len(language_list)
             else:
@@ -3868,9 +3900,9 @@ class TestFullTextSearchMultiAnalyzer(TestcaseBase):
             )
             assert len(results) == 1
             assert len(results[0]) > 0
-            log.info(
-                f"Query '{test['query']}' with analyzer '{test['analyzer_name']}' returned {len(results[0])} results"
-            )
+            # log.info(
+            #     f"Query '{test['query']}' with analyzer '{test['analyzer_name']}' returned {len(results[0])} results"
+            # )
 
     @pytest.mark.tags(CaseLabel.L0)
     def test_multi_analyzer_fallback(self):
@@ -4084,8 +4116,8 @@ class TestFullTextSearchMultiAnalyzer(TestcaseBase):
                 output_fields=["doc_id", "language", "article_content"],
                 limit=10,
             )
-            log.info(test)
-            log.info(results)
+            # log.info(test)
+            # log.info(results)
             assert len(results) == 1
             assert len(results[0]) > 0
             if test["analyzer_name"] == "eng":
@@ -4113,8 +4145,8 @@ class TestFullTextSearchMultiAnalyzer(TestcaseBase):
                 output_fields=["doc_id", "language", "article_content"],
                 limit=10,
             )
-            log.info(test)
-            log.info(results)
+            # log.info(test)
+            # log.info(results)
             assert len(results) == 1
             assert len(results[0]) > 0
             for r in results[0]:
@@ -4162,7 +4194,7 @@ class TestFullTextSearchMultiAnalyzer(TestcaseBase):
             res_diff = res_set - mock_res_set
             mock_res_diff = mock_res_set - res_set
             if res_diff or mock_res_diff:
-                log.error(f"result diff: {res_diff}, {mock_res_diff}")
+                # log.error(f"result diff: {res_diff}, {mock_res_diff}")
                 assert False, (
                     f"result diff: {res_diff} in origin but not in mock, {mock_res_diff} in mock but not in origin"
                 )

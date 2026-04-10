@@ -33,11 +33,6 @@ NewLoadIndexInfo(CLoadIndexInfo* c_load_index_info);
 void
 DeleteLoadIndexInfo(CLoadIndexInfo c_load_index_info);
 
-CStatus
-AppendIndexParam(CLoadIndexInfo c_load_index_info,
-                 const char* index_key,
-                 const char* index_value);
-
 LoadResourceRequest
 EstimateLoadIndexResource(CLoadIndexInfo c_load_index_info);
 
@@ -48,32 +43,20 @@ TryReserveLoadingResourceWithTimeout(CResourceUsage size,
 void
 ReleaseLoadingResource(CResourceUsage size);
 
-CStatus
-AppendIndexInfo(CLoadIndexInfo c_load_index_info,
-                int64_t index_id,
-                int64_t build_id,
-                int64_t version);
+void
+ChargeLoadedResource(CResourceUsage size);
+
+void
+RefundLoadedResource(CResourceUsage size);
 
 CStatus
 AppendIndex(CLoadIndexInfo c_load_index_info, CBinarySet c_binary_set);
 
 CStatus
-AppendIndexFilePath(CLoadIndexInfo c_load_index_info, const char* file_path);
-
-CStatus
 AppendIndexV2(CTraceContext c_trace, CLoadIndexInfo c_load_index_info);
 
 CStatus
-AppendIndexEngineVersionToLoadInfo(CLoadIndexInfo c_load_index_info,
-                                   int32_t index_engine_version);
-
-CStatus
 CleanLoadedIndex(CLoadIndexInfo c_load_index_info);
-
-void
-AppendStorageInfo(CLoadIndexInfo c_load_index_info,
-                  const char* uri,
-                  int64_t version);
 
 CStatus
 FinishLoadIndexInfo(CLoadIndexInfo c_load_index_info,

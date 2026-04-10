@@ -122,6 +122,30 @@ func NewManualFlushMessageBody(msg message.ImmutableMessage) (msgstream.TsMsg, e
 	}, nil
 }
 
+type FlushAllMessageBody struct {
+	*tsMsgImpl
+	FlushAllMessage message.ImmutableFlushAllMessageV2
+}
+
+func NewFlushAllMessageBody(msg message.ImmutableMessage) (msgstream.TsMsg, error) {
+	flushAllMsg, err := message.AsImmutableFlushAllMessageV2(msg)
+	if err != nil {
+		return nil, err
+	}
+	return &FlushAllMessageBody{
+		tsMsgImpl: &tsMsgImpl{
+			BaseMsg: msgstream.BaseMsg{
+				BeginTimestamp: msg.TimeTick(),
+				EndTimestamp:   msg.TimeTick(),
+			},
+			ts:      msg.TimeTick(),
+			sz:      msg.EstimateSize(),
+			msgType: MustGetCommonpbMsgTypeFromMessageType(msg.MessageType()),
+		},
+		FlushAllMessage: flushAllMsg,
+	}, nil
+}
+
 type SchemaChangeMessageBody struct {
 	*tsMsgImpl
 	SchemaChangeMessage message.ImmutableSchemaChangeMessageV2
@@ -175,5 +199,82 @@ func NewAlterCollectionMessageBody(msg message.ImmutableMessage) (msgstream.TsMs
 			msgType: MustGetCommonpbMsgTypeFromMessageType(msg.MessageType()),
 		},
 		AlterCollectionMessage: alterCollMsg,
+	}, nil
+}
+
+type TruncateCollectionMessageBody struct {
+	*tsMsgImpl
+	TruncateCollectionMessage message.ImmutableTruncateCollectionMessageV2
+}
+
+func NewTruncateCollectionMessageBody(msg message.ImmutableMessage) (msgstream.TsMsg, error) {
+	truncateCollMsg, err := message.AsImmutableTruncateCollectionMessageV2(msg)
+	if err != nil {
+		return nil, err
+	}
+	return &TruncateCollectionMessageBody{
+		tsMsgImpl: &tsMsgImpl{
+			BaseMsg: msgstream.BaseMsg{
+				BeginTimestamp: msg.TimeTick(),
+				EndTimestamp:   msg.TimeTick(),
+			},
+			ts:      msg.TimeTick(),
+			sz:      msg.EstimateSize(),
+			msgType: MustGetCommonpbMsgTypeFromMessageType(msg.MessageType()),
+		},
+		TruncateCollectionMessage: truncateCollMsg,
+	}, nil
+}
+
+type AlterWALMessageBody struct {
+	*tsMsgImpl
+	AlterWALMessage message.ImmutableAlterWALMessageV2
+}
+
+func (p *AlterWALMessageBody) ID() msgstream.UniqueID {
+	return 0
+}
+
+func NewAlterWALMessageBody(msg message.ImmutableMessage) (msgstream.TsMsg, error) {
+	alterWALMsg := message.MustAsImmutableAlterWALMessageV2(msg)
+	return &AlterWALMessageBody{
+		tsMsgImpl: &tsMsgImpl{
+			BaseMsg: msgstream.BaseMsg{
+				BeginTimestamp: msg.TimeTick(),
+				EndTimestamp:   msg.TimeTick(),
+			},
+			ts:      msg.TimeTick(),
+			sz:      msg.EstimateSize(),
+			msgType: MustGetCommonpbMsgTypeFromMessageType(msg.MessageType()),
+		},
+		AlterWALMessage: alterWALMsg,
+	}, nil
+}
+
+type CreateIndexMessageBody struct {
+	*tsMsgImpl
+	CreateIndexMessage message.ImmutableCreateIndexMessageV2
+}
+
+func (c *CreateIndexMessageBody) ID() msgstream.UniqueID {
+	return 0
+}
+
+func NewCreateIndexMessageBody(msg message.ImmutableMessage) (msgstream.TsMsg, error) {
+	createIndexMsg, err := message.AsImmutableCreateIndexMessageV2(msg)
+	if err != nil {
+		return nil, err
+	}
+	return &CreateIndexMessageBody{
+		tsMsgImpl: &tsMsgImpl{
+			BaseMsg: msgstream.BaseMsg{
+				BeginTimestamp: msg.TimeTick(),
+				EndTimestamp:   msg.TimeTick(),
+			},
+			ts:      msg.TimeTick(),
+			sz:      msg.EstimateSize(),
+			msgType: MustGetCommonpbMsgTypeFromMessageType(msg.MessageType()),
+		},
+		CreateIndexMessage: createIndexMsg,
 	}, nil
 }

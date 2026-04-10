@@ -9,26 +9,47 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <fmt/core.h>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+#include <simdjson.h>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "NamedType/named_type_impl.hpp"
+#include "bitset/bitset.h"
+#include "bitset/detail/element_vectorized.h"
+#include "common/Consts.h"
+#include "common/FieldData.h"
+#include "common/Json.h"
 #include "common/Schema.h"
+#include "common/Tracer.h"
 #include "common/Types.h"
+#include "common/protobuf_utils.h"
 #include "expr/ITypeExpr.h"
+#include "filemanager/InputStream.h"
+#include "gtest/gtest.h"
+#include "index/IndexStats.h"
 #include "index/json_stats/JsonKeyStats.h"
-#include "cachinglayer/Manager.h"
-#include "segcore/storagev2translator/JsonStatsTranslator.h"
+#include "pb/common.pb.h"
 #include "pb/plan.pb.h"
+#include "pb/schema.pb.h"
 #include "plan/PlanNode.h"
 #include "query/ExecPlanNodeVisitor.h"
 #include "segcore/ChunkedSegmentSealedImpl.h"
-#include "segcore/Types.h"
+#include "segcore/SegmentSealed.h"
+#include "simdjson/padded_string.h"
+#include "storage/ChunkManager.h"
+#include "storage/FileManager.h"
 #include "storage/InsertData.h"
+#include "storage/PayloadReader.h"
 #include "storage/RemoteChunkManagerSingleton.h"
+#include "storage/ThreadPools.h"
+#include "storage/Types.h"
 #include "storage/Util.h"
+#include "test_utils/Constants.h"
 #include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
@@ -36,7 +57,7 @@ using namespace milvus::index;
 
 namespace {
 
-milvus::index::CacheJsonKeyStatsPtr
+std::shared_ptr<JsonKeyStats>
 BuildAndLoadJsonKeyStats(const std::vector<std::string>& json_strings,
                          const milvus::FieldId json_fid,
                          const std::string& root_path,
@@ -79,12 +100,6 @@ BuildAndLoadJsonKeyStats(const std::vector<std::string>& json_strings,
     auto chunk_manager = storage::CreateChunkManager(storage_config);
     auto fs = storage::InitArrowFileSystem(storage_config);
 
-    milvus_storage::ArrowFileSystemSingleton::GetInstance().Init(
-        milvus_storage::ArrowFileSystemConfig{
-            .root_path = root_path,
-            .storage_type = "local",
-        });
-
     auto log_path = fmt::format("/{}/{}/{}/{}/{}/{}",
                                 root_path,
                                 collection_id,
@@ -110,23 +125,18 @@ BuildAndLoadJsonKeyStats(const std::vector<std::string>& json_strings,
     load_config["index_files"] = index_files;
     load_config[milvus::LOAD_PRIORITY] =
         milvus::proto::common::LoadPriority::HIGH;
+    load_config[STATS_BASE_PATH_KEY] =
+        storage::GenRemoteJsonStatsPathPrefix(chunk_manager,
+                                              build_id,
+                                              version_id,
+                                              collection_id,
+                                              partition_id,
+                                              segment_id,
+                                              field_id);
 
-    milvus::segcore::storagev2translator::JsonStatsLoadInfo load_info{
-        /* enable_mmap */ false,
-        /* mmap_dir_path */ "",
-        /* segment_id */ segment_id,
-        /* field_id */ field_id,
-        /* stats_size */ 0};
-
-    std::unique_ptr<
-        milvus::cachinglayer::Translator<milvus::index::JsonKeyStats>>
-        base_translator = std::make_unique<
-            milvus::segcore::storagev2translator::JsonStatsTranslator>(
-            load_info, milvus::tracer::TraceContext{}, ctx, load_config);
-
-    auto slot = milvus::cachinglayer::Manager::GetInstance().CreateCacheSlot(
-        std::move(base_translator));
-    return slot;
+    auto reader = std::make_shared<JsonKeyStats>(ctx, true);
+    reader->Load(milvus::tracer::TraceContext{}, load_config);
+    return reader;
 }
 
 }  // namespace
@@ -173,7 +183,7 @@ TEST(JsonContainsByStatsTest, BasicContainsAnyOnArray) {
     const int64_t field_id = json_fid.get();
     const int64_t build_id = 5001;
     const int64_t version_id = 1;
-    const std::string root_path = "/tmp/test-json-contains-by-stats";
+    const std::string root_path = TestLocalPath;
 
     auto stats = BuildAndLoadJsonKeyStats(json_raw_data,
                                           json_fid,

@@ -140,6 +140,22 @@ impl IndexWriterWrapper {
         }
     }
 
+    pub fn add_array_keywords_with_len(
+        &mut self,
+        ptrs: &[*const u8],
+        lens: &[usize],
+        offset: Option<i64>,
+    ) -> Result<()> {
+        match self {
+            IndexWriterWrapper::V5(writer) => {
+                writer.add_array_keywords_with_len(ptrs, lens, offset)
+            }
+            IndexWriterWrapper::V7(writer) => {
+                writer.add_array_keywords_with_len(ptrs, lens, offset.unwrap() as u32)
+            }
+        }
+    }
+
     pub fn add_json_key_stats(
         &mut self,
         keys: &[*const c_char],
@@ -286,6 +302,7 @@ mod tests {
                 field_name,
                 dir.path().to_str().unwrap(),
                 "default",
+                "",
                 "",
                 1,
                 50_000_000,

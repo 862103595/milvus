@@ -131,6 +131,14 @@ func (c *Client) DropCollection(ctx context.Context, option DropCollectionOption
 	return err
 }
 
+func (c *Client) TruncateCollection(ctx context.Context, option TruncateCollectionOption, callOptions ...grpc.CallOption) error {
+	req := option.Request()
+	return c.callService(func(milvusService milvuspb.MilvusServiceClient) error {
+		resp, err := milvusService.TruncateCollection(ctx, req, callOptions...)
+		return merr.CheckRPCCall(resp, err)
+	})
+}
+
 func (c *Client) RenameCollection(ctx context.Context, option RenameCollectionOption, callOptions ...grpc.CallOption) error {
 	req := option.Request()
 
@@ -185,6 +193,10 @@ func (c *Client) GetCollectionStats(ctx context.Context, opt GetCollectionOption
 
 // AddCollectionField adds a field to a collection.
 func (c *Client) AddCollectionField(ctx context.Context, opt AddCollectionFieldOption, callOpts ...grpc.CallOption) error {
+	if err := opt.Validate(); err != nil {
+		return err
+	}
+
 	req := opt.Request()
 
 	err := c.callService(func(milvusService milvuspb.MilvusServiceClient) error {

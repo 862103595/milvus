@@ -3,6 +3,7 @@ package common
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -178,87 +179,6 @@ func TestShouldFieldBeLoaded(t *testing.T) {
 	}
 }
 
-func TestReplicateProperty(t *testing.T) {
-	t.Run("ReplicateID", func(t *testing.T) {
-		{
-			p := []*commonpb.KeyValuePair{
-				{
-					Key:   ReplicateIDKey,
-					Value: "1001",
-				},
-			}
-			e, ok := IsReplicateEnabled(p)
-			assert.True(t, e)
-			assert.True(t, ok)
-			i, ok := GetReplicateID(p)
-			assert.True(t, ok)
-			assert.Equal(t, "1001", i)
-		}
-
-		{
-			p := []*commonpb.KeyValuePair{
-				{
-					Key:   ReplicateIDKey,
-					Value: "",
-				},
-			}
-			e, ok := IsReplicateEnabled(p)
-			assert.False(t, e)
-			assert.True(t, ok)
-		}
-
-		{
-			p := []*commonpb.KeyValuePair{
-				{
-					Key:   "foo",
-					Value: "1001",
-				},
-			}
-			e, ok := IsReplicateEnabled(p)
-			assert.False(t, e)
-			assert.False(t, ok)
-		}
-	})
-
-	t.Run("ReplicateTS", func(t *testing.T) {
-		{
-			p := []*commonpb.KeyValuePair{
-				{
-					Key:   ReplicateEndTSKey,
-					Value: "1001",
-				},
-			}
-			ts, ok := GetReplicateEndTS(p)
-			assert.True(t, ok)
-			assert.EqualValues(t, 1001, ts)
-		}
-
-		{
-			p := []*commonpb.KeyValuePair{
-				{
-					Key:   ReplicateEndTSKey,
-					Value: "foo",
-				},
-			}
-			ts, ok := GetReplicateEndTS(p)
-			assert.False(t, ok)
-			assert.EqualValues(t, 0, ts)
-		}
-
-		{
-			p := []*commonpb.KeyValuePair{
-				{
-					Key:   "foo",
-					Value: "1001",
-				},
-			}
-			ts, ok := GetReplicateEndTS(p)
-			assert.False(t, ok)
-			assert.EqualValues(t, 0, ts)
-		}
-	})
-}
-
 func TestIsEnableDynamicSchema(t *testing.T) {
 	type testCase struct {
 		tag         string
@@ -312,4 +232,258 @@ func TestFunctionProperty(t *testing.T) {
 	assert.True(t, GetCollectionAllowInsertNonBM25FunctionOutputs(
 		[]*commonpb.KeyValuePair{{Key: CollectionAllowInsertNonBM25FunctionOutputs, Value: "true"}}),
 	)
+}
+
+func TestIsDisableFuncRuntimeCheck(t *testing.T) {
+	disable, err := IsDisableFuncRuntimeCheck([]*commonpb.KeyValuePair{}...)
+	assert.NoError(t, err)
+	assert.False(t, disable)
+	disable, err = IsDisableFuncRuntimeCheck([]*commonpb.KeyValuePair{{Key: DisableFuncRuntimeCheck, Value: "False"}}...)
+	assert.NoError(t, err)
+	assert.False(t, disable)
+	disable, err = IsDisableFuncRuntimeCheck([]*commonpb.KeyValuePair{{Key: DisableFuncRuntimeCheck, Value: "True"}}...)
+	assert.NoError(t, err)
+	assert.True(t, disable)
+	disable, err = IsDisableFuncRuntimeCheck([]*commonpb.KeyValuePair{{Key: DisableFuncRuntimeCheck, Value: "Error"}}...)
+	assert.Error(t, err)
+	assert.False(t, disable)
+}
+
+func TestGetCollectionTTL(t *testing.T) {
+	type testCase struct {
+		tag       string
+		value     string
+		expect    time.Duration
+		expectErr bool
+	}
+
+	cases := []testCase{
+		{tag: "normal_case", value: "3600", expect: time.Duration(3600) * time.Second, expectErr: false},
+		{tag: "error_value", value: "error value", expectErr: true},
+		{tag: "out_of_int64_range", value: "10000000000000000000000000000000000000000000000000000000000000000000000000000", expectErr: true},
+		{tag: "negative", value: "-1", expect: -1 * time.Second},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tag, func(t *testing.T) {
+			result, err := GetCollectionTTL([]*commonpb.KeyValuePair{{Key: CollectionTTLConfigKey, Value: tc.value}})
+			if tc.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.EqualValues(t, tc.expect, result)
+			}
+			result, err = GetCollectionTTLFromMap(map[string]string{CollectionTTLConfigKey: tc.value})
+			if tc.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.EqualValues(t, tc.expect, result)
+			}
+		})
+	}
+
+	t.Run("not_config", func(t *testing.T) {
+		result, err := GetCollectionTTL([]*commonpb.KeyValuePair{})
+		assert.NoError(t, err)
+		assert.EqualValues(t, -1, result)
+		result, err = GetCollectionTTLFromMap(map[string]string{})
+		assert.NoError(t, err)
+		assert.EqualValues(t, -1, result)
+	})
+}
+
+func TestWarmupPolicy(t *testing.T) {
+	t.Run("GetWarmupPolicy", func(t *testing.T) {
+		// Test when warmup key exists
+		props := []*commonpb.KeyValuePair{
+			{Key: WarmupKey, Value: WarmupSync},
+		}
+		policy, exist := GetWarmupPolicy(props...)
+		assert.True(t, exist)
+		assert.Equal(t, WarmupSync, policy)
+
+		// Test when warmup key doesn't exist
+		props = []*commonpb.KeyValuePair{
+			{Key: "other_key", Value: "other_value"},
+		}
+		policy, exist = GetWarmupPolicy(props...)
+		assert.False(t, exist)
+		assert.Equal(t, "", policy)
+
+		// Test empty props
+		policy, exist = GetWarmupPolicy()
+		assert.False(t, exist)
+		assert.Equal(t, "", policy)
+	})
+
+	t.Run("GetWarmupPolicyByKey", func(t *testing.T) {
+		props := []*commonpb.KeyValuePair{
+			{Key: WarmupScalarFieldKey, Value: WarmupSync},
+			{Key: WarmupVectorIndexKey, Value: WarmupDisable},
+		}
+
+		// Test getting scalar field warmup
+		policy, exist := GetWarmupPolicyByKey(WarmupScalarFieldKey, props...)
+		assert.True(t, exist)
+		assert.Equal(t, WarmupSync, policy)
+
+		// Test getting vector index warmup
+		policy, exist = GetWarmupPolicyByKey(WarmupVectorIndexKey, props...)
+		assert.True(t, exist)
+		assert.Equal(t, WarmupDisable, policy)
+
+		// Test key not found
+		policy, exist = GetWarmupPolicyByKey(WarmupScalarIndexKey, props...)
+		assert.False(t, exist)
+		assert.Equal(t, "", policy)
+	})
+
+	t.Run("ValidateWarmupPolicy", func(t *testing.T) {
+		// Valid values
+		assert.NoError(t, ValidateWarmupPolicy(WarmupSync))
+		assert.NoError(t, ValidateWarmupPolicy(WarmupDisable))
+		assert.NoError(t, ValidateWarmupPolicy(WarmupAsync))
+
+		// Invalid values
+		assert.Error(t, ValidateWarmupPolicy("invalid"))
+		assert.Error(t, ValidateWarmupPolicy(""))
+	})
+
+	t.Run("IsWarmupKey", func(t *testing.T) {
+		// Valid warmup keys
+		assert.True(t, IsWarmupKey(WarmupKey))
+		assert.True(t, IsWarmupKey(WarmupScalarFieldKey))
+		assert.True(t, IsWarmupKey(WarmupScalarIndexKey))
+		assert.True(t, IsWarmupKey(WarmupVectorFieldKey))
+		assert.True(t, IsWarmupKey(WarmupVectorIndexKey))
+
+		// Invalid keys
+		assert.False(t, IsWarmupKey("warmup.invalid"))
+		assert.False(t, IsWarmupKey("other_key"))
+		assert.False(t, IsWarmupKey(""))
+	})
+
+	t.Run("IsFieldWarmupKey", func(t *testing.T) {
+		// Only WarmupKey is a field-level warmup key
+		assert.True(t, IsFieldWarmupKey(WarmupKey))
+
+		// Collection-level warmup keys are not field-level
+		assert.False(t, IsFieldWarmupKey(WarmupScalarFieldKey))
+		assert.False(t, IsFieldWarmupKey(WarmupScalarIndexKey))
+		assert.False(t, IsFieldWarmupKey(WarmupVectorFieldKey))
+		assert.False(t, IsFieldWarmupKey(WarmupVectorIndexKey))
+
+		// Invalid keys
+		assert.False(t, IsFieldWarmupKey("warmup.invalid"))
+		assert.False(t, IsFieldWarmupKey("other_key"))
+		assert.False(t, IsFieldWarmupKey(""))
+	})
+
+	t.Run("IsCollectionWarmupKey", func(t *testing.T) {
+		// Collection-level warmup keys
+		assert.True(t, IsCollectionWarmupKey(WarmupScalarFieldKey))
+		assert.True(t, IsCollectionWarmupKey(WarmupScalarIndexKey))
+		assert.True(t, IsCollectionWarmupKey(WarmupVectorFieldKey))
+		assert.True(t, IsCollectionWarmupKey(WarmupVectorIndexKey))
+
+		// WarmupKey is field-level, not collection-level
+		assert.False(t, IsCollectionWarmupKey(WarmupKey))
+
+		// Invalid keys
+		assert.False(t, IsCollectionWarmupKey("warmup.invalid"))
+		assert.False(t, IsCollectionWarmupKey("other_key"))
+		assert.False(t, IsCollectionWarmupKey(""))
+	})
+}
+
+func TestQueryMode(t *testing.T) {
+	t.Run("GetQueryMode returns mode when set", func(t *testing.T) {
+		kvs := []*commonpb.KeyValuePair{
+			{Key: QueryModeKey, Value: "large_topk"},
+		}
+		assert.Equal(t, QueryModeLargeTopK, GetQueryMode(kvs...))
+	})
+
+	t.Run("GetQueryMode case insensitive", func(t *testing.T) {
+		kvs := []*commonpb.KeyValuePair{
+			{Key: QueryModeKey, Value: "Large_TopK"},
+		}
+		assert.Equal(t, QueryModeLargeTopK, GetQueryMode(kvs...))
+	})
+
+	t.Run("GetQueryMode returns empty when not present", func(t *testing.T) {
+		kvs := []*commonpb.KeyValuePair{
+			{Key: "other.key", Value: "large_topk"},
+		}
+		assert.Equal(t, "", GetQueryMode(kvs...))
+	})
+
+	t.Run("GetQueryMode returns empty for no kvs", func(t *testing.T) {
+		assert.Equal(t, "", GetQueryMode())
+	})
+
+	t.Run("IsQueryModeLargeTopK returns true", func(t *testing.T) {
+		kvs := []*commonpb.KeyValuePair{
+			{Key: QueryModeKey, Value: "large_topk"},
+		}
+		assert.True(t, IsQueryModeLargeTopK(kvs...))
+	})
+
+	t.Run("IsQueryModeLargeTopK returns false when not set", func(t *testing.T) {
+		assert.False(t, IsQueryModeLargeTopK())
+	})
+
+	t.Run("ValidateQueryMode accepts large_topk", func(t *testing.T) {
+		kvs := []*commonpb.KeyValuePair{
+			{Key: QueryModeKey, Value: "large_topk"},
+		}
+		assert.NoError(t, ValidateQueryMode(kvs...))
+	})
+
+	t.Run("ValidateQueryMode accepts missing key", func(t *testing.T) {
+		assert.NoError(t, ValidateQueryMode())
+	})
+
+	t.Run("ValidateQueryMode rejects invalid value", func(t *testing.T) {
+		kvs := []*commonpb.KeyValuePair{
+			{Key: QueryModeKey, Value: "invalid"},
+		}
+		assert.Error(t, ValidateQueryMode(kvs...))
+	})
+}
+
+func TestClampScalarIndexVersion(t *testing.T) {
+	max := MaximumScalarIndexEngineVersion
+
+	// Values at or below maximum pass through unchanged
+	assert.Equal(t, int32(0), ClampScalarIndexVersion(0))
+	assert.Equal(t, int32(1), ClampScalarIndexVersion(1))
+	assert.Equal(t, max, ClampScalarIndexVersion(max))
+
+	// Values above maximum are clamped
+	assert.Equal(t, max, ClampScalarIndexVersion(max+1))
+	assert.Equal(t, max, ClampScalarIndexVersion(max+100))
+}
+
+func TestWKTWKBConversion(t *testing.T) {
+	testCases := []struct {
+		name string
+		wkt  string
+	}{
+		{"Point Empty", "POINT EMPTY"},
+		{"Polygon Empty", "POLYGON EMPTY"},
+		{"Point with coords", "POINT (1 2)"},
+		{"Polygon with coords", "POLYGON ((30 10, 40 40, 20 40, 10 20, 30 10))"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			wkb, err := ConvertWKTToWKB(tc.wkt)
+			assert.NoError(t, err)
+			assert.NotNil(t, wkb)
+
+			wktResult, err := ConvertWKBToWKT(wkb)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.wkt, wktResult)
+		})
+	}
 }
